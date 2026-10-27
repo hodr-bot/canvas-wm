@@ -122,6 +122,7 @@ dependencies = [
  "libc",
  "log",
  "serde",
+ "slog",
  "smithay",
  "toml 0.8.23",
  "wayland-client 0.29.5",

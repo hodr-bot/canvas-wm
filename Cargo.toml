@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 smithay = { version = "0.3", optional = true }
 xkbcommon = { version = "0.4", optional = true }
+slog = { version = "2", optional = true }
 log = "0.4"
 env_logger = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -19,7 +20,7 @@ toml = "0.8"
 
 [features]
 default = []
-compositor = ["smithay", "xkbcommon"]
+compositor = ["smithay", "xkbcommon", "slog"]
 
 [dev-dependencies]
 approx = "0.5"

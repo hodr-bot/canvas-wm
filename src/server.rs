@@ -8,19 +8,25 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use smithay::backend::input::KeyState;
 use smithay::backend::renderer::gles2::Gles2Texture;
 use smithay::reexports::wayland_protocols::unstable::xdg_shell::v6::server::zxdg_shell_v6::ZxdgShellV6;
 use smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase;
 use smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor;
+use smithay::reexports::wayland_server::protocol::wl_pointer::ButtonState as WlButtonState;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, Global};
+use slog::Drain as _;
+use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::compositor_init;
+use smithay::wayland::seat::{AxisFrame, KeyboardHandle, PointerHandle, Seat, XkbConfig};
 use smithay::wayland::shell::xdg::{xdg_shell_init, ShellState, XdgRequest};
 use smithay::wayland::shm::init_shm_global;
+use smithay::wayland::Serial;
 
 use crate::canvas::{CanvasWindow, Vec2};
 
@@ -74,8 +80,39 @@ impl ServerState {
     }
 }
 
+/// Stderr drain for Smithay's slog seat logs. Level follows
+/// `CANVAS_SEAT_TRACE` (trace when set, debug otherwise); keycodes are
+/// numbers only, no keysyms or text ever reach the log.
+struct SeatLogDrain;
+impl slog::Drain for SeatLogDrain {
+    type Ok = ();
+    type Err = slog::Never;
+
+    fn log(
+        &self,
+        record: &slog::Record,
+        _values: &slog::OwnedKVList,
+    ) -> Result<(), slog::Never> {
+        eprintln!("[seat {}] {}", record.level(), record.msg());
+        Ok(())
+    }
+}
+
+fn seat_logger() -> slog::Logger {
+    let level = if std::env::var("CANVAS_SEAT_TRACE").is_ok() {
+        slog::Level::Trace
+    } else {
+        slog::Level::Debug
+    };
+    let drain = slog::LevelFilter::new(SeatLogDrain, level).fuse();
+    slog::Logger::root(drain, slog::o!())
+}
+
 /// Owns the Wayland display and keeps the globals alive. Pump it from the
 /// backend event loop; client windows appear in the passed ServerState.
+///
+/// Also owns the seat: one keyboard + one pointer. The backend feeds raw
+/// input here; the seat routes it to the focused surfaces.
 pub struct Server {
     display: Display,
     _compositor: Global<WlCompositor>,
@@ -84,6 +121,12 @@ pub struct Server {
     _shell_state: Arc<Mutex<ShellState>>,
     _xdg: Global<XdgWmBase>,
     _zxdg: Global<ZxdgShellV6>,
+    _seat: Seat,
+    _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
+    keyboard: KeyboardHandle,
+    pointer: PointerHandle,
+    serial: u32,
+    start: Instant,
 }
 
 impl Server {
@@ -112,6 +155,12 @@ impl Server {
             None,
         );
         let socket = display.add_socket_auto()?;
+        let (mut seat, seat_global) =
+            Seat::new(&mut display, "seat-0".into(), Some(seat_logger()));
+        let keyboard = seat
+            .add_keyboard(XkbConfig::default(), 200, 25, |_, _| {})
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("seat keyboard: {:?}", err)))?;
+        let pointer = seat.add_pointer(|_| {});
         Ok((
             Self {
                 display,
@@ -121,6 +170,12 @@ impl Server {
                 _shell_state: shell_state,
                 _xdg: xdg,
                 _zxdg: zxdg,
+                _seat: seat,
+                _seat_global: seat_global,
+                keyboard,
+                pointer,
+                serial: 0,
+                start: Instant::now(),
             },
             socket,
         ))
@@ -132,6 +187,76 @@ impl Server {
             .display
             .dispatch(Duration::from_millis(0), state);
         self.display.flush_clients(state);
+    }
+
+    fn next_serial(&mut self) -> Serial {
+        self.serial = self.serial.wrapping_add(1);
+        Serial::from(self.serial)
+    }
+
+    fn now_ms(&self) -> u32 {
+        self.start.elapsed().as_millis() as u32
+    }
+
+    /// Forward a key to the focused client. `evdev` is the kernel keycode.
+    /// Super and Esc never reach here: the backend consumes them as gestures.
+    pub fn input_key(&mut self, evdev: u32, pressed: bool) {
+        log::debug!("seat input_key evdev={} pressed={}", evdev, pressed);
+        let state = if pressed {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        };
+        let serial = self.next_serial();
+        let time = self.now_ms();
+        self.keyboard.input(evdev, state, serial, time, |_, _| true);
+    }
+
+    /// Move keyboard focus. Call with None then the new surface when the
+    /// window set changes, so late-bound clients also receive Enter.
+    pub fn focus_keyboard(&mut self, surface: Option<&WlSurface>) {
+        let serial = self.next_serial();
+        self.keyboard.set_focus(surface, serial);
+    }
+
+    /// Forward pointer motion. `logical` is the output-space position,
+    /// `focus` the surface under the cursor with surface-local coordinates.
+    pub fn input_motion(
+        &mut self,
+        logical: (f64, f64),
+        focus: Option<(WlSurface, (i32, i32))>,
+    ) {
+        log::debug!(
+            "seat input_motion logical=({},{}) focus={}",
+            logical.0,
+            logical.1,
+            focus.is_some()
+        );
+        let serial = self.next_serial();
+        let time = self.now_ms();
+        let location: Point<f64, Logical> = logical.into();
+        let focus = focus.map(|(surface, (x, y))| {
+            let local: Point<i32, Logical> = (x, y).into();
+            (surface, local)
+        });
+        self.pointer.motion(location, focus, serial, time);
+    }
+
+    /// Forward a pointer button. `code` is the evdev button code.
+    pub fn input_button(&mut self, code: u32, pressed: bool) {
+        let state = if pressed {
+            WlButtonState::Pressed
+        } else {
+            WlButtonState::Released
+        };
+        let serial = self.next_serial();
+        let time = self.now_ms();
+        self.pointer.button(code, state, serial, time);
+    }
+
+    /// Forward a scroll frame to the focused client.
+    pub fn input_axis(&mut self, frame: AxisFrame) {
+        self.pointer.axis(frame);
     }
 }
 
@@ -163,5 +288,125 @@ mod tests {
         let wa = &s.windows[&first].canvas;
         let wb = &s.windows[&second].canvas;
         assert!(wb.pos.x > wa.pos.x && wb.pos.y > wa.pos.y);
+    }
+}
+
+/// In-process seat proof: a real client connects over the socket, maps a
+/// toplevel, then the server focuses it and sends key + pointer events.
+/// No X, no winit, no xdotool: pump and dispatch interleave on one thread.
+#[cfg(test)]
+mod seat_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use wayland_client::protocol::wl_compositor::WlCompositor as ClientCompositor;
+    use wayland_client::protocol::wl_keyboard::Event as ClientKeyEvent;
+    use wayland_client::protocol::wl_pointer::Event as ClientPointerEvent;
+    use wayland_client::protocol::wl_seat::WlSeat as ClientSeat;
+    use wayland_client::{Display as ClientDisplay, GlobalManager};
+    use wayland_protocols::xdg_shell::client::{xdg_surface, xdg_wm_base};
+
+    fn pump_both(
+        server: &mut Server,
+        state: &mut ServerState,
+        display: &ClientDisplay,
+        queue: &mut wayland_client::EventQueue,
+        rounds: usize,
+    ) {
+        use std::io::ErrorKind;
+        for _ in 0..rounds {
+            if let Err(e) = display.flush() {
+                assert_eq!(e.kind(), ErrorKind::WouldBlock, "client flush: {:?}", e);
+            }
+            server.pump(state);
+            if let Some(guard) = queue.prepare_read() {
+                if let Err(e) = guard.read_events() {
+                    assert_eq!(e.kind(), ErrorKind::WouldBlock, "client read: {:?}", e);
+                }
+            }
+            queue
+                .dispatch_pending(&mut (), |_, _, _| {})
+                .expect("client dispatch");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn seat_forwards_key_and_pointer_to_focused_window() {
+        std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir());
+        let (mut server, socket) = Server::new().expect("server");
+        let socket_name = socket.to_str().expect("socket name").to_owned();
+        let mut state = ServerState::default();
+
+        let display = ClientDisplay::connect_to_name(socket_name).expect("client connect");
+        let mut queue = display.create_event_queue();
+        let attached = (*display).clone().attach(queue.token());
+        let globals = GlobalManager::new(&attached);
+        pump_both(&mut server, &mut state, &display, &mut queue, 30);
+
+        let compositor = globals
+            .instantiate_exact::<ClientCompositor>(4)
+            .expect("wl_compositor");
+        let seat = globals.instantiate_exact::<ClientSeat>(5).expect("wl_seat");
+        let events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let kb_events = events.clone();
+        seat.get_keyboard().quick_assign(move |_, event, _| match event {
+            ClientKeyEvent::Enter { .. } => kb_events.borrow_mut().push("kb-enter".into()),
+            ClientKeyEvent::Key { key, .. } => {
+                kb_events.borrow_mut().push(format!("key {}", key))
+            }
+            _ => {}
+        });
+        let pt_events = events.clone();
+        seat.get_pointer().quick_assign(move |_, event, _| match event {
+            ClientPointerEvent::Enter { .. } => pt_events.borrow_mut().push("pt-enter".into()),
+            ClientPointerEvent::Button { button, .. } => {
+                pt_events.borrow_mut().push(format!("button {}", button))
+            }
+            _ => {}
+        });
+        pump_both(&mut server, &mut state, &display, &mut queue, 20);
+
+        let wm_base = globals
+            .instantiate_exact::<xdg_wm_base::XdgWmBase>(1)
+            .expect("xdg_wm_base");
+        wm_base.quick_assign(|wm_base, event, _| match event {
+            xdg_wm_base::Event::Ping { serial } => wm_base.pong(serial),
+            _ => {}
+        });
+        let surface = compositor.create_surface();
+        let xdg_surface = wm_base.get_xdg_surface(&surface);
+        xdg_surface.quick_assign(|xdg_surface, event, mut data| match event {
+            xdg_surface::Event::Configure { serial } => {
+                xdg_surface.ack_configure(serial);
+                if let Some(done) = data.get::<bool>() {
+                    *done = true;
+                }
+            }
+            _ => {}
+        });
+        let _toplevel = xdg_surface.get_toplevel();
+        surface.commit();
+        pump_both(&mut server, &mut state, &display, &mut queue, 40);
+        assert_eq!(state.windows.len(), 1, "client toplevel becomes a window");
+
+        let id = *state.windows.keys().next().unwrap();
+        let surf = state.windows[&id].surface.clone().expect("surface");
+        server.focus_keyboard(None);
+        server.focus_keyboard(Some(&surf));
+        server.input_key(16, true);
+        server.input_key(16, false);
+        let local = (10, 10);
+        server.input_motion((0.0, 0.0), Some((surf, local)));
+        server.input_button(0x110, true);
+        server.input_button(0x110, false);
+        pump_both(&mut server, &mut state, &display, &mut queue, 40);
+
+        let got = events.borrow().join("\n");
+        assert!(got.contains("kb-enter"), "keyboard enter:\n{}", got);
+        assert!(got.contains("key 16"), "key event:\n{}", got);
+        assert!(got.contains("pt-enter"), "pointer enter:\n{}", got);
+        assert!(got.contains("button 272"), "button event:\n{}", got);
     }
 }

@@ -16,6 +16,14 @@ impl Vec2 {
     }
 }
 
+impl std::ops::Sub for Vec2 {
+    type Output = Vec2;
+
+    fn sub(self, rhs: Vec2) -> Vec2 {
+        Vec2::new(self.x - rhs.x, self.y - rhs.y)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
     pub pos: Vec2,

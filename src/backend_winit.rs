@@ -10,20 +10,33 @@ use std::time::Duration;
 
 use smithay::backend::{
     input::{
-        ButtonState, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
-        MouseButton, PointerButtonEvent, PointerMotionAbsoluteEvent,
+        Axis, AxisSource as InputAxisSource, ButtonState, Event, InputBackend, InputEvent,
+        KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
+        PointerMotionAbsoluteEvent,
     },
     renderer::{Frame, ImportShm, Texture, Transform},
     winit::{self, WinitEvent, WinitInputError},
 };
+use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis as WlAxis, AxisSource};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle};
 use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
+use smithay::wayland::seat::AxisFrame;
 use smithay::wayland::shm::with_buffer_contents;
 
 use crate::canvas::{window_screen_rect, Camera};
 use crate::keys::{is_super, KeyMapper, TapTracker, KEY_Escape};
 use crate::server::{Server, ServerState};
 use crate::session::{Session, SuperEvent};
+
+/// winit mouse buttons to evdev codes clients expect.
+fn button_code(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => 0x110,
+        MouseButton::Right => 0x111,
+        MouseButton::Middle => 0x112,
+        MouseButton::Other(code) => 0x110 + code as u32,
+    }
+}
 
 /// Background color of the canvas, derived from the camera.
 /// Dark slate that deepens as you zoom out, so overview reads as a void.
@@ -50,14 +63,37 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let view = crate::canvas::Vec2::new(1280.0, 800.0);
     let mut pointer = crate::canvas::Vec2::new(640.0, 400.0);
     let mut frames: u64 = 0;
+    // Window ids the seat already knows about; a change re-asserts focus so
+    // late-bound clients receive keyboard Enter on the newest window.
+    let mut known_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     loop {
         server.pump(&mut server_state);
+        // Newest window steals keyboard focus, like any floating WM.
+        let ids: std::collections::HashSet<u64> = server_state.windows.keys().copied().collect();
+        if ids != known_ids {
+            known_ids = ids;
+            let newest = server_state.windows.keys().copied().max();
+            let surface = newest
+                .and_then(|id| server_state.windows.get(&id))
+                .and_then(|c| c.surface.clone());
+            // Bounce through None so Enter is re-sent even when the
+            // surface is unchanged (clients that bound late missed it).
+            server.focus_keyboard(None);
+            server.focus_keyboard(surface.as_ref());
+        }
         let mut need_render = false;
         match input.dispatch_new_events(|event| match event {
             InputEvent::Keyboard { event } => {
                 let pressed = matches!(event.state(), KeyState::Pressed);
-                let sym = mapper.keysym(event.key_code(), pressed);
+                let (sym, evdev) = mapper.resolve(event.key_code(), pressed);
+                log::debug!(
+                    "key scancode={} sym={} evdev={} pressed={}",
+                    event.key_code(),
+                    sym,
+                    evdev,
+                    pressed
+                );
                 if sym == KEY_Escape && pressed {
                     session.on_event(
                         SuperEvent::Esc,
@@ -76,15 +112,43 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         );
                         need_render = true;
                     }
-                } else if pressed {
-                    tap.note_other_press();
+                } else {
+                    if pressed {
+                        tap.note_other_press();
+                    }
+                    server.input_key(evdev, pressed);
                 }
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                pointer = crate::canvas::Vec2::new(event.x(), event.y());
+                let scale = graphics.window_size().scale_factor;
+                let logical = crate::canvas::Vec2::new(event.x() / scale, event.y() / scale);
+                pointer = logical;
+                let world = session.camera.screen_to_world(logical, view);
+                log::debug!(
+                    "motion physical=({},{}) scale={} logical=({},{}) world=({},{})",
+                    event.x(),
+                    event.y(),
+                    scale,
+                    logical.x,
+                    logical.y,
+                    world.x,
+                    world.y
+                );
+                let hit = server_state
+                    .windows
+                    .iter()
+                    .find(|(_, c)| c.canvas.contains(world));
+                let focus = hit.and_then(|(_, c)| {
+                    c.surface.clone().map(|s| {
+                        let local = world - c.canvas.pos;
+                        (s, (local.x as i32, local.y as i32))
+                    })
+                });
+                server.input_motion((logical.x, logical.y), focus);
             }
             InputEvent::PointerButton { event } => {
-                if event.state() == ButtonState::Pressed
+                let pressed = event.state() == ButtonState::Pressed;
+                if pressed
                     && event.button() == MouseButton::Left
                     && session.state == crate::session::SuperState::Overview
                 {
@@ -107,10 +171,45 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         ),
                     };
                     need_render = true;
+                } else {
+                    // Click focuses the window under the cursor, then the
+                    // client receives the button.
+                    if pressed {
+                        let world = session.camera.screen_to_world(pointer, view);
+                        if let Some((id, c)) = server_state
+                            .windows
+                            .iter()
+                            .find(|(_, c)| c.canvas.contains(world))
+                        {
+                            let id = *id;
+                            server.focus_keyboard(c.surface.as_ref());
+                            known_ids.insert(id);
+                        }
+                    }
+                    server.input_button(button_code(event.button()), pressed);
                 }
             }
             InputEvent::PointerAxis { event } => {
-                log::debug!("axis time={}", event.time());
+                let mut frame =
+                    AxisFrame::new(event.time()).source(match event.source() {
+                        InputAxisSource::Wheel => AxisSource::Wheel,
+                        InputAxisSource::WheelTilt => AxisSource::WheelTilt,
+                        InputAxisSource::Finger => AxisSource::Finger,
+                        InputAxisSource::Continuous => AxisSource::Continuous,
+                    });
+                if let Some(value) = event.amount(Axis::Horizontal) {
+                    frame = frame.value(WlAxis::HorizontalScroll, value);
+                }
+                if let Some(value) = event.amount(Axis::Vertical) {
+                    frame = frame.value(WlAxis::VerticalScroll, value);
+                }
+                if let Some(steps) = event.amount_discrete(Axis::Horizontal) {
+                    frame = frame.discrete(WlAxis::HorizontalScroll, steps as i32);
+                }
+                if let Some(steps) = event.amount_discrete(Axis::Vertical) {
+                    frame = frame.discrete(WlAxis::VerticalScroll, steps as i32);
+                }
+                server.input_axis(frame);
             }
             InputEvent::Special(evt) => match evt {
                 WinitEvent::Refresh => need_render = true,

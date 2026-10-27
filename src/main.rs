@@ -1,5 +1,6 @@
 mod canvas;
 mod session;
+mod bar;
 #[cfg(feature = "compositor")]
 mod backend_winit;
 #[cfg(feature = "compositor")]

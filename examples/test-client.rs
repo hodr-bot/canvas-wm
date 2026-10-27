@@ -11,6 +11,9 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd};
 
 use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_keyboard::Event as KeyEvent;
+use wayland_client::protocol::wl_pointer::Event as PointerEvent;
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm;
 use wayland_client::{Display, GlobalManager};
 use wayland_protocols::xdg_shell::client::{xdg_surface, xdg_wm_base};
@@ -31,6 +34,44 @@ fn main() {
     let shm = globals
         .instantiate_exact::<wl_shm::WlShm>(1)
         .expect("wl_shm");
+    // Bind the seat BEFORE mapping the surface: the compositor moves
+    // keyboard focus to each newly mapped window, and only clients that
+    // already hold keyboard/pointer objects receive Enter.
+    let seat = globals
+        .instantiate_exact::<WlSeat>(5)
+        .expect("wl_seat");
+    let keyboard = seat.get_keyboard();
+    keyboard.quick_assign(|_, event, _| match event {
+        KeyEvent::Enter { .. } => println!("input: keyboard enter"),
+        KeyEvent::Leave { .. } => println!("input: keyboard leave"),
+        KeyEvent::Key { key, state, .. } => {
+            println!("input: key code={} state={:?}", key, state)
+        }
+        _ => {}
+    });
+    let pointer = seat.get_pointer();
+    pointer.quick_assign(|_, event, _| match event {
+        PointerEvent::Enter {
+            surface_x,
+            surface_y,
+            ..
+        } => println!("input: pointer enter x={} y={}", surface_x, surface_y),
+        PointerEvent::Motion {
+            surface_x,
+            surface_y,
+            ..
+        } => println!(
+            "input: pointer motion x={} y={}",
+            surface_x, surface_y
+        ),
+        PointerEvent::Button { button, state, .. } => {
+            println!("input: pointer button code={} state={:?}", button, state)
+        }
+        _ => {}
+    });
+    event_queue
+        .sync_roundtrip(&mut (), |_, _, _| {})
+        .expect("roundtrip");
     let wm_base = globals
         .instantiate_exact::<xdg_wm_base::XdgWmBase>(1)
         .expect("xdg_wm_base");
@@ -70,8 +111,30 @@ fn main() {
     event_queue
         .sync_roundtrip(&mut (), |_, _, _| {})
         .expect("roundtrip");
-    // Stay alive briefly so the window exists server-side, then clean exit.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Dwell so the compositor can deliver seat events (key, pointer);
+    // first CLI arg overrides the dwell in milliseconds (E2E uses more).
+    let dwell_ms: u128 = std::env::args()
+        .nth(1)
+        .and_then(|arg| arg.parse::<u64>().ok())
+        .unwrap_or(1500) as u128;
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < dwell_ms {
+        // Non-blocking client loop: flush requests, read what is available
+        // (dispatch_pending alone never touches the socket), then dispatch.
+        use std::io::ErrorKind;
+        if let Err(e) = display.flush() {
+            assert_ne!(e.kind(), ErrorKind::Other, "flush: {:?}", e);
+        }
+        if let Some(guard) = event_queue.prepare_read() {
+            if let Err(e) = guard.read_events() {
+                assert_eq!(e.kind(), ErrorKind::WouldBlock, "read: {:?}", e);
+            }
+        }
+        event_queue
+            .dispatch_pending(&mut (), |_, _, _| {})
+            .expect("dispatch");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     println!("test-client: configure acked, exiting");
 }
 

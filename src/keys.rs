@@ -1,9 +1,8 @@
 //! Keyboard mapping: scancode -> keysym via xkbcommon, plus Super-tap tracking.
 //!
-//! Winit reports platform scancodes (X11 keycodes on X11, evdev codes on
-//! Wayland). XKB keycodes are evdev+8, so resolution tries the scancode as-is
-//! first and falls back to scancode+8 when that yields NoSymbol. This covers
-//! both backends without platform sniffing.
+//! Winit reports evdev scancodes on Linux (X11 and Wayland backends alike).
+//! XKB keycodes are evdev+8, so resolution tries scancode+8 first and falls
+//! back to the raw scancode when that yields NoSymbol.
 
 use xkbcommon::xkb::{self, KeyDirection, Keycode, Keysym};
 
@@ -13,12 +12,22 @@ pub use xkb::{KEY_Escape, KEY_Super_L, KEY_Super_R};
 pub const NO_SYMBOL: Keysym = 0;
 
 /// Pure fallback logic, testable with a stub lookup.
-pub fn resolve_with_lookup(scancode: u32, mut lookup: impl FnMut(Keycode) -> Keysym) -> Keysym {
-    let first = lookup(scancode);
-    if first != NO_SYMBOL {
-        return first;
+/// Returns the keysym plus the xkb keycode that produced it, so callers can
+/// derive the evdev code (xkb keycode minus 8) for seat forwarding.
+///
+/// Winit reports evdev scancodes on Linux (both X11 and Wayland backends),
+/// and XKB keycodes are evdev+8, so the +8 code is tried first; the raw
+/// scancode is only a fallback for exotic platforms where it already is
+/// an XKB keycode.
+pub fn resolve_with_lookup(
+    scancode: u32,
+    mut lookup: impl FnMut(Keycode) -> Keysym,
+) -> (Keysym, Keycode) {
+    let shifted = lookup(scancode.wrapping_add(8));
+    if shifted != NO_SYMBOL {
+        return (shifted, scancode.wrapping_add(8));
     }
-    lookup(scancode.wrapping_add(8))
+    (lookup(scancode), scancode)
 }
 
 pub fn is_super(sym: Keysym) -> bool {
@@ -82,8 +91,10 @@ impl KeyMapper {
         })
     }
 
-    /// Feed a raw winit scancode + edge, get the keysym back.
-    pub fn keysym(&mut self, scancode: u32, pressed: bool) -> Keysym {
+    /// Feed a raw winit scancode + edge, get the keysym and the evdev keycode.
+    /// The evdev code is what the seat forwards to clients; it is derived
+    /// from whichever xkb keycode actually resolved (xkb is evdev+8).
+    pub fn resolve(&mut self, scancode: u32, pressed: bool) -> (Keysym, u32) {
         // Update both candidate keycodes so shift levels stay coherent.
         // (KeyDirection is not Copy, so the edge is computed per call.)
         let down = |p: bool| {
@@ -96,7 +107,9 @@ impl KeyMapper {
         self.state.update_key(scancode, down(pressed));
         self.state
             .update_key(scancode.wrapping_add(8), down(pressed));
-        resolve_with_lookup(scancode, |code| self.state.key_get_one_sym(code))
+        let (sym, code) =
+            resolve_with_lookup(scancode, |c| self.state.key_get_one_sym(c));
+        (sym, code.wrapping_sub(8))
     }
 }
 
@@ -127,22 +140,26 @@ mod tests {
     }
 
     #[test]
-    fn fallback_adds_eight_on_nosymbol() {
-        // Stub: only the +8 code resolves (Wayland-style raw evdev input).
+    fn shifted_wins_on_evdev_scancode() {
+        // Linux winit gives evdev (16 = KEY_Q); xkb wants evdev+8 (24).
         let mut table = HashMap::new();
-        table.insert(9u32, KEY_Escape);
-        let sym = resolve_with_lookup(1, |code| table.get(&code).copied().unwrap_or(NO_SYMBOL));
-        assert_eq!(sym, KEY_Escape);
+        table.insert(16u32, 55); // '7' on xkb keycode 16
+        table.insert(24u32, 113); // 'q'
+        let (sym, code) =
+            resolve_with_lookup(16, |c| table.get(&c).copied().unwrap_or(NO_SYMBOL));
+        assert_eq!(sym, 113);
+        assert_eq!(code, 24);
     }
 
     #[test]
-    fn direct_hit_wins_over_fallback() {
-        // Stub: raw code already resolves (X11-style input); +8 differs.
-        let sym = resolve_with_lookup(133, |code| match code {
-            133 => KEY_Super_L,
-            141 => KEY_Escape,
-            _ => NO_SYMBOL,
+    fn raw_fallback_when_shifted_misses() {
+        // Stub: only the raw code resolves; +8 is NoSymbol.
+        let mut table = HashMap::new();
+        table.insert(133u32, KEY_Super_L);
+        let (sym, code) = resolve_with_lookup(133, |c| {
+            table.get(&c).copied().unwrap_or(NO_SYMBOL)
         });
         assert_eq!(sym, KEY_Super_L);
+        assert_eq!(code, 133);
     }
 }

@@ -43,7 +43,16 @@
           xorg.libXrender
         ];
         # dlopen at runtime (winit X11, EGL, libwayland-server) needs the
-        # libs on LD_LIBRARY_PATH, not just at link time.
+        # libs on LD_LIBRARY_PATH, not just at link time. cargo test runs
+        # the un-wrapped binary, so the seat e2e test needs it in checkPhase.
+        preCheck = with pkgs; ''
+          export LD_LIBRARY_PATH="${lib.makeLibraryPath [
+            wayland
+            mesa
+            libglvnd
+            libxkbcommon
+          ]}:$LD_LIBRARY_PATH"
+        '';
         postFixup = with pkgs; ''
           wrapProgram $out/bin/canvas-wm \
             --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath [
