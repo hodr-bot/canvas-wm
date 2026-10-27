@@ -1,0 +1,24 @@
+[package]
+name = "canvas-wm"
+version = "0.1.0"
+edition = "2021"
+description = "Infinite canvas Wayland compositor (floating only, game-feel camera)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "canvas-wm"
+path = "src/main.rs"
+
+[dependencies]
+smithay = { version = "0.3", optional = true }
+log = "0.4"
+env_logger = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[features]
+default = []
+compositor = ["smithay"]
+
+[dev-dependencies]
+approx = "0.5"
