@@ -123,6 +123,8 @@ dependencies = [
  "serde",
  "smithay",
  "toml 0.8.23",
+ "wayland-client 0.29.5",
+ "wayland-protocols 0.29.5",
  "xkbcommon",
 ]
 
@@ -1575,6 +1577,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b950621f9354b322ee817a23474e479b34be96c2e909c14f7bc0100e9a970bc6"
 dependencies = [
  "bitflags 1.3.2",
+ "wayland-client 0.29.5",
  "wayland-commons 0.29.5",
  "wayland-scanner 0.29.5",
  "wayland-server",

@@ -23,3 +23,5 @@ compositor = ["smithay", "xkbcommon"]
 
 [dev-dependencies]
 approx = "0.5"
+wayland-client = "0.29"
+wayland-protocols = { version = "0.29", features = ["client"] }
