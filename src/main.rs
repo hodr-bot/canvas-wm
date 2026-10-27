@@ -2,6 +2,8 @@ mod canvas;
 mod session;
 #[cfg(feature = "compositor")]
 mod backend_winit;
+#[cfg(feature = "compositor")]
+mod keys;
 
 use std::collections::HashMap;
 
