@@ -7,11 +7,33 @@
     system = "x86_64-linux";
     pkgs = import nixpkgs { inherit system; };
   in {
-    packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
-      pname = "canvas-wm";
-      version = "0.1.0";
-      src = ./.;
-      cargoLock.lockFile = ./Cargo.lock;
+    packages.${system} = {
+      default = pkgs.rustPlatform.buildRustPackage {
+        pname = "canvas-wm";
+        version = "0.1.0";
+        src = ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+      };
+
+      # Full compositor (Smithay winit backend). Heavier system closure.
+      compositor = pkgs.rustPlatform.buildRustPackage {
+        pname = "canvas-wm";
+        version = "0.1.0";
+        src = ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+        cargoBuildFlags = [ "--features" "compositor" ];
+        nativeBuildInputs = with pkgs; [ pkg-config ];
+        buildInputs = with pkgs; [
+          wayland
+          mesa
+          libgbm
+          libinput
+          udev
+          libdrm
+          dbus
+          libxkbcommon
+        ];
+      };
     };
 
     devShells.${system}.default = pkgs.mkShell {

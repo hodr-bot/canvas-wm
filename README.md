@@ -16,6 +16,9 @@ multi-select kept in view, XWayland + multi-output planned, minimal status bar.
 ```bash
 cargo test
 cargo run
+# Full compositor (window + input pump + GLES render):
+nix build .#compositor
+./result/bin/canvas-wm --winit --frames 120
 ```
 
 NixOS (system module, no home-manager required): see `nix/module.nix`.

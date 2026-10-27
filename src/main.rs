@@ -1,10 +1,28 @@
 mod canvas;
 mod session;
+#[cfg(feature = "compositor")]
+mod backend_winit;
 
 use std::collections::HashMap;
 
 fn main() {
     env_logger::init();
+    #[cfg(feature = "compositor")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--winit") {
+            let frames = args
+                .windows(2)
+                .find(|w| w[0] == "--frames")
+                .and_then(|w| w[1].parse::<u64>().ok());
+            log::info!("canvas-wm 0.1.0 starting (winit backend)");
+            if let Err(err) = backend_winit::run(frames) {
+                log::error!("winit backend failed: {}", err);
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     log::info!("canvas-wm 0.1.0 starting (lot 0: canvas core)");
     log::info!("Smithay backend: winit for dev, udev+libinput+XWayland for sessions");
     // Lot 0 entry point: pure canvas logic is exercised by `cargo test`.
