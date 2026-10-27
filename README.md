@@ -25,3 +25,7 @@ NixOS (system module, no home-manager required): see `nix/module.nix`.
 
 E2E proof (`docs/e2e-render.png`): real xdg client under Xvfb, dark canvas +
 solid client window rendered at its cascade position through the camera.
+Bar proof (`docs/e2e-bar.png`): internal bar client maps first as overlay
+window 0, full-width strip with one green chip per canvas window.
+Verified live: chip click focuses without leaking the button to clients,
+canvas click delivers enter at exact local coords + button 272.
