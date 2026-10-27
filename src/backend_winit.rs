@@ -19,6 +19,7 @@ use smithay::backend::{
 
 use crate::canvas::{Camera, CanvasWindow};
 use crate::keys::{is_super, KeyMapper, TapTracker, KEY_Escape};
+use crate::server::{Server, ServerState};
 use crate::session::{Session, SuperEvent};
 
 /// Background color of the canvas, derived from the camera.
@@ -38,28 +39,30 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut mapper = KeyMapper::new().ok_or("xkb keymap unavailable (missing xkb-data?)")?;
     let mut session = Session::new();
     let mut tap = TapTracker::default();
-    // Real client windows land here once the Wayland frontend exists.
-    let windows: std::collections::HashMap<u64, CanvasWindow> =
-        std::collections::HashMap::new();
+    // Client windows land here as xdg-toplevels connect.
+    let mut server_state = ServerState::default();
+    let (mut server, socket) = Server::new().map_err(|e| format!("wayland bind: {}", e))?;
+    log::info!("wayland socket ready on {:?}", socket);
     // Logical size of the winit window; replaced by real output sizes on udev.
     let view = crate::canvas::Vec2::new(1280.0, 800.0);
     let mut pointer = crate::canvas::Vec2::new(640.0, 400.0);
     let mut frames: u64 = 0;
 
     loop {
+        server.pump(&mut server_state);
         let mut need_render = false;
         match input.dispatch_new_events(|event| match event {
             InputEvent::Keyboard { event } => {
                 let pressed = matches!(event.state(), KeyState::Pressed);
                 let sym = mapper.keysym(event.key_code(), pressed);
                 if sym == KEY_Escape && pressed {
-                    session.on_event(SuperEvent::Esc, &windows, view);
+                    session.on_event(SuperEvent::Esc, &server_state.windows, view);
                     need_render = true;
                 } else if is_super(sym) {
                     if pressed {
                         tap.note_super_press();
                     } else if tap.note_super_release() {
-                        session.on_event(SuperEvent::SuperTap, &windows, view);
+                        session.on_event(SuperEvent::SuperTap, &server_state.windows, view);
                         need_render = true;
                     }
                 } else if pressed {
@@ -75,15 +78,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     && session.state == crate::session::SuperState::Overview
                 {
                     let world = session.camera.screen_to_world(pointer, view);
-                    let hit = windows
+                    let hit = server_state.windows
                         .iter()
                         .find(|(_, w)| w.contains(world))
                         .map(|(id, _)| *id);
                     match hit {
                         Some(id) => {
-                            session.on_event(SuperEvent::WindowClick(id), &windows, view)
+                            session.on_event(SuperEvent::WindowClick(id), &server_state.windows, view)
                         }
-                        None => session.on_event(SuperEvent::CanvasClick, &windows, view),
+                        None => session.on_event(SuperEvent::CanvasClick, &server_state.windows, view),
                     };
                     need_render = true;
                 }

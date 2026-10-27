@@ -23,17 +23,48 @@
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = [ "--features" "compositor" ];
         cargoTestFlags = [ "--features" "compositor" ];
-        nativeBuildInputs = with pkgs; [ pkg-config ];
+        nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
         buildInputs = with pkgs; [
           wayland
           mesa
           libgbm
+          libglvnd
           libinput
           udev
           libdrm
           dbus
           libxkbcommon
+          xorg.libX11
+          xorg.libXcursor
+          xorg.libXrandr
+          xorg.libXi
+          xorg.libXext
+          xorg.libXfixes
+          xorg.libXrender
         ];
+        # dlopen at runtime (winit X11, EGL, libwayland-server) needs the
+        # libs on LD_LIBRARY_PATH, not just at link time.
+        postFixup = with pkgs; ''
+          wrapProgram $out/bin/canvas-wm \
+            --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath [
+              wayland
+              mesa
+              libgbm
+              libglvnd
+              libinput
+              udev
+              libdrm
+              dbus
+              libxkbcommon
+              xorg.libX11
+              xorg.libXcursor
+              xorg.libXrandr
+              xorg.libXi
+              xorg.libXext
+              xorg.libXfixes
+              xorg.libXrender
+            ]}"
+        '';
       };
     };
 

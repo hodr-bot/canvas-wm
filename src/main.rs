@@ -4,6 +4,8 @@ mod session;
 mod backend_winit;
 #[cfg(feature = "compositor")]
 mod keys;
+#[cfg(feature = "compositor")]
+mod server;
 
 use std::collections::HashMap;
 
