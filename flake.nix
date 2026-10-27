@@ -22,6 +22,7 @@
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = [ "--features" "compositor" ];
+        cargoTestFlags = [ "--features" "compositor" ];
         nativeBuildInputs = with pkgs; [ pkg-config ];
         buildInputs = with pkgs; [
           wayland
