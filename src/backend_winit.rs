@@ -27,6 +27,8 @@ use crate::canvas::{window_screen_rect, Camera};
 use crate::keys::{is_super, KeyMapper, TapTracker, KEY_Escape};
 use crate::server::{Server, ServerState};
 use crate::session::{Session, SuperEvent};
+use crate::{bar, bar_client::BarClient};
+use crate::bar::BAR_HEIGHT;
 
 /// winit mouse buttons to evdev codes clients expect.
 fn button_code(button: MouseButton) -> u32 {
@@ -66,14 +68,39 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Window ids the seat already knows about; a change re-asserts focus so
     // late-bound clients receive keyboard Enter on the newest window.
     let mut known_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Focused canvas window (chip highlight) and last bar state sent.
+    let mut focused_id: Option<u64> = None;
+    let mut last_bar: (usize, Option<usize>) = (usize::MAX, None);
+
+    // The internal bar maps first, before any external client can connect.
+    // Tag window 0 as the screen-space overlay once the server sees it.
+    let mut bar = BarClient::connect(&socket, view.x as i32)
+        .map_err(|e| format!("bar client: {}", e))?;
+    for _ in 0..500 {
+        bar.progress();
+        server.pump(&mut server_state);
+        bar.pump();
+        if server_state.windows.contains_key(&0) {
+            server_state.set_overlay(0);
+            break;
+        }
+    }
+    if !server_state
+        .windows
+        .get(&0)
+        .map(|c| c.overlay)
+        .unwrap_or(false)
+    {
+        log::warn!("bar did not map; continuing without overlay");
+    }
 
     loop {
         server.pump(&mut server_state);
-        // Newest window steals keyboard focus, like any floating WM.
+        // Newest canvas window steals keyboard focus, like any floating WM.
         let ids: std::collections::HashSet<u64> = server_state.windows.keys().copied().collect();
         if ids != known_ids {
             known_ids = ids;
-            let newest = server_state.windows.keys().copied().max();
+            let newest = server_state.canvas_ids().iter().copied().max();
             let surface = newest
                 .and_then(|id| server_state.windows.get(&id))
                 .and_then(|c| c.surface.clone());
@@ -81,6 +108,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             // surface is unchanged (clients that bound late missed it).
             server.focus_keyboard(None);
             server.focus_keyboard(surface.as_ref());
+            focused_id = newest;
         }
         let mut need_render = false;
         match input.dispatch_new_events(|event| match event {
@@ -123,6 +151,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let scale = graphics.window_size().scale_factor;
                 let logical = crate::canvas::Vec2::new(event.x() / scale, event.y() / scale);
                 pointer = logical;
+                // The bar captures the pointer: no client focus above it.
+                if bar::in_bar(logical) {
+                    server.input_motion((logical.x, logical.y), None);
+                    return;
+                }
                 let world = session.camera.screen_to_world(logical, view);
                 log::debug!(
                     "motion physical=({},{}) scale={} logical=({},{}) world=({},{})",
@@ -137,18 +170,33 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let hit = server_state
                     .windows
                     .iter()
-                    .find(|(_, c)| c.canvas.contains(world));
+                    .find(|(_, c)| !c.overlay && c.canvas.contains(world));
+                // Seat offset = surface origin in logical space; Smithay
+                // reports enter/motion coords as pointer minus this origin.
                 let focus = hit.and_then(|(_, c)| {
                     c.surface.clone().map(|s| {
-                        let local = world - c.canvas.pos;
-                        (s, (local.x as i32, local.y as i32))
+                        let (ox, oy, _, _) =
+                            window_screen_rect(&session.camera, &c.canvas, view, scale);
+                        (s, ((ox / scale) as i32, (oy / scale) as i32))
                     })
                 });
                 server.input_motion((logical.x, logical.y), focus);
             }
             InputEvent::PointerButton { event } => {
                 let pressed = event.state() == ButtonState::Pressed;
-                if pressed
+                // Bar clicks focus a chip's window and never reach clients.
+                if pressed && bar::in_bar(pointer) {
+                    let canvas = server_state.canvas_ids();
+                    if let Some(i) = bar::chip_at(pointer, canvas.len(), view.x) {
+                        if let Some(id) = canvas.get(i).copied() {
+                            if let Some(c) = server_state.windows.get(&id) {
+                                server.focus_keyboard(c.surface.as_ref());
+                            }
+                            focused_id = Some(id);
+                            need_render = true;
+                        }
+                    }
+                } else if pressed
                     && event.button() == MouseButton::Left
                     && session.state == crate::session::SuperState::Overview
                 {
@@ -156,7 +204,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     let hit = server_state
                         .windows
                         .iter()
-                        .find(|(_, c)| c.canvas.contains(world))
+                        .find(|(_, c)| !c.overlay && c.canvas.contains(world))
                         .map(|(id, _)| *id);
                     match hit {
                         Some(id) => session.on_event(
@@ -179,10 +227,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         if let Some((id, c)) = server_state
                             .windows
                             .iter()
-                            .find(|(_, c)| c.canvas.contains(world))
+                            .find(|(_, c)| !c.overlay && c.canvas.contains(world))
                         {
                             let id = *id;
                             server.focus_keyboard(c.surface.as_ref());
+                            focused_id = Some(id);
                             known_ids.insert(id);
                         }
                     }
@@ -227,6 +276,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // Bar follows the canvas window set; redraw on change.
+        bar.pump();
+        let canvas = server_state.canvas_ids();
+        let focused_chip = focused_id.and_then(|id| canvas.iter().position(|c| *c == id));
+        if (canvas.len(), focused_chip) != last_bar {
+            last_bar = (canvas.len(), focused_chip);
+            log::debug!(
+                "bar update n={} focused_chip={:?}",
+                canvas.len(),
+                focused_chip
+            );
+            bar.redraw(canvas.len(), focused_chip);
+            need_render = true;
+        }
+
         if need_render || frames == 0 || max_frames.is_some() {
             let scale = graphics.window_size().scale_factor;
             let color = background_color(&session.camera);
@@ -268,12 +332,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
-                    // Draw through the canvas camera.
+                    // Draw through the canvas camera, or screen-fixed for
+                    // the overlay bar.
                     if let Some(tex) = cw.texture.as_ref() {
-                        let (x, y, w, h) =
-                            window_screen_rect(&session.camera, &cw.canvas, view, scale);
-                        let dest =
-                            Rectangle::<f64, Physical>::from_loc_and_size((x, y), (w, h));
+                        let dest = if cw.overlay {
+                            Rectangle::<f64, Physical>::from_loc_and_size(
+                                (0.0, 0.0),
+                                (view.x * scale, BAR_HEIGHT * scale),
+                            )
+                        } else {
+                            let (x, y, w, h) =
+                                window_screen_rect(&session.camera, &cw.canvas, view, scale);
+                            Rectangle::<f64, Physical>::from_loc_and_size((x, y), (w, h))
+                        };
                         let src = Rectangle::<i32, BufferCoord>::from_loc_and_size(
                             (0, 0),
                             tex.size(),

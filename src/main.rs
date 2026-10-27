@@ -4,6 +4,8 @@ mod bar;
 #[cfg(feature = "compositor")]
 mod backend_winit;
 #[cfg(feature = "compositor")]
+mod bar_client;
+#[cfg(feature = "compositor")]
 mod keys;
 #[cfg(feature = "compositor")]
 mod server;

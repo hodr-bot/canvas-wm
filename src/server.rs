@@ -54,10 +54,13 @@ pub struct ServerState {
 
 /// A client window: canvas placement plus live surface and GPU texture.
 /// The texture is refreshed from newly committed shm buffers each frame.
+/// `overlay` marks non-canvas surfaces (the internal bar): drawn fixed in
+/// screen space, excluded from picking, focus and seat routing.
 pub struct ClientWindow {
     pub canvas: CanvasWindow,
     pub surface: Option<WlSurface>,
     pub texture: Option<Gles2Texture>,
+    pub overlay: bool,
 }
 
 impl ClientWindow {
@@ -66,6 +69,7 @@ impl ClientWindow {
             canvas: place_window(id, n),
             surface,
             texture: None,
+            overlay: false,
         }
     }
 }
@@ -77,6 +81,26 @@ impl ServerState {
         let win = ClientWindow::new(id, surface, self.windows.len());
         self.windows.insert(id, win);
         id
+    }
+
+    /// Tag a window as screen-space overlay (the bar). Only the backend
+    /// calls this, right after the internal bar client maps at startup.
+    pub fn set_overlay(&mut self, id: u64) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            win.overlay = true;
+        }
+    }
+
+    /// Windows on the canvas, sorted by id; overlays excluded.
+    pub fn canvas_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .windows
+            .iter()
+            .filter(|(_, c)| !c.overlay)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
@@ -220,7 +244,8 @@ impl Server {
     }
 
     /// Forward pointer motion. `logical` is the output-space position,
-    /// `focus` the surface under the cursor with surface-local coordinates.
+    /// `focus` the surface under the cursor with the surface ORIGIN in
+    /// logical space (Smithay subtracts it to report surface-local coords).
     pub fn input_motion(
         &mut self,
         logical: (f64, f64),
