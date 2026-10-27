@@ -53,7 +53,7 @@ impl Default for Camera {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct CanvasWindow {
     pub id: u64,
     pub pos: Vec2,
@@ -189,6 +189,21 @@ pub fn focus_in_direction(from: Vec2, dir: Vec2, windows: &[CanvasWindow]) -> Op
     best.map(|(_, id)| id)
 }
 
+/// Screen rectangle (physical pixels) of a window through the camera.
+/// `view` is the logical output size, `scale` the output scale factor.
+pub fn window_screen_rect(
+    cam: &Camera,
+    win: &CanvasWindow,
+    view: Vec2,
+    scale: f64,
+) -> (f64, f64, f64, f64) {
+    let x = ((win.pos.x - cam.pos.x) * cam.zoom + view.x * 0.5) * scale;
+    let y = ((win.pos.y - cam.pos.y) * cam.zoom + view.y * 0.5) * scale;
+    let w = win.size.x * cam.zoom * scale;
+    let h = win.size.y * cam.zoom * scale;
+    (x, y, w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +254,22 @@ mod tests {
         assert_eq!(hit, Some(1));
         let miss = focus_in_direction(from, Vec2::new(-1.0, -1.0), &[wins[0].clone()]);
         assert_eq!(miss, None);
+    }
+
+    #[test]
+    fn screen_rect_matches_camera() {
+        let cam = Camera::new();
+        let view = Vec2::new(1280.0, 800.0);
+        let win = CanvasWindow::new(1, 96.0, 96.0, 800.0, 600.0);
+        let (x, y, w, h) = window_screen_rect(&cam, &win, view, 1.0);
+        assert_eq!((x, y, w, h), (736.0, 496.0, 800.0, 600.0));
+        // Zoomed out: everything shrinks toward the view center.
+        let far = Camera {
+            zoom: 0.5,
+            ..Camera::new()
+        };
+        let (x2, _, w2, _) = window_screen_rect(&far, &win, view, 1.0);
+        assert!(w2 < w && x2 > 500.0 && x2 < 736.0);
     }
 
     #[test]

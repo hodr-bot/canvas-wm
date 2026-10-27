@@ -98,7 +98,7 @@ impl Session {
     pub fn on_event(
         &mut self,
         event: SuperEvent,
-        windows: &std::collections::HashMap<u64, CanvasWindow>,
+        resolve: &dyn Fn(u64) -> Option<CanvasWindow>,
         view: Vec2,
     ) -> SuperAction {
         match (&self.state, event) {
@@ -119,10 +119,11 @@ impl Session {
             (SuperState::Overview, SuperEvent::SuperTap) => {
                 let ids = self.overview.quit();
                 self.state = SuperState::Idle;
-                let selected: Vec<&CanvasWindow> =
-                    ids.iter().filter_map(|id| windows.get(id)).collect();
+                let selected: Vec<CanvasWindow> =
+                    ids.iter().filter_map(|id| resolve(*id)).collect();
+                let refs: Vec<&CanvasWindow> = selected.iter().collect();
                 // Empty selection = plain focus-back, no forced fullscreen.
-                let fit = fit_view_for_selection(&self.camera, &selected, view, 80.0);
+                let fit = fit_view_for_selection(&self.camera, &refs, view, 80.0);
                 if let Some(fit) = fit {
                     self.camera = fit;
                 } else if let Some(prev) = self.prev_camera.take() {
@@ -168,14 +169,15 @@ mod tests {
     fn super_tap_select_retap_keeps_both_in_view() {
         let mut s = Session::new();
         let wins = two_windows();
+        let resolve = |id: u64| wins.get(&id).copied();
         let view = Vec2::new(1920.0, 1080.0);
         assert!(matches!(
-            s.on_event(SuperEvent::SuperTap, &wins, view),
+            s.on_event(SuperEvent::SuperTap, &resolve, view),
             SuperAction::EnterOverview { .. }
         ));
-        s.on_event(SuperEvent::WindowClick(1), &wins, view);
-        s.on_event(SuperEvent::WindowClick(2), &wins, view);
-        let action = s.on_event(SuperEvent::SuperTap, &wins, view);
+        s.on_event(SuperEvent::WindowClick(1), &resolve, view);
+        s.on_event(SuperEvent::WindowClick(2), &resolve, view);
+        let action = s.on_event(SuperEvent::SuperTap, &resolve, view);
         let fit = match action {
             SuperAction::QuitWithFit { fit } => fit.expect("both selected => fit"),
             other => panic!("expected fit, got {:?}", other),
@@ -191,11 +193,12 @@ mod tests {
     fn esc_restores_previous_camera() {
         let mut s = Session::new();
         let wins = two_windows();
+        let resolve = |id: u64| wins.get(&id).copied();
         let view = Vec2::new(1920.0, 1080.0);
         let before = s.camera;
-        s.on_event(SuperEvent::SuperTap, &wins, view);
+        s.on_event(SuperEvent::SuperTap, &resolve, view);
         assert_ne!(s.camera.zoom, before.zoom);
-        s.on_event(SuperEvent::Esc, &wins, view);
+        s.on_event(SuperEvent::Esc, &resolve, view);
         assert_eq!(s.camera.zoom, before.zoom);
     }
 

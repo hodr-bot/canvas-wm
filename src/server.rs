@@ -10,11 +10,13 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use smithay::backend::renderer::gles2::Gles2Texture;
 use smithay::reexports::wayland_protocols::unstable::xdg_shell::v6::server::zxdg_shell_v6::ZxdgShellV6;
 use smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase;
 use smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, Global};
 use smithay::wayland::compositor::compositor_init;
 use smithay::wayland::shell::xdg::{xdg_shell_init, ShellState, XdgRequest};
@@ -40,15 +42,33 @@ pub fn place_window(id: u64, n: usize) -> CanvasWindow {
 
 #[derive(Default)]
 pub struct ServerState {
-    pub windows: HashMap<u64, CanvasWindow>,
+    pub windows: HashMap<u64, ClientWindow>,
     next_id: u64,
 }
 
+/// A client window: canvas placement plus live surface and GPU texture.
+/// The texture is refreshed from newly committed shm buffers each frame.
+pub struct ClientWindow {
+    pub canvas: CanvasWindow,
+    pub surface: Option<WlSurface>,
+    pub texture: Option<Gles2Texture>,
+}
+
+impl ClientWindow {
+    fn new(id: u64, surface: Option<WlSurface>, n: usize) -> Self {
+        Self {
+            canvas: place_window(id, n),
+            surface,
+            texture: None,
+        }
+    }
+}
+
 impl ServerState {
-    pub fn add_toplevel(&mut self) -> u64 {
+    pub fn add_toplevel(&mut self, surface: Option<WlSurface>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let win = place_window(id, self.windows.len());
+        let win = ClientWindow::new(id, surface, self.windows.len());
         self.windows.insert(id, win);
         id
     }
@@ -81,7 +101,8 @@ impl Server {
             |request, mut dispatch| match request {
                 XdgRequest::NewToplevel { surface } => {
                     if let Some(state) = dispatch.get::<ServerState>() {
-                        let id = state.add_toplevel();
+                        let wl_surface = surface.get_surface().cloned();
+                        let id = state.add_toplevel(wl_surface);
                         log::info!("new toplevel -> canvas window {}", id);
                         surface.send_configure();
                     }
@@ -135,12 +156,12 @@ mod tests {
     #[test]
     fn toplevels_get_unique_ids_and_windows() {
         let mut s = ServerState::default();
-        let first = s.add_toplevel();
-        let second = s.add_toplevel();
+        let first = s.add_toplevel(None);
+        let second = s.add_toplevel(None);
         assert_ne!(first, second);
         assert_eq!(s.windows.len(), 2);
-        let wa = &s.windows[&first];
-        let wb = &s.windows[&second];
+        let wa = &s.windows[&first].canvas;
+        let wb = &s.windows[&second].canvas;
         assert!(wb.pos.x > wa.pos.x && wb.pos.y > wa.pos.y);
     }
 }

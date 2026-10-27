@@ -13,11 +13,14 @@ use smithay::backend::{
         ButtonState, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
         MouseButton, PointerButtonEvent, PointerMotionAbsoluteEvent,
     },
-    renderer::Frame,
+    renderer::{Frame, ImportShm, Texture, Transform},
     winit::{self, WinitEvent, WinitInputError},
 };
+use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle};
+use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
+use smithay::wayland::shm::with_buffer_contents;
 
-use crate::canvas::{Camera, CanvasWindow};
+use crate::canvas::{window_screen_rect, Camera};
 use crate::keys::{is_super, KeyMapper, TapTracker, KEY_Escape};
 use crate::server::{Server, ServerState};
 use crate::session::{Session, SuperEvent};
@@ -56,13 +59,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let pressed = matches!(event.state(), KeyState::Pressed);
                 let sym = mapper.keysym(event.key_code(), pressed);
                 if sym == KEY_Escape && pressed {
-                    session.on_event(SuperEvent::Esc, &server_state.windows, view);
+                    session.on_event(
+                        SuperEvent::Esc,
+                        &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                        view,
+                    );
                     need_render = true;
                 } else if is_super(sym) {
                     if pressed {
                         tap.note_super_press();
                     } else if tap.note_super_release() {
-                        session.on_event(SuperEvent::SuperTap, &server_state.windows, view);
+                        session.on_event(
+                            SuperEvent::SuperTap,
+                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                            view,
+                        );
                         need_render = true;
                     }
                 } else if pressed {
@@ -78,15 +89,22 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     && session.state == crate::session::SuperState::Overview
                 {
                     let world = session.camera.screen_to_world(pointer, view);
-                    let hit = server_state.windows
+                    let hit = server_state
+                        .windows
                         .iter()
-                        .find(|(_, w)| w.contains(world))
+                        .find(|(_, c)| c.canvas.contains(world))
                         .map(|(id, _)| *id);
                     match hit {
-                        Some(id) => {
-                            session.on_event(SuperEvent::WindowClick(id), &server_state.windows, view)
-                        }
-                        None => session.on_event(SuperEvent::CanvasClick, &server_state.windows, view),
+                        Some(id) => session.on_event(
+                            SuperEvent::WindowClick(id),
+                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                            view,
+                        ),
+                        None => session.on_event(
+                            SuperEvent::CanvasClick,
+                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                            view,
+                        ),
                     };
                     need_render = true;
                 }
@@ -111,10 +129,66 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         }
 
         if need_render || frames == 0 || max_frames.is_some() {
+            let scale = graphics.window_size().scale_factor;
             let color = background_color(&session.camera);
-            graphics.render(|_, frame| {
+            graphics.render(|renderer, frame| {
                 if let Err(err) = frame.clear(color) {
                     log::error!("clear failed: {}", err);
+                }
+                for (id, cw) in server_state.windows.iter_mut() {
+                    // Import freshly committed shm buffers.
+                    if let Some(surface) = cw.surface.as_ref() {
+                        let assignment = with_states(surface, |states| {
+                            states
+                                .cached_state
+                                .current::<SurfaceAttributes>()
+                                .buffer
+                                .take()
+                        });
+                        if let Ok(Some(BufferAssignment::NewBuffer { buffer, .. })) = assignment {
+                            let dims = with_buffer_contents(&buffer, |_, data| {
+                                (data.width, data.height)
+                            });
+                            if let Ok((w, h)) = dims {
+                                let damage = Rectangle::<i32, BufferCoord>::from_loc_and_size(
+                                    (0, 0),
+                                    (w, h),
+                                );
+                                match renderer.import_shm_buffer(&buffer, None, &[damage]) {
+                                    Ok(tex) => {
+                                        log::info!(
+                                            "imported {}x{} shm buffer for window {}",
+                                            w,
+                                            h,
+                                            id
+                                        );
+                                        cw.texture = Some(tex)
+                                    }
+                                    Err(err) => log::warn!("shm import failed: {}", err),
+                                }
+                            }
+                        }
+                    }
+                    // Draw through the canvas camera.
+                    if let Some(tex) = cw.texture.as_ref() {
+                        let (x, y, w, h) =
+                            window_screen_rect(&session.camera, &cw.canvas, view, scale);
+                        let dest =
+                            Rectangle::<f64, Physical>::from_loc_and_size((x, y), (w, h));
+                        let src = Rectangle::<i32, BufferCoord>::from_loc_and_size(
+                            (0, 0),
+                            tex.size(),
+                        );
+                        if let Err(err) = frame.render_texture_from_to(
+                            tex,
+                            src,
+                            dest,
+                            Transform::Normal,
+                            1.0,
+                        ) {
+                            log::warn!("draw failed: {}", err);
+                        }
+                    }
                 }
             })?;
             frames += 1;

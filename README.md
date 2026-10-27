@@ -22,3 +22,6 @@ nix build .#compositor
 ```
 
 NixOS (system module, no home-manager required): see `nix/module.nix`.
+
+E2E proof (`docs/e2e-render.png`): real xdg client under Xvfb, dark canvas +
+solid client window rendered at its cascade position through the camera.
