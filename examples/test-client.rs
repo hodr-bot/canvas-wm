@@ -34,24 +34,30 @@ fn main() {
 
     let surface = compositor.create_surface();
     let xdg_surface = wm_base.get_xdg_surface(&surface);
-    xdg_surface.quick_assign(|xdg_surface, event, _| match event {
-        xdg_surface::Event::Configure { serial } => xdg_surface.ack_configure(serial),
+    xdg_surface.quick_assign(|xdg_surface, event, mut dispatch_data| match event {
+        xdg_surface::Event::Configure { serial } => {
+            xdg_surface.ack_configure(serial);
+            if let Some(configured) = dispatch_data.get::<bool>() {
+                *configured = true;
+            }
+        }
         _ => {}
     });
     let toplevel = xdg_surface.get_toplevel();
     toplevel.set_title("canvas-wm test".into());
     surface.commit();
 
-    let mut rounds = 0u32;
-    loop {
-        event_queue
-            .dispatch_pending(&mut (), |_, _, _| {})
-            .expect("dispatch");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        rounds += 1;
-        if rounds > 15 {
-            break;
-        }
+    // Synchronous roundtrip: flushes our requests and blocks until the
+    // compositor processed them. No configure back means no window.
+    let mut configured = false;
+    event_queue
+        .sync_roundtrip(&mut configured, |_, _, _| {})
+        .expect("roundtrip");
+    if !configured {
+        eprintln!("test-client: no configure received, no window created");
+        std::process::exit(1);
     }
-    println!("test-client: toplevel open, exiting");
+    // Stay alive briefly so the window exists server-side, then clean exit.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    println!("test-client: configure acked, exiting");
 }
