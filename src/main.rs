@@ -1,4 +1,5 @@
 mod canvas;
+mod session;
 
 use std::collections::HashMap;
 
