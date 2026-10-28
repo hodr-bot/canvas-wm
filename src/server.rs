@@ -16,6 +16,7 @@ use smithay::backend::input::KeyState;
 use smithay::backend::renderer::gles2::Gles2Texture;
 use smithay::reexports::wayland_protocols::unstable::xdg_shell::v6::server::zxdg_shell_v6::ZxdgShellV6;
 use smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase;
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor;
@@ -71,6 +72,9 @@ pub struct ClientWindow {
     pub canvas: CanvasWindow,
     pub surface: Option<WlSurface>,
     pub texture: Option<Gles2Texture>,
+    /// Last attached buffer, kept so damage-only commits (repaint into
+    /// the same shm buffer, no new attach) can re-upload pixels.
+    pub last_buffer: Option<WlBuffer>,
     pub overlay: bool,
     pub x11: Option<u32>,
 }
@@ -81,6 +85,7 @@ impl ClientWindow {
             canvas: place_window(id, n),
             surface,
             texture: None,
+            last_buffer: None,
             overlay: false,
             x11: None,
         }

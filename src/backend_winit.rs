@@ -145,6 +145,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Unmatched X surface links wait here; the surface may be created
     // server-side after the client message arrives.
     let mut pending_x: Vec<(u32, u32)> = Vec::new();
+    let frame_clock = std::time::Instant::now();
 
     loop {
         if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(0)), &mut ()) {
@@ -487,6 +488,24 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             need_render = true;
         }
 
+        // Newly committed client buffers (native or XWayland) need a
+        // frame even with no input: otherwise live apps (xterm text,
+        // clocks) stay stuck on their first imported buffer. Damage-only
+        // commits (no new attach) count too: X clients repaint into the
+        // same shm buffer and only send damage.
+        for cw in server_state.windows.values() {
+            if let Some(surface) = cw.surface.as_ref() {
+                let pending = with_states(surface, |states| {
+                    let current = states.cached_state.current::<SurfaceAttributes>();
+                    current.buffer.is_some() || !current.damage.is_empty()
+                });
+                if matches!(pending, Ok(true)) {
+                    need_render = true;
+                    break;
+                }
+            }
+        }
+
         if need_render || frames == 0 || max_frames.is_some() {
             let scale = graphics.window_size().scale_factor;
             let color = background_color(&session.camera);
@@ -495,17 +514,33 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     log::error!("clear failed: {}", err);
                 }
                 for (id, cw) in server_state.windows.iter_mut() {
-                    // Import freshly committed shm buffers.
+                    // Import freshly committed shm buffers. New attaches
+                    // upload the new buffer; damage-only commits repaint
+                    // into the kept buffer, so re-upload that.
                     if let Some(surface) = cw.surface.as_ref() {
-                        let assignment = with_states(surface, |states| {
-                            states
-                                .cached_state
-                                .current::<SurfaceAttributes>()
-                                .buffer
-                                .take()
+                        let (assignment, damaged) = with_states(surface, |states| {
+                            let mut current =
+                                states.cached_state.current::<SurfaceAttributes>();
+                            let assignment = current.buffer.take();
+                            let damaged = !current.damage.is_empty();
+                            current.damage.clear();
+                            (assignment, damaged)
+                        })
+                        .unwrap_or((None, false));
+                        let buffer = match assignment {
+                            Some(BufferAssignment::NewBuffer { buffer, .. }) => Some(buffer),
+                            _ => None,
+                        };
+                        let buffer = buffer.or_else(|| {
+                            if damaged {
+                                cw.last_buffer.clone()
+                            } else {
+                                None
+                            }
                         });
-                        if let Ok(Some(BufferAssignment::NewBuffer { buffer, .. })) = assignment {
-                            let dims = with_buffer_contents(&buffer, |_, data| {
+                        if let Some(buffer) = buffer.as_ref() {
+                            cw.last_buffer = Some(buffer.clone());
+                            let dims = with_buffer_contents(buffer, |_, data| {
                                 (data.width, data.height)
                             });
                             if let Ok((w, h)) = dims {
@@ -573,6 +608,27 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     }
                 }
             })?;
+            // Frame callbacks: tell clients this frame was presented, so
+            // paced clients (Xwayland damage throttling, animations) keep
+            // committing instead of stalling after their first buffer.
+            let now_ms = frame_clock.elapsed().as_millis() as u32;
+            for cw in server_state.windows.values() {
+                if let Some(surface) = cw.surface.as_ref() {
+                    let pending = with_states(surface, |states| {
+                        std::mem::take(
+                            &mut states
+                                .cached_state
+                                .current::<SurfaceAttributes>()
+                                .frame_callbacks,
+                        )
+                    });
+                    if let Ok(callbacks) = pending {
+                        for callback in callbacks {
+                            callback.done(now_ms);
+                        }
+                    }
+                }
+            }
             frames += 1;
             if let Some(max) = max_frames {
                 if frames >= max {

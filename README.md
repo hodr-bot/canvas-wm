@@ -41,3 +41,11 @@ V1 photo series (all live under Xvfb, `docs/v1-*.png`):
 `v1-fit` — re-Super keeps both in view
 (log: `QuitWithFit … zoom=2.00 selected=2`, both windows fill the frame);
 `v1-xwayland` — xeyes alone, white eyes + pupils tracking the pointer.
+
+Real apps (`docs/v1-real-apps.png`, `docs/v1-real-overview.png`):
+xterm with typed `echo toile-infinie-V1` (keyboard works end-to-end
+through seat/XTEST), xclock analog face, xcalc with full labels —
+all live XWayland clients with core fonts + Xft configured headless.
+Fixes that made it possible: frame callbacks (`wl_callback.done`
+every presented frame — Xwayland throttles damage without them) and
+damage-only commit re-import from the kept shm buffer.
