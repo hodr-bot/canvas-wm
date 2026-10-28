@@ -31,6 +31,14 @@ export XDG_RUNTIME_DIR="$RT"
 : "${RUST_LOG:=canvas_wm=info}"
 export RUST_LOG
 
+# The dev window defaults to the X11 backend: winit 0.25-era Wayland
+# tables abort (SIGABRT) on wl_shm format codes newer than they know,
+# which modern host compositors advertise (proven with a fake host:
+# bogus format code -> byte-identical `unknown opcode 0` abort).
+# X11 sidesteps the host handshake entirely.
+: "${WINIT_UNIX_BACKEND:=x11}"
+export WINIT_UNIX_BACKEND
+
 # Print the compositor log tail to help diagnose startup failures.
 dump_log() {
     echo "--- last 30 lines of $LOG ---" >&2
