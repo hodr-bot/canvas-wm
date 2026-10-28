@@ -23,7 +23,7 @@ use smithay::backend::{
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis as WlAxis, AxisSource};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle};
+use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size};
 use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
 use smithay::wayland::seat::AxisFrame;
 use smithay::wayland::shm::with_buffer_contents;
@@ -62,6 +62,59 @@ pub fn background_color(camera: &Camera) -> [f32; 4] {
     let t = ((camera.zoom - 0.05) / 1.95).clamp(0.0, 1.0) as f32;
     let base = 0.04 + 0.05 * t;
     [base * 0.9, base, base * 1.3, 1.0]
+}
+
+/// Draw one menu text line: atlas quads per char (upright UVs, real
+/// alpha) plus solid overlay pixels for French accents. Screen space,
+/// y down; `u` is the canvas-to-physical scale (zoom x output scale),
+/// cells are 16 logical px at 2x.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_menu_line(
+    gl: &smithay::backend::renderer::gles2::ffi::Gles2,
+    tprog: (u32, i32, i32, i32, u32, u32),
+    sprog: (u32, i32, i32, u32),
+    mvp: &[f32; 16],
+    atlas: u32,
+    x: f32,
+    y: f32,
+    u: f32,
+    text: &str,
+) {
+    let cell = 16.0 * u;
+    let dot = 2.0 * u;
+    let mut cx = x;
+    for ch in text.chars() {
+        let mapped = crate::menu::cell_for(ch);
+        let (u0, v0, u1, v1) = crate::render3d::glyph_uv(mapped.byte);
+        let w = 8.0 * 2.0 * u;
+        let verts: [f32; 16] = [
+            cx, y, u0, v0, //
+            cx + w, y, u1, v0, //
+            cx, y + w, u0, v1, //
+            cx + w, y + w, u1, v1,
+        ];
+        crate::render3d::draw_textured(gl, tprog, mvp, atlas, &verts, false);
+        if let Some(accent) = mapped.accent {
+            // Capitals use row 0 for the body, so their accents lift one
+            // row to stay clear of the glyph (lowercase rows 0-1 are free).
+            let lift = if mapped.byte.is_ascii_uppercase() { -1 } else { 0 };
+            for (px, py) in crate::menu::accent_pixels(accent) {
+                crate::render3d::draw_solid(
+                    gl,
+                    sprog,
+                    mvp,
+                    [1.0, 1.0, 1.0, 1.0],
+                    (
+                        cx + *px as f32 * 2.0 * u,
+                        y + (*py + lift) as f32 * 2.0 * u,
+                        dot,
+                        dot,
+                    ),
+                );
+            }
+        }
+        cx += cell;
+    }
 }
 
 /// Open the dev window and run until closed or `max_frames` is reached.
@@ -112,6 +165,20 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut solid_prog: Option<(u32, i32, i32, u32)> = None;
     // Textured GL program: windows as perspective planes in 3D.
     let mut tex_prog: Option<(u32, i32, i32, i32, u32, u32)> = None;
+    // Options menu + user settings (Options menu edits these live).
+    let mut settings = crate::settings::Settings::default();
+    let mut menu = crate::menu::MenuState::default();
+    // Ambient background: compiled program, animation clock (seconds at
+    // current speed; frozen in eco), and last repaint for the slow-drift
+    // throttle. Off = flat clear, zero shader cost.
+    let mut bg_prog: Option<(u32, i32, i32, i32, i32, u32)> = None;
+    let mut bg_failed = false;
+    let mut bg_time: f32 = 0.0;
+    let mut last_bg_paint = std::time::Instant::now();
+    // Glyph atlas texture for menu text (uploaded once, 128x64 RGBA).
+    let mut atlas_tex: Option<
+        smithay::backend::renderer::gles2::Gles2Texture,
+    > = None;
     // Canvas-mode press point: released without moving = plain canvas click.
     let mut pan_start: Option<crate::canvas::Vec2> = None;
 
@@ -255,6 +322,48 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     evdev,
                     pressed
                 );
+                // Options menu open: it owns presses (Up/Down/Enter nav,
+                // Esc closes). Releases still reach the app so nothing
+                // sticks; other presses are swallowed, never typed.
+                if menu.open {
+                    if sym == KEY_Escape && pressed {
+                        menu.open = false;
+                        log::info!("menu closed");
+                        need_render = true;
+                        return;
+                    }
+                    if pressed {
+                        match evdev {
+                            crate::menu::KEY_UP => {
+                                menu.up();
+                                need_render = true;
+                            }
+                            crate::menu::KEY_DOWN => {
+                                menu.down();
+                                need_render = true;
+                            }
+                            crate::menu::KEY_ENTER => {
+                                if let Some(id) =
+                                    crate::menu::MenuState::activate_at(menu.selected, &mut settings)
+                                {
+                                    log::info!("menu option {} toggled", id);
+                                }
+                                need_render = true;
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                    // Release while open: forward to the app (anti-stick).
+                    let xid = focused_id
+                        .and_then(|id| server_state.windows.get(&id))
+                        .and_then(|c| c.x11);
+                    match (xwm.as_ref(), xid) {
+                        (Some(wm), Some(xid)) => wm.xtest_key(xid, evdev, false),
+                        _ => server.input_key(evdev, false),
+                    }
+                    return;
+                }
                 if sym == KEY_Escape && pressed {
                     let action = session.on_event(
                         SuperEvent::Esc,
@@ -304,6 +413,20 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         } else {
                             held_mods.remove(&evdev);
                         }
+                    }
+                    // Options menu toggle: Super + physical comma (macOS
+                    // Cmd+,) or Super + physical I (Windows Win+I).
+                    // Positional codes, so it holds on any layout, and
+                    // Super-gated, so app keys (Ctrl+,) are never stolen.
+                    // Consumed — never reaches the app.
+                    if pressed
+                        && super_held
+                        && (evdev == crate::menu::KEY_COMMA || evdev == crate::menu::KEY_I)
+                    {
+                        menu.open = !menu.open;
+                        log::info!("menu open={}", menu.open);
+                        need_render = true;
+                        return;
                     }
                     // Hover shortcuts (Canvas mode, or Super held in Idle
                     // so hold-Super+key works like a normal WM): F
@@ -567,6 +690,35 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             InputEvent::PointerButton { event } => {
                 let pressed = event.state() == ButtonState::Pressed;
                 let left = event.button() == MouseButton::Left;
+                // Options menu open: left press on an item activates it,
+                // left press outside closes; nothing reaches the canvas.
+                if menu.open {
+                    if pressed && left {
+                        let cw = session.to_canvas(pointer, view);
+                        let center = session.to_canvas(
+                            crate::canvas::Vec2::new(view.x / 2.0, view.y / 2.0),
+                            view,
+                        );
+                        let lay = crate::menu::layout(view.x, view.y, center.x, center.y);
+                        match crate::menu::item_at(&lay, cw.x, cw.y) {
+                            Some(i) => {
+                                menu.selected = i;
+                                if let Some(id) = crate::menu::MenuState::activate_at(
+                                    menu.selected,
+                                    &mut settings,
+                                ) {
+                                    log::info!("menu option {} toggled", id);
+                                }
+                            }
+                            None => {
+                                menu.open = false;
+                                log::info!("menu closed");
+                            }
+                        }
+                        need_render = true;
+                    }
+                    return;
+                }
                 // Canvas-mode press starts here; Idle falls through to focus.
                 if session.state == crate::session::SuperState::Canvas {
                     // Canvas mode: apps are frozen, nothing reaches clients.
@@ -857,11 +1009,63 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // Ambient background drift: a slow repaint cadence while animated
+        // (never a hot loop); eco or off = frozen, zero extra frames.
+        if settings.bg_frame_interval().is_some()
+            && last_bg_paint.elapsed() >= settings.bg_frame_interval().unwrap()
+        {
+            need_render = true;
+        }
+
         if need_render || frames == 0 || max_frames.is_some() {
             let scale = graphics.window_size().scale_factor;
             let color = background_color(&session.camera);
+            // Advance the background clock by real elapsed time whenever we
+            // paint it; otherwise re-anchor so unpausing never jumps.
+            let bg_now = std::time::Instant::now();
+            let mut bg_dt = 0.0f32;
+            if settings.bg_anim && settings.bg_speed() > 0.0 {
+                bg_dt = bg_now.duration_since(last_bg_paint).as_secs_f32() * settings.bg_speed();
+            }
+            last_bg_paint = bg_now;
+            bg_time += bg_dt;
             graphics.render(|renderer, frame| {
-                if let Err(err) = frame.clear(color) {
+                if settings.bg_anim {
+                    if bg_prog.is_none() && !bg_failed {
+                        match renderer.with_context(|_, gl| {
+                            crate::render3d::compile_bg(gl)
+                        }) {
+                            Ok(Ok(p)) => {
+                                bg_prog = Some(p);
+                                log::info!("background GL program ready");
+                            }
+                            Ok(Err(e)) => {
+                                log::warn!("background GL program: {}", e);
+                                bg_failed = true;
+                            }
+                            Err(e) => {
+                                log::warn!("background GL context: {:?}", e);
+                                bg_failed = true;
+                            }
+                        }
+                    }
+                    if let Some(prog) = bg_prog {
+                        let sc = scale as f32;
+                        let _ = renderer.with_context(|_, gl| unsafe {
+                            crate::render3d::draw_bg(
+                                gl,
+                                prog,
+                                view.x as f32 * sc,
+                                view.y as f32 * sc,
+                                bg_time,
+                                session.view_camera().zoom as f32,
+                                settings.bg_dim(),
+                            );
+                        });
+                    } else if let Err(err) = frame.clear(color) {
+                        log::error!("clear failed: {}", err);
+                    }
+                } else if let Err(err) = frame.clear(color) {
                     log::error!("clear failed: {}", err);
                 }
                 // Painter's algorithm: lowest z first, so the visual top
@@ -1130,6 +1334,168 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     b,
                                 ),
                             );
+                        });
+                    }
+                }
+                // Options menu, always topmost: bordered panel, selection
+                // highlight, rows drawn from the data-driven item list.
+                if menu.open {
+                    if atlas_tex.is_none() {
+                        let px = crate::render3d::build_glyph_atlas();
+                        let up = renderer.with_context(|r, gl| unsafe {
+                            use smithay::backend::renderer::gles2::ffi;
+                            let mut tex = 0;
+                            gl.GenTextures(1, &mut tex as *mut _);
+                            gl.BindTexture(ffi::TEXTURE_2D, tex);
+                            gl.TexImage2D(
+                                ffi::TEXTURE_2D,
+                                0,
+                                ffi::RGBA as i32,
+                                crate::render3d::ATLAS_W as i32,
+                                crate::render3d::ATLAS_H as i32,
+                                0,
+                                ffi::RGBA,
+                                ffi::UNSIGNED_BYTE as u32,
+                                px.as_ptr() as *const _,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_MIN_FILTER,
+                                ffi::LINEAR as i32,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_MAG_FILTER,
+                                ffi::LINEAR as i32,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_WRAP_S,
+                                ffi::CLAMP_TO_EDGE as i32,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_WRAP_T,
+                                ffi::CLAMP_TO_EDGE as i32,
+                            );
+                            smithay::backend::renderer::gles2::Gles2Texture::from_raw(
+                                r,
+                                tex,
+                                Size::<i32, BufferCoord>::from((128, 64)),
+                            )
+                        });
+                        match up {
+                            Ok(t) => {
+                                atlas_tex = Some(t);
+                                log::info!("menu glyph atlas ready");
+                            }
+                            Err(e) => log::warn!("menu atlas upload: {:?}", e),
+                        }
+                    }
+                    if tex_prog.is_none() {
+                        match renderer.with_context(|_, gl| {
+                            crate::render3d::compile_textured(gl)
+                        }) {
+                            Ok(Ok(p)) => {
+                                tex_prog = Some(p);
+                                log::info!("textured GL program ready");
+                            }
+                            Ok(Err(e)) => log::warn!("textured GL program: {}", e),
+                            Err(e) => log::warn!("textured GL context: {:?}", e),
+                        }
+                    }
+                    if solid_prog.is_none() {
+                        match renderer.with_context(|_, gl| {
+                            crate::render3d::compile_solid(gl)
+                        }) {
+                            Ok(Ok(p)) => {
+                                solid_prog = Some(p);
+                                log::info!("chrome GL program ready");
+                            }
+                            Ok(Err(e)) => log::warn!("chrome GL program: {}", e),
+                            Err(e) => log::warn!("chrome GL context: {:?}", e),
+                        }
+                    }
+                    if let (Some(sprog), Some(tprog), Some(atlas)) =
+                        (solid_prog, tex_prog, atlas_tex.as_ref())
+                    {
+                        let mvp = crate::render3d::ortho(view.x as f32, view.y as f32);
+                        let sc = scale as f32;
+                        let zoom = session.view_camera().zoom as f32;
+                        let u = zoom * sc;
+                        let center = session.to_canvas(
+                            crate::canvas::Vec2::new(view.x / 2.0, view.y / 2.0),
+                            view,
+                        );
+                        let lay = crate::menu::layout(view.x, view.y, center.x, center.y);
+                        let to_px = |wx: f64, wy: f64| {
+                            let s = session.to_screen(crate::canvas::Vec2::new(wx, wy), view);
+                            ((s.x as f32) * sc, (s.y as f32) * sc)
+                        };
+                        let (px0, py0) = to_px(lay.x, lay.y);
+                        let pw = lay.w as f32 * u;
+                        let ph = lay.h as f32 * u;
+                        let pad = crate::menu::PANEL_PAD as f32 * u;
+                        let row_h = crate::menu::ROW_H as f32 * u;
+                        let atlas_id = atlas.tex_id();
+                        let rows = crate::menu::items();
+                        let _ = renderer.with_context(|_, gl| unsafe {
+                            // Border, then panel.
+                            crate::render3d::draw_solid(
+                                gl,
+                                sprog,
+                                &mvp,
+                                [0.16, 0.21, 0.33, 1.0],
+                                (px0 - 2.0 * sc, py0 - 2.0 * sc, pw + 4.0 * sc, ph + 4.0 * sc),
+                            );
+                            crate::render3d::draw_solid(
+                                gl,
+                                sprog,
+                                &mvp,
+                                [0.078, 0.094, 0.13, 1.0],
+                                (px0, py0, pw, ph),
+                            );
+                            let mut item_idx = 0usize;
+                            for (i, row) in rows.iter().enumerate() {
+                                let (_, rpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + i as f64 * crate::menu::ROW_H);
+                                let ty = rpy + 7.0 * u;
+                                match row {
+                                    crate::menu::Row::Header(label)
+                                    | crate::menu::Row::Foot(label) => {
+                                        draw_menu_line(
+                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, u,
+                                            label,
+                                        );
+                                    }
+                                    crate::menu::Row::Item(it) => {
+                                        if item_idx == menu.selected {
+                                            crate::render3d::draw_solid(
+                                                gl,
+                                                sprog,
+                                                &mvp,
+                                                [0.14, 0.18, 0.30, 1.0],
+                                                (px0, rpy, pw, row_h),
+                                            );
+                                        }
+                                        let state = match it.kind {
+                                            crate::menu::MenuKind::Toggle { is_on, .. } => {
+                                                if is_on(&settings) {
+                                                    " : Activé"
+                                                } else {
+                                                    " : Désactivé"
+                                                }
+                                            }
+                                            crate::menu::MenuKind::Info => "",
+                                        };
+                                        let line = format!("{}{}", it.label, state);
+                                        draw_menu_line(
+                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, u,
+                                            &line,
+                                        );
+                                        item_idx += 1;
+                                    }
+                                }
+                            }
                         });
                     }
                 }

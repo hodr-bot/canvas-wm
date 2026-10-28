@@ -24,6 +24,12 @@ mod xwm;
 mod keys;
 #[cfg(feature = "compositor")]
 mod server;
+#[cfg(feature = "compositor")]
+mod font8x8;
+#[cfg(feature = "compositor")]
+mod settings;
+#[cfg(feature = "compositor")]
+mod menu;
 
 use std::collections::HashMap;
 

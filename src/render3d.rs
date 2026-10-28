@@ -324,6 +324,171 @@ pub fn shm_format_is_opaque(
     )
 }
 
+/// Ambient wallpaper: a fullscreen procedural program. Dark slate base,
+/// two octaves short of busy: one slow drift plus one self-warped
+/// detail layer, vignette shadows toward the edges, darker when zoomed
+/// out (matches `background_color`). Amplitude is deliberately tiny:
+/// presence, not wallpaper-as-content.
+#[cfg(feature = "compositor")]
+const VERT_BG_SRC: &str = "#version 100
+attribute vec2 position;
+varying vec2 v_uv;
+void main() { v_uv = position * 0.5 + 0.5; gl_Position = vec4(position, 0.0, 1.0); }
+";
+
+#[cfg(feature = "compositor")]
+const FRAG_BG_SRC: &str = "#version 100
+// highp: the noise hash needs it. mediump mantissas (~10 bit) quantise
+// the hash products to whole integers, whose fract is 0 everywhere —
+// the failure mode is a flat black field. If a GPU lacks highp in the
+// fragment stage, compile fails and the backend falls back to flat
+// clear (see bg_failed), never to a broken frame.
+precision highp float;
+uniform vec2 res;
+uniform float t;
+uniform float zoom;
+uniform float dim;
+varying vec2 v_uv;
+// Precision-safe hash (no sin/fract-of-huge: mediump overflows the
+// classic sin(dot)*43758 past ~65504 and returns black). Hoskins
+// integer-style hash stays in small range on any precision.
+float hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x),
+               mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float fbm(vec2 p) { return vnoise(p) * 0.55 + vnoise(p * 2.13) * 0.28 + vnoise(p * 4.41) * 0.17; }
+void main() {
+    float aspect = res.x / res.y;
+    vec2 p = vec2(v_uv.x * aspect, v_uv.y);
+    float slow = t * 0.03;
+    float warp = fbm(p * 1.1 - slow * 0.3);
+    float n = fbm(p * 1.6 + vec2(slow * 0.7, slow * 0.4) + warp * 0.6);
+    float depth = clamp(0.35 + zoom * 0.65, 0.35, 1.0);
+    vec3 base = vec3(0.060, 0.070, 0.100) * depth;
+    vec3 glow = vec3(0.070, 0.090, 0.140) * (n - 0.5) * 0.9;
+    vec2 c = v_uv - 0.5;
+    float vig = 1.0 - smoothstep(0.25, 0.95, length(c * vec2(1.0, 0.85)));
+    vec3 col = (base + glow) * mix(0.45, 1.0, vig);
+    gl_FragColor = vec4(col * dim, 1.0);
+}
+";
+
+/// Compile the background program: (program, u_res, u_t, u_zoom, u_dim, a_pos).
+#[cfg(feature = "compositor")]
+pub fn compile_bg(gl: &ffi::Gles2) -> Result<(u32, i32, i32, i32, i32, u32), String> {
+    let c = |s: &str| CString::new(s).unwrap();
+    unsafe {
+        let vert = compile(gl, ffi::VERTEX_SHADER, VERT_BG_SRC)?;
+        let frag = compile(gl, ffi::FRAGMENT_SHADER, FRAG_BG_SRC)?;
+        let program = gl.CreateProgram();
+        gl.AttachShader(program, vert);
+        gl.AttachShader(program, frag);
+        gl.LinkProgram(program);
+        gl.DetachShader(program, vert);
+        gl.DetachShader(program, frag);
+        gl.DeleteShader(vert);
+        gl.DeleteShader(frag);
+        let mut status = ffi::FALSE as i32;
+        gl.GetProgramiv(program, ffi::LINK_STATUS, &mut status as *mut _);
+        if status == ffi::FALSE as i32 {
+            gl.DeleteProgram(program);
+            return Err("background program link failed".into());
+        }
+        let res = gl.GetUniformLocation(program, c("res").as_ptr() as *const _);
+        let t = gl.GetUniformLocation(program, c("t").as_ptr() as *const _);
+        let zoom = gl.GetUniformLocation(program, c("zoom").as_ptr() as *const _);
+        let dim = gl.GetUniformLocation(program, c("dim").as_ptr() as *const _);
+        let pos = gl.GetAttribLocation(program, c("position").as_ptr() as *const _) as u32;
+        Ok((program, res, t, zoom, dim, pos))
+    }
+}
+
+/// Draw the ambient background over the whole viewport (clip-space quad,
+/// opaque). `t` is seconds * speed (frozen in eco), `zoom` the camera
+/// zoom for depth, `dim` the eco dimmer.
+#[cfg(feature = "compositor")]
+pub unsafe fn draw_bg(
+    gl: &ffi::Gles2,
+    prog: (u32, i32, i32, i32, i32, u32),
+    w_px: f32,
+    h_px: f32,
+    t: f32,
+    zoom: f32,
+    dim: f32,
+) {
+    let (program, u_res, u_t, u_zoom, u_dim, a_pos) = prog;
+    gl.Disable(ffi::SCISSOR_TEST);
+    gl.UseProgram(program);
+    gl.Uniform2f(u_res, w_px, h_px);
+    gl.Uniform1f(u_t, t);
+    gl.Uniform1f(u_zoom, zoom);
+    gl.Uniform1f(u_dim, dim);
+    // Fullscreen triangle strip in clip space.
+    let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+    gl.EnableVertexAttribArray(a_pos);
+    gl.VertexAttribPointer(a_pos, 2, ffi::FLOAT, ffi::FALSE as u8, 0, verts.as_ptr() as *const _);
+    gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
+    gl.DisableVertexAttribArray(a_pos);
+    gl.UseProgram(0);
+    gl.Enable(ffi::SCISSOR_TEST);
+}
+
+/// Glyph atlas: 16x8 cells of 8x8 px (128x64 RGBA, white premultiplied).
+/// One upload, then every menu char is a UV sub-rect through the normal
+/// textured program.
+#[cfg(feature = "compositor")]
+pub const ATLAS_W: u32 = 128;
+#[cfg(feature = "compositor")]
+pub const ATLAS_H: u32 = 64;
+
+/// Build atlas bytes (row-major RGBA) from the vendored 8x8 font.
+#[cfg(feature = "compositor")]
+pub fn build_glyph_atlas() -> Vec<u8> {
+    let mut px = vec![0u8; (ATLAS_W * ATLAS_H * 4) as usize];
+    for byte in 0..128u8 {
+        let rows = crate::font8x8::glyph(byte);
+        let col = (byte % 16) as u32;
+        let row = (byte / 16) as u32;
+        for (ry, bits) in rows.iter().enumerate() {
+            for rx in 0..8u32 {
+                if bits & (1 << rx) != 0 {
+                    let x = col * 8 + rx;
+                    let y = row * 8 + ry as u32;
+                    let o = ((y * ATLAS_W + x) * 4) as usize;
+                    px[o] = 255;
+                    px[o + 1] = 255;
+                    px[o + 2] = 255;
+                    px[o + 3] = 255;
+                }
+            }
+        }
+    }
+    px
+}
+
+/// UV sub-rect (u0, v0, u1, v1) of one atlas cell. V points down the
+/// uploaded rows; the backend flips to upright UVs when drawing.
+#[cfg(feature = "compositor")]
+pub fn glyph_uv(byte: u8) -> (f32, f32, f32, f32) {
+    let b = (byte & 0x7F) as f32;
+    let col = b % 16.0;
+    let row = (b / 16.0).floor();
+    (
+        col * 8.0 / ATLAS_W as f32,
+        row * 8.0 / ATLAS_H as f32,
+        (col * 8.0 + 8.0) / ATLAS_W as f32,
+        (row * 8.0 + 8.0) / ATLAS_H as f32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +562,27 @@ mod tests {
         assert!(shm_format_is_opaque(Rgb565));
         assert!(!shm_format_is_opaque(Argb8888));
         assert!(!shm_format_is_opaque(Abgr8888));
+    }
+
+    #[cfg(feature = "compositor")]
+    #[test]
+    fn atlas_holds_lit_a_and_blank_space() {
+        let px = build_glyph_atlas();
+        assert_eq!(px.len(), (ATLAS_W * ATLAS_H * 4) as usize);
+        // 'A' cell (col 1, row 4): first row 0x0C has bits 2,3 lit.
+        let cell = |bx: u32, by: u32| ((by * ATLAS_W + bx) * 4) as usize;
+        let ax = 1 * 8;
+        let ay = 4 * 8;
+        assert_eq!(px[cell(ax + 2, ay)], 255);
+        assert_eq!(px[cell(ax + 2, ay) + 3], 255);
+        assert_eq!(px[cell(ax + 0, ay) + 3], 0);
+        // Space cell (col 0, row 2) is fully blank.
+        let sx = 0;
+        let sy = 2 * 8;
+        assert!(px[cell(sx, sy)..cell(sx, sy) + 4].iter().all(|&v| v == 0));
+        // UVs stay inside the atlas.
+        let (u0, v0, u1, v1) = glyph_uv(b'A');
+        assert!(0.0 <= u0 && u0 < u1 && u1 <= 1.0);
+        assert!(0.0 <= v0 && v0 < v1 && v1 <= 1.0);
     }
 }

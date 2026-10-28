@@ -5,7 +5,7 @@
 //! its screen from this; native clients use it for geometry/DPI.
 
 use smithay::reexports::wayland_server::protocol::wl_output::{
-    self, Mode, Subpixel, Transform, WlOutput,
+    Mode, Subpixel, Transform, WlOutput,
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, Filter, Global, Main};
