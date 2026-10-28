@@ -22,6 +22,7 @@ use smithay::backend::{
 };
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis as WlAxis, AxisSource};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle};
 use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
 use smithay::wayland::seat::AxisFrame;
@@ -1072,7 +1073,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             // Frame callbacks: tell clients this frame was presented, so
             // paced clients (Xwayland damage throttling, animations) keep
             // committing instead of stalling after their first buffer.
+            // Output enter goes out first sight per surface: Qt waits for
+            // `wl_surface.enter` before its first frame.
             let now_ms = frame_clock.elapsed().as_millis() as u32;
+            let surfaces: Vec<WlSurface> = server_state
+                .windows
+                .values()
+                .filter_map(|cw| cw.surface.clone())
+                .collect();
+            for surface in &surfaces {
+                if server_state.claim_output_enter(surface) {
+                    server.enter_output(surface);
+                }
+            }
             for cw in server_state.windows.values() {
                 if let Some(surface) = cw.surface.as_ref() {
                     let pending = with_states(surface, |states| {

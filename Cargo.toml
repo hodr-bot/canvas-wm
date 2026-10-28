@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 smithay = { version = "0.3", optional = true }
 wayland-client = { version = "0.29", optional = true }
-wayland-protocols = { version = "0.29", features = ["client"], optional = true }
+wayland-protocols = { version = "0.29", features = ["client", "staging_protocols"], optional = true }
 x11rb = { version = "0.14", features = ["damage", "xtest", "composite"], optional = true }
 xkbcommon = { version = "0.4", optional = true }
 slog = { version = "2", optional = true }
@@ -29,4 +29,4 @@ compositor = ["smithay", "wayland-client", "wayland-protocols", "x11rb", "xkbcom
 approx = "0.5"
 libc = "0.2"
 wayland-client = "0.29"
-wayland-protocols = { version = "0.29", features = ["client"] }
+wayland-protocols = { version = "0.29", features = ["client", "staging_protocols"] }

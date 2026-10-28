@@ -5,7 +5,7 @@
 //! canvas. Client buffer rendering and seat input land next.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::rc::Rc;
@@ -62,6 +62,8 @@ pub struct ServerState {
     /// WL_SURFACE_ID client message; the backend resolves it here and
     /// renders the real surface zero-copy (no GetImage bridge).
     surface_ids: HashMap<u32, WlSurface>,
+    /// Surfaces already announced to wl_outputs (enter sent once).
+    entered_outputs: HashSet<u32>,
 }
 
 /// A client window: canvas placement plus live surface and GPU texture.
@@ -183,6 +185,26 @@ impl ServerState {
         }
     }
 
+    /// Window owning `surface`, if any (activation focus, layer panels).
+    pub fn window_for_surface(&self, surface: &WlSurface) -> Option<u64> {
+        let id = surface.as_ref().id();
+        self.windows
+            .iter()
+            .find(|(_, w)| {
+                w.surface
+                    .as_ref()
+                    .map(|s| s.as_ref().id() == id)
+                    .unwrap_or(false)
+            })
+            .map(|(wid, _)| *wid)
+    }
+
+    /// Claim the one-shot output enter for `surface`. True on first call
+    /// per surface id; the backend sends `wl_surface.enter` then.
+    pub fn claim_output_enter(&mut self, surface: &WlSurface) -> bool {
+        self.entered_outputs.insert(surface.as_ref().id())
+    }
+
     /// Toggle fullscreen: the window takes the whole view, restored on
     /// toggle-off. The rect fills the view exactly (true fullscreen);
     /// the backend also configures X clients to the new size so their
@@ -264,6 +286,20 @@ pub struct Server {
         Global<smithay::reexports::wayland_protocols::wlr::unstable::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     /// Device registry shared with protocol handlers and the DnD grab.
     data_registry: crate::data::SharedRegistry,
+    /// Decoration manager (client-side preferred, no SSD path).
+    _decoration: Global<
+        smithay::reexports::wayland_protocols::unstable::xdg_decoration::v1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    >,
+    /// Activation tokens + pending focus surfaces.
+    activation_registry: crate::activation::SharedRegistry,
+    _activation: Global<
+        smithay::reexports::wayland_protocols::staging::xdg_activation::v1::server::xdg_activation_v1::XdgActivationV1,
+    >,
+    /// Primary (middle-click) selection registry.
+    primary_registry: crate::primary::SharedRegistry,
+    _primary: Global<
+        smithay::reexports::wayland_protocols::unstable::primary_selection::v1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+    >,
     /// Last pressed pointer button, for drag-grab start data.
     last_press: Option<u32>,
     /// Last pointer location + focus, for drag-grab start data.
@@ -273,6 +309,8 @@ pub struct Server {
     _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
     /// Single wl_output v4 (Smithay's advertises v3, which mako refuses).
     _output_global: Global<WlOutput>,
+    /// Bound outputs, for surface enter broadcasts (Qt needs enter).
+    output_registry: crate::output::SharedOutputs,
     keyboard: KeyboardHandle,
     pointer: PointerHandle,
     serial: u32,
@@ -282,6 +320,9 @@ pub struct Server {
 impl Server {
     pub fn new() -> io::Result<(Self, OsString)> {
         let display = Rc::new(RefCell::new(Display::new()));
+        // Reserve serial 0: some toolkits (Qt) ignore a first configure
+        // carrying serial 0 and wait forever for a real one.
+        let _ = smithay::wayland::SERIAL_COUNTER.next_serial();
         let (compositor, subcompositor) = compositor_init(
             &mut display.borrow_mut(),
             |surface, mut dispatch| {
@@ -322,6 +363,16 @@ impl Server {
             crate::data::init_manager(&mut display.borrow_mut(), data_registry.clone());
         // Layer shell for panels and notifications (mako).
         let layer_shell = crate::layer::init_layer_shell(&mut display.borrow_mut());
+        // Decoration negotiation (always client-side) for GTK/Qt.
+        let decoration = crate::deco::init_decoration(&mut display.borrow_mut());
+        // Token-based activation: clients can request focus.
+        let activation_registry = crate::activation::new_registry();
+        let activation =
+            crate::activation::init_activation(&mut display.borrow_mut(), activation_registry.clone());
+        // Primary (middle-click) selection alongside the clipboard.
+        let primary_registry = crate::primary::new_registry();
+        let primary =
+            crate::primary::init_manager(&mut display.borrow_mut(), primary_registry.clone());
         let socket = display.borrow_mut().add_socket_auto()?;
         let (mut seat, seat_global) =
             Seat::new(&mut display.borrow_mut(), "seat-0".into(), Some(seat_logger()));
@@ -334,6 +385,7 @@ impl Server {
         // it for DPI/positioning. Our own v4 global: Smithay's advertises
         // v3, which mako refuses to bind.
         let output_global = crate::output::init_output(&mut display.borrow_mut());
+        let (output_global, output_registry) = output_global;
         Ok((
             Self {
                 display,
@@ -347,12 +399,18 @@ impl Server {
                 _data_manager: data_manager,
                 _layer_shell: layer_shell,
                 data_registry,
+                _decoration: decoration,
+                activation_registry,
+                _activation: activation,
+                primary_registry,
+                _primary: primary,
                 last_press: None,
                 last_pointer: (0.0, 0.0),
                 last_focus: None,
                 _seat: seat,
                 _seat_global: seat_global,
                 _output_global: output_global,
+                output_registry,
                 keyboard,
                 pointer,
                 serial: 0,
@@ -370,6 +428,7 @@ impl Server {
             .dispatch(Duration::from_millis(0), state);
         self.display.borrow_mut().flush_clients(state);
         self.drain_data_device();
+        self.drain_activation(state);
     }
 
     /// Shared display handle, for XWayland startup (same-thread use).
@@ -413,6 +472,28 @@ impl Server {
     /// reach the right client. X11-backed windows clear it.
     pub fn focus_data_device(&self, surface: Option<&WlSurface>) {
         crate::data::set_focus_client(&self.data_registry, surface);
+        crate::primary::set_focus_client(&self.primary_registry, surface);
+    }
+
+    /// Focus surfaces requested through `xdg_activation_v1`: raise the
+    /// owning window and hand it keyboard focus.
+    pub fn drain_activation(&mut self, state: &mut ServerState) {
+        for surface in crate::activation::take_pending(&self.activation_registry) {
+            if !surface.as_ref().is_alive() {
+                continue;
+            }
+            if let Some(id) = state.window_for_surface(&surface) {
+                state.raise(id);
+                log::info!("activation: focused window {}", id);
+            }
+            self.focus_keyboard(Some(&surface));
+        }
+    }
+
+    /// Broadcast `wl_surface.enter` for a newly seen surface. Toolkits
+    /// such as Qt wait for enter before their first frame.
+    pub fn enter_output(&self, surface: &WlSurface) {
+        crate::output::enter_all(&self.output_registry, surface);
     }
 
     /// Install a client-requested drag as a pointer grab once per frame.

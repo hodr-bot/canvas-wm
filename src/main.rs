@@ -5,6 +5,12 @@ mod render3d;
 #[cfg(feature = "compositor")]
 mod xdg_v3;
 #[cfg(feature = "compositor")]
+mod deco;
+#[cfg(feature = "compositor")]
+mod activation;
+#[cfg(feature = "compositor")]
+mod primary;
+#[cfg(feature = "compositor")]
 mod layer;
 #[cfg(feature = "compositor")]
 mod output;

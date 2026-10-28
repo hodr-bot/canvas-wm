@@ -7,20 +7,33 @@
 use smithay::reexports::wayland_server::protocol::wl_output::{
     self, Mode, Subpixel, Transform, WlOutput,
 };
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, Filter, Global, Main};
+use std::{cell::RefCell, rc::Rc};
 
 /// Logical viewport every client sees.
 pub const VIEW_W: i32 = 1280;
 pub const VIEW_H: i32 = 800;
 
+/// Bound outputs, for surface enter/leave broadcasts.
+pub type SharedOutputs = Rc<RefCell<Vec<Main<WlOutput>>>>;
+
+pub fn new_outputs() -> SharedOutputs {
+    Rc::new(RefCell::new(Vec::new()))
+}
+
 /// Advertise `wl_output` version 4 (1280x800, scale 1).
-pub fn init_output(display: &mut Display) -> Global<WlOutput> {
-    display.create_global(
+pub fn init_output(display: &mut Display) -> (Global<WlOutput>, SharedOutputs) {
+    let outputs = new_outputs();
+    let live = outputs.clone();
+    let global = display.create_global(
         4,
         Filter::new(move |(output, _version): (Main<WlOutput>, _), _, _| {
+            live.borrow_mut().push(output.clone());
             implement_output(output)
         }),
-    )
+    );
+    (global, outputs)
 }
 
 fn implement_output(output: Main<WlOutput>) {
@@ -55,4 +68,23 @@ fn implement_output(output: Main<WlOutput>) {
         output.description("canvas-wm canvas".into());
     }
     output.done();
+}
+
+/// Tell every bound output that `surface` entered it. Toolkits such as
+/// Qt gate their first frame on `wl_surface.enter`; without it they map
+/// and stay blank forever.
+pub fn enter_all(outputs: &SharedOutputs, surface: &WlSurface) {
+    outputs.borrow_mut().retain(|o| o.as_ref().is_alive());
+    let owner = surface.as_ref().client();
+    for output in outputs.borrow().iter() {
+        // enter must reference same-client objects: foreign outputs
+        // kill the receiver's connection on use.
+        let same = match (&output.as_ref().client(), &owner) {
+            (Some(a), Some(b)) => a.equals(b),
+            _ => false,
+        };
+        if same {
+            surface.enter(output);
+        }
+    }
 }
