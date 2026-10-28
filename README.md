@@ -13,6 +13,10 @@ multi-select kept in view, XWayland + multi-output planned, no status bar
 - Directional focus without wrap (`S+D` = bottom-right or nothing)
 - XWayland on, multi-output = viewports on one shared canvas
 - No zones (rejected), drawings/effects in V2
+- Power saving: eco mode keeps minimal animations only (short fades,
+  no zoom flights), and degrades gracefully — in-flight transitions
+  finish or cut cleanly with an on-screen notice first, never yanked
+  mid-flight without warning
 
 ```bash
 cargo test
@@ -20,6 +24,8 @@ cargo run
 # Full compositor (window + input pump + GLES render):
 nix build .#compositor
 ./result/bin/canvas-wm --winit --frames 120
+# Manual run with X clients (polls for readiness, no fixed sleep):
+scripts/launch-with-clients.sh xterm xcalc
 ```
 
 NixOS (system module, no home-manager required): see `nix/module.nix`.
