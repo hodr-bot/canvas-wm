@@ -5,6 +5,8 @@ mod render3d;
 #[cfg(feature = "compositor")]
 mod xdg_v3;
 #[cfg(feature = "compositor")]
+mod data;
+#[cfg(feature = "compositor")]
 mod backend_winit;
 #[cfg(feature = "compositor")]
 mod xwm;

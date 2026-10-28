@@ -118,7 +118,9 @@ fn surface_implementation(
                 log::info!("xdg v3 new toplevel -> canvas window {}", win_id);
             }
             // Initial configure with no size: client picks, we follow.
-            id.configure(0, 0, vec![]);
+            // Advertise activated: newest windows take keyboard focus
+            // immediately (some clients stall without it).
+            id.configure(0, 0, vec![4, 0, 0, 0]);
             xdg_surface.configure(serial.into());
         }
         xdg_surface::Request::GetPopup { id, .. } => {

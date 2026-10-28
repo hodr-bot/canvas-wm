@@ -238,11 +238,14 @@ pub struct Server {
     /// xdg_shell version 3 (modern GTK binds the highest version).
     _xdg_v3: Global<smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase>,
     /// Clipboard + drag-and-drop manager (foot, GTK, Qt all require it).
-    _data_device: Global<WlDataDeviceManager>,
-    /// Events posted by the data-device callback during dispatch.
-    pending_data: Rc<RefCell<Vec<smithay::wayland::data_device::DataDeviceEvent>>>,
-    /// Current selection source, to relay `receive` writes.
-    selection_source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+    _data_manager: Global<WlDataDeviceManager>,
+    /// Device registry shared with protocol handlers and the DnD grab.
+    data_registry: crate::data::SharedRegistry,
+    /// Last pressed pointer button, for drag-grab start data.
+    last_press: Option<u32>,
+    /// Last pointer location + focus, for drag-grab start data.
+    last_pointer: (f64, f64),
+    last_focus: Option<(WlSurface, (i32, i32))>,
     _seat: Seat,
     _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
     _output: Output,
@@ -289,17 +292,11 @@ impl Server {
         );
         // Modern clients (GTK 4) refuse the v1 global above; offer v3.
         let xdg_v3 = crate::xdg_v3::init_xdg_v3(&mut display.borrow_mut());
-        // Clipboard + DnD foundation. GTK/foot/Qt refuse to run without it.
-        // The callback only queues; the main loop relays with state access.
-        let pending_data: Rc<RefCell<Vec<smithay::wayland::data_device::DataDeviceEvent>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let pending_clone = pending_data.clone();
-        let data_device = smithay::wayland::data_device::init_data_device(
-            &mut display.borrow_mut(),
-            move |event| pending_clone.borrow_mut().push(event),
-            smithay::wayland::data_device::default_action_chooser,
-            seat_logger(),
-        );
+        // Clipboard + DnD via our own manager (Smithay 0.3 hides the
+        // device registry and drag grab from downstream crates).
+        let data_registry = crate::data::new_registry();
+        let data_manager =
+            crate::data::init_manager(&mut display.borrow_mut(), data_registry.clone());
         let socket = display.borrow_mut().add_socket_auto()?;
         let (mut seat, seat_global) =
             Seat::new(&mut display.borrow_mut(), "seat-0".into(), Some(seat_logger()));
@@ -345,9 +342,11 @@ impl Server {
                 _xdg: xdg,
                 _zxdg: zxdg,
                 _xdg_v3: xdg_v3,
-                _data_device: data_device,
-                pending_data,
-                selection_source: None,
+                _data_manager: data_manager,
+                data_registry,
+                last_press: None,
+                last_pointer: (0.0, 0.0),
+                last_focus: None,
                 _seat: seat,
                 _seat_global: seat_global,
                 _output: output,
@@ -408,40 +407,35 @@ impl Server {
         self.focus_data_device(surface);
     }
 
-    /// Mirror keyboard focus into the data-device selection focus so
-    /// copy/paste offers reach the right client. X11 windows clear it.
+    /// Mirror keyboard focus into the registry so selection and DnD offers
+    /// reach the right client. X11-backed windows clear it.
     pub fn focus_data_device(&self, surface: Option<&WlSurface>) {
-        let client = surface.and_then(|s| s.as_ref().client());
-        smithay::wayland::data_device::set_data_device_focus(&self._seat, client);
+        crate::data::set_focus_client(&self.data_registry, surface);
     }
 
-    /// Relay queued data-device events. Call once per frame after pump:
-    /// tracks the selection source and forwards `receive` writes to it so
-    /// copy/paste actually transfers bytes between native clients.
+    /// Install a client-requested drag as a pointer grab once per frame.
     pub fn drain_data_device(&mut self) {
-        use smithay::wayland::data_device::DataDeviceEvent;
-        for event in self.pending_data.borrow_mut().drain(..) {
-            match event {
-                DataDeviceEvent::NewSelection(source) => {
-                    self.selection_source = source;
-                }
-                DataDeviceEvent::DnDStarted { .. } => {
-                    log::info!("data-device: drag started (grab wiring is a later pass)");
-                }
-                DataDeviceEvent::DnDDropped => {
-                    log::info!("data-device: drag dropped");
-                }
-                DataDeviceEvent::SendSelection { mime_type, fd } => {
-                    if let Some(source) = self.selection_source.clone() {
-                        source.send(mime_type, fd);
-                    } else {
-                        // No source: drop the fd so the reader sees EOF.
-                        use std::os::unix::io::FromRawFd as _;
-                        drop(unsafe { std::fs::File::from_raw_fd(fd) });
-                    }
-                }
-            }
+        if crate::data::drag_finished(&self.data_registry) {
+            crate::data::clear_drag(&self.data_registry);
+            return;
         }
+        let serial = self.next_serial();
+        let button = self.last_press.unwrap_or(0x110);
+        let location: Point<f64, Logical> = self.last_pointer.into();
+        let focus = self.last_focus.clone().map(|(s, (x, y))| {
+            (
+                s,
+                Point::<i32, Logical>::from((x, y)),
+            )
+        });
+        crate::data::install_pending_drag(
+            &self.data_registry,
+            &self._seat,
+            serial,
+            button,
+            location,
+            focus,
+        );
     }
 
     /// Forward pointer motion. `logical` is the output-space position,
@@ -458,6 +452,8 @@ impl Server {
             logical.1,
             focus.is_some()
         );
+        self.last_pointer = logical;
+        self.last_focus = focus.clone();
         let serial = self.next_serial();
         let time = self.now_ms();
         let location: Point<f64, Logical> = logical.into();
@@ -475,6 +471,9 @@ impl Server {
         } else {
             WlButtonState::Released
         };
+        if pressed {
+            self.last_press = Some(code);
+        }
         let serial = self.next_serial();
         let time = self.now_ms();
         self.pointer.button(code, state, serial, time);
