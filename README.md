@@ -76,11 +76,10 @@ centre pixel fixed); the logic plane stays 2D, presentation is 3D. Cost is
 ~zero: same textures, same fill rate, one matrix per window. Non-shm
 buffers keep Smithay's flat path as fallback.
 
-Hover keys, no modifiers (`docs/keys-close/fullscreen/move/resize.png`):
-`F` fullscreen without moving (the client is resized to the view),
-`Q` close, `E` grab-move (window follows
-the pointer while held, no button needed), `R` resize mode while held
-(left/right drag on edges and corners grows the rect, min 60px, never
-snaps back on repaint). Tradeoff: typing q/e/r/f with the pointer over a
-window fires the action — move the pointer off the window to type those
-letters (modifiers always type normally).
+Hover keys, Super mode only, no modifiers (`docs/keys-*.png`): `F`
+fullscreen (the client is resized to the view), `Q` close, `E` grab-move
+(window follows the pointer while held, no button needed), `R` resize
+mode while held (left/right drag on edges and corners grows the rect,
+min 60px, never snaps back on repaint). Plain Idle typing never triggers
+anything: every key reaches the app untouched unless the pointer hovers
+a window in Super mode.

@@ -92,8 +92,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut panning: Option<crate::canvas::Vec2> = None;
     // Hover chrome: last frame's revealed buttons (window id + layout).
     let mut last_chrome: Option<(u64, crate::chrome::ChromeLayout)> = None;
-    // Hover keyboard shortcuts (Idle): modifier guard, F/Q repeat guards,
-    // E grab-move (window id + last canvas pointer), R resize mode.
+    // Hover keyboard shortcuts (Canvas mode only): modifier guard, F/Q
+    // repeat guards, E grab-move (window id + last canvas pointer),
+    // R resize mode.
     let mut mods_held: u8 = 0;
     let mut f_held = false;
     let mut q_held = false;
@@ -284,11 +285,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             mods_held = mods_held.saturating_sub(1);
                         }
                     }
-                    // Hover shortcuts (Idle, window under pointer): F
-                    // fullscreen, Q close, E grab-move, R resize mode.
-                    // Consumed — never reaches the app.
+                    // Hover shortcuts (Canvas mode only, window under
+                    // pointer): F fullscreen, Q close, E grab-move,
+                    // R resize mode. Consumed — never reaches the app.
+                    // Idle sends every key to the app untouched, so normal
+                    // typing never triggers an action.
                     let mut consumed = false;
-                    if session.state == crate::session::SuperState::Idle {
+                    if session.state == crate::session::SuperState::Canvas {
                         if let Some(action) =
                             crate::chrome::hover_shortcut(evdev, mods_held > 0)
                         {
