@@ -17,6 +17,7 @@ use smithay::backend::renderer::gles2::Gles2Texture;
 use smithay::reexports::wayland_protocols::unstable::xdg_shell::v6::server::zxdg_shell_v6::ZxdgShellV6;
 use smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::reexports::wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager;
 use smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor;
@@ -234,6 +235,10 @@ pub struct Server {
     _shell_state: Arc<Mutex<ShellState>>,
     _xdg: Global<XdgWmBase>,
     _zxdg: Global<ZxdgShellV6>,
+    /// xdg_shell version 3 (modern GTK binds the highest version).
+    _xdg_v3: Global<smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase>,
+    /// Clipboard + drag-and-drop manager (foot, GTK, Qt all require it).
+    _data_device: Global<WlDataDeviceManager>,
     _seat: Seat,
     _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
     _output: Output,
@@ -277,6 +282,24 @@ impl Server {
                 _ => {}
             },
             None,
+        );
+        // Modern clients (GTK 4) refuse the v1 global above; offer v3.
+        let xdg_v3 = crate::xdg_v3::init_xdg_v3(&mut display.borrow_mut());
+        // Clipboard + DnD foundation. GTK/foot/Qt refuse to run without it.
+        let data_device = smithay::wayland::data_device::init_data_device(
+            &mut display.borrow_mut(),
+            |event| match event {
+                smithay::wayland::data_device::DataDeviceEvent::NewSelection(_) => {}
+                smithay::wayland::data_device::DataDeviceEvent::DnDStarted { .. } => {
+                    log::info!("data-device: drag started (grab wiring is a later pass)");
+                }
+                smithay::wayland::data_device::DataDeviceEvent::DnDDropped => {
+                    log::info!("data-device: drag dropped");
+                }
+                smithay::wayland::data_device::DataDeviceEvent::SendSelection { .. } => {}
+            },
+            smithay::wayland::data_device::default_action_chooser,
+            seat_logger(),
         );
         let socket = display.borrow_mut().add_socket_auto()?;
         let (mut seat, seat_global) =
@@ -322,6 +345,8 @@ impl Server {
                 _shell_state: shell_state,
                 _xdg: xdg,
                 _zxdg: zxdg,
+                _xdg_v3: xdg_v3,
+                _data_device: data_device,
                 _seat: seat,
                 _seat_global: seat_global,
                 _output: output,
@@ -377,6 +402,15 @@ impl Server {
     pub fn focus_keyboard(&mut self, surface: Option<&WlSurface>) {
         let serial = self.next_serial();
         self.keyboard.set_focus(surface, serial);
+        // Selection offers must follow keyboard focus for copy/paste.
+        self.focus_data_device(surface);
+    }
+
+    /// Mirror keyboard focus into the data-device selection focus so
+    /// copy/paste offers reach the right client. X11 windows clear it.
+    pub fn focus_data_device(&self, surface: Option<&WlSurface>) {
+        let client = surface.and_then(|s| s.as_ref().client());
+        smithay::wayland::data_device::set_data_device_focus(&self._seat, client);
     }
 
     /// Forward pointer motion. `logical` is the output-space position,
