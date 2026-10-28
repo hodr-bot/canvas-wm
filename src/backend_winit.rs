@@ -93,10 +93,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut panning: Option<crate::canvas::Vec2> = None;
     // Hover chrome: last frame's revealed buttons (window id + layout).
     let mut last_chrome: Option<(u64, crate::chrome::ChromeLayout)> = None;
-    // Hover keyboard shortcuts (Canvas mode only): modifier guard, F/Q
-    // repeat guards, E grab-move (window id + last canvas pointer),
-    // R resize mode.
-    let mut mods_held: u8 = 0;
+    // Hover keyboard shortcuts (Canvas mode, or Super held in Idle):
+    // held-modifier set, F/Q repeat guards, E grab-move (window id +
+    // last canvas pointer), R resize mode. The modifier set (not a
+    // counter) stays correct across key repeats: repeats re-insert an
+    // already-present code instead of drifting a count upward forever.
+    let mut held_mods: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
+    let mut super_held = false;
     let mut f_held = false;
     let mut q_held = false;
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
@@ -267,43 +271,50 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     need_render = true;
                 } else if is_super(sym) {
                     if pressed {
+                        super_held = true;
                         tap.note_super_press();
-                    } else if tap.note_super_release() {
-                        let action = session.on_event(
-                            SuperEvent::SuperTap,
-                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
-                            view,
-                        );
-                        log::info!(
-                            "super {:?} state={:?} zoom={:.2} selected={}",
-                            action,
-                            session.state,
-                            session.camera.zoom,
-                            session.overview.selected.len()
-                        );
-                        need_render = true;
+                    } else {
+                        super_held = false;
+                        if tap.note_super_release() {
+                            let action = session.on_event(
+                                SuperEvent::SuperTap,
+                                &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                                view,
+                            );
+                            log::info!(
+                                "super {:?} state={:?} zoom={:.2} selected={}",
+                                action,
+                                session.state,
+                                session.camera.zoom,
+                                session.overview.selected.len()
+                            );
+                            need_render = true;
+                        }
                     }
                 } else {
                     if pressed {
                         tap.note_other_press();
                     }
-                    // Modifier tracking: hover shortcuts only fire bare.
+                    // Modifier tracking as a set: key repeats re-insert the
+                    // same code (idempotent) instead of drifting a counter
+                    // upward and killing every later bare shortcut.
                     if crate::chrome::MOD_CODES.contains(&evdev) {
                         if pressed {
-                            mods_held = mods_held.saturating_add(1);
+                            held_mods.insert(evdev);
                         } else {
-                            mods_held = mods_held.saturating_sub(1);
+                            held_mods.remove(&evdev);
                         }
                     }
-                    // Hover shortcuts (Canvas mode only, window under
-                    // pointer): F fullscreen, Q close, E grab-move,
-                    // R resize mode. Consumed — never reaches the app.
+                    // Hover shortcuts (Canvas mode, or Super held in Idle
+                    // so hold-Super+key works like a normal WM): F
+                    // fullscreen, Q close, E grab-move, R resize mode.
+                    // Consumed — never reaches the app.
                     // Idle sends every key to the app untouched, so normal
                     // typing never triggers an action.
                     let mut consumed = false;
-                    if session.state == crate::session::SuperState::Canvas {
+                    if session.state == crate::session::SuperState::Canvas || super_held {
                         if let Some(action) =
-                            crate::chrome::hover_shortcut(evdev, mods_held > 0)
+                            crate::chrome::hover_shortcut(evdev, !held_mods.is_empty())
                         {
                             let cworld = session.to_canvas(pointer, view);
                             let hover = server_state.topmost_at(cworld);
