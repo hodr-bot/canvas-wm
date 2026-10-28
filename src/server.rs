@@ -239,6 +239,10 @@ pub struct Server {
     _xdg_v3: Global<smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase>,
     /// Clipboard + drag-and-drop manager (foot, GTK, Qt all require it).
     _data_device: Global<WlDataDeviceManager>,
+    /// Events posted by the data-device callback during dispatch.
+    pending_data: Rc<RefCell<Vec<smithay::wayland::data_device::DataDeviceEvent>>>,
+    /// Current selection source, to relay `receive` writes.
+    selection_source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
     _seat: Seat,
     _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
     _output: Output,
@@ -286,18 +290,13 @@ impl Server {
         // Modern clients (GTK 4) refuse the v1 global above; offer v3.
         let xdg_v3 = crate::xdg_v3::init_xdg_v3(&mut display.borrow_mut());
         // Clipboard + DnD foundation. GTK/foot/Qt refuse to run without it.
+        // The callback only queues; the main loop relays with state access.
+        let pending_data: Rc<RefCell<Vec<smithay::wayland::data_device::DataDeviceEvent>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let pending_clone = pending_data.clone();
         let data_device = smithay::wayland::data_device::init_data_device(
             &mut display.borrow_mut(),
-            |event| match event {
-                smithay::wayland::data_device::DataDeviceEvent::NewSelection(_) => {}
-                smithay::wayland::data_device::DataDeviceEvent::DnDStarted { .. } => {
-                    log::info!("data-device: drag started (grab wiring is a later pass)");
-                }
-                smithay::wayland::data_device::DataDeviceEvent::DnDDropped => {
-                    log::info!("data-device: drag dropped");
-                }
-                smithay::wayland::data_device::DataDeviceEvent::SendSelection { .. } => {}
-            },
+            move |event| pending_clone.borrow_mut().push(event),
             smithay::wayland::data_device::default_action_chooser,
             seat_logger(),
         );
@@ -347,6 +346,8 @@ impl Server {
                 _zxdg: zxdg,
                 _xdg_v3: xdg_v3,
                 _data_device: data_device,
+                pending_data,
+                selection_source: None,
                 _seat: seat,
                 _seat_global: seat_global,
                 _output: output,
@@ -367,6 +368,7 @@ impl Server {
             .borrow_mut()
             .dispatch(Duration::from_millis(0), state);
         self.display.borrow_mut().flush_clients(state);
+        self.drain_data_device();
     }
 
     /// Shared display handle, for XWayland startup (same-thread use).
@@ -411,6 +413,35 @@ impl Server {
     pub fn focus_data_device(&self, surface: Option<&WlSurface>) {
         let client = surface.and_then(|s| s.as_ref().client());
         smithay::wayland::data_device::set_data_device_focus(&self._seat, client);
+    }
+
+    /// Relay queued data-device events. Call once per frame after pump:
+    /// tracks the selection source and forwards `receive` writes to it so
+    /// copy/paste actually transfers bytes between native clients.
+    pub fn drain_data_device(&mut self) {
+        use smithay::wayland::data_device::DataDeviceEvent;
+        for event in self.pending_data.borrow_mut().drain(..) {
+            match event {
+                DataDeviceEvent::NewSelection(source) => {
+                    self.selection_source = source;
+                }
+                DataDeviceEvent::DnDStarted { .. } => {
+                    log::info!("data-device: drag started (grab wiring is a later pass)");
+                }
+                DataDeviceEvent::DnDDropped => {
+                    log::info!("data-device: drag dropped");
+                }
+                DataDeviceEvent::SendSelection { mime_type, fd } => {
+                    if let Some(source) = self.selection_source.clone() {
+                        source.send(mime_type, fd);
+                    } else {
+                        // No source: drop the fd so the reader sees EOF.
+                        use std::os::unix::io::FromRawFd as _;
+                        drop(unsafe { std::fs::File::from_raw_fd(fd) });
+                    }
+                }
+            }
+        }
     }
 
     /// Forward pointer motion. `logical` is the output-space position,
