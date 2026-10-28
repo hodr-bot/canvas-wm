@@ -55,6 +55,19 @@ pub fn chrome_visibility(
     }
 }
 
+/// Drag threshold in world pixels: a press only becomes a move past this.
+pub const DRAG_THRESHOLD_WORLD: f64 = 6.0;
+
+/// Press-to-current offset once past the threshold, else None (plain click).
+pub fn drag_offset(press: Vec2, current: Vec2) -> Option<Vec2> {
+    let delta = current - press;
+    if delta.x.abs().max(delta.y.abs()) >= DRAG_THRESHOLD_WORLD {
+        Some(delta)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SuperState {
     Idle,
@@ -200,6 +213,35 @@ mod tests {
         assert_ne!(s.camera.zoom, before.zoom);
         s.on_event(SuperEvent::Esc, &resolve, view);
         assert_eq!(s.camera.zoom, before.zoom);
+    }
+
+    #[test]
+    fn drag_offset_threshold() {
+        let press = Vec2::new(100.0, 100.0);
+        assert!(drag_offset(press, Vec2::new(103.0, 102.0)).is_none());
+        let moved = drag_offset(press, Vec2::new(120.0, 90.0)).expect("past threshold");
+        assert_eq!(moved, Vec2::new(20.0, -10.0));
+    }
+
+    #[test]
+    fn zoom_at_keeps_anchor_fixed() {
+        let mut cam = Camera::new();
+        let view = Vec2::new(1280.0, 800.0);
+        let screen = Vec2::new(900.0, 500.0);
+        let before = cam.screen_to_world(screen, view);
+        cam.zoom_at(screen, view, 2.0);
+        assert!((cam.zoom - 2.0).abs() < 1e-9);
+        let after = cam.screen_to_world(screen, view);
+        assert!((after.x - before.x).abs() < 1e-9);
+        assert!((after.y - before.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pan_by_moves_camera_against_drag() {
+        let mut cam = Camera::new();
+        cam.zoom = 2.0;
+        cam.pan_by(Vec2::new(40.0, -20.0));
+        assert_eq!(cam.pos, Vec2::new(-20.0, 10.0));
     }
 
     #[test]

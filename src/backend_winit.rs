@@ -31,7 +31,7 @@ use smithay::xwayland::{XWayland, XWaylandEvent};
 use crate::canvas::{window_screen_rect, Camera};
 use crate::keys::{is_super, KeyMapper, TapTracker, KEY_Escape};
 use crate::server::{Server, ServerState};
-use crate::session::{Session, SuperEvent};
+use crate::session::{drag_offset, Session, SuperEvent};
 use crate::xwm::Xwm;
 use crate::{bar, bar_client::BarClient};
 use crate::bar::BAR_HEIGHT;
@@ -88,6 +88,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Focused canvas window (chip highlight) and last bar state sent.
     let mut focused_id: Option<u64> = None;
     let mut last_bar: (usize, Option<usize>) = (usize::MAX, None);
+    // Live canvas gestures: left-drag moves a window (Idle only), middle-drag
+    // pans the camera. Press world + last world + whether past threshold.
+    let mut grab: Option<(u64, crate::canvas::Vec2, crate::canvas::Vec2, bool)> = None;
+    let mut panning: Option<crate::canvas::Vec2> = None;
 
     // The internal bar maps first, before any external client can connect.
     // It is tagged as overlay by matching its surface id (deterministic,
@@ -306,6 +310,36 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     server.input_motion((logical.x, logical.y), None);
                     return;
                 }
+                // Live gestures before picking: middle-drag pans the camera,
+                // left-drag past threshold moves the grabbed window.
+                if let Some(last) = panning {
+                    let dx = pointer.x - last.x;
+                    let dy = pointer.y - last.y;
+                    session.camera.pan_by(crate::canvas::Vec2::new(dx, dy));
+                    panning = Some(pointer);
+                    need_render = true;
+                }
+                if let Some((id, press_world, last_world, moved)) = grab {
+                    let world_now = session.camera.screen_to_world(pointer, view);
+                    // Past the threshold, every motion moves the window by its
+                    // delta — including the crossing event itself, so even a
+                    // single-jump drag (press, one motion, release) moves.
+                    if moved || drag_offset(press_world, world_now).is_some() {
+                        let dx = world_now.x - last_world.x;
+                        let dy = world_now.y - last_world.y;
+                        match server_state.windows.get_mut(&id) {
+                            Some(cw) => {
+                                cw.canvas.pos.x += dx;
+                                cw.canvas.pos.y += dy;
+                                need_render = true;
+                            }
+                            None => grab = None,
+                        }
+                        if grab.is_some() {
+                            grab = Some((id, press_world, world_now, true));
+                        }
+                    }
+                }
                 let world = session.camera.screen_to_world(logical, view);
                 log::debug!(
                     "motion physical=({},{}) scale={} logical=({},{}) world=({},{})",
@@ -343,6 +377,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
             InputEvent::PointerButton { event } => {
                 let pressed = event.state() == ButtonState::Pressed;
+                // Middle button is the canvas pan gesture; clients never see it.
+                if event.button() == MouseButton::Middle {
+                    if pressed {
+                        panning = Some(pointer);
+                    } else {
+                        panning = None;
+                    }
+                    return;
+                }
+                // A released left button ends any window drag.
+                if !pressed && event.button() == MouseButton::Left {
+                    grab = None;
+                }
                 // Bar clicks focus a chip's window and never reach clients.
                 if pressed && bar::in_bar(pointer) {
                     let canvas = server_state.canvas_ids();
@@ -418,6 +465,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             server.focus_keyboard(c.surface.as_ref());
                             focused_id = Some(id);
                             known_ids.insert(id);
+                            // Arm a potential drag (Idle only); past the
+                            // threshold, motion moves the window instead.
+                            if session.state == crate::session::SuperState::Idle {
+                                grab = Some((id, world, world, false));
+                            }
                         }
                     }
                     let code = button_code(event.button());
@@ -436,6 +488,26 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 }
             }
             InputEvent::PointerAxis { event } => {
+                // Wheel over empty canvas zooms at the pointer; over a window
+                // it scrolls the client instead.
+                let vertical = event
+                    .amount(Axis::Vertical)
+                    .or_else(|| event.amount_discrete(Axis::Vertical).map(|s| s as f64))
+                    .unwrap_or(0.0);
+                if vertical != 0.0 && !bar::in_bar(pointer) {
+                    let world = session.camera.screen_to_world(pointer, view);
+                    let over_window = server_state
+                        .windows
+                        .iter()
+                        .any(|(_, c)| !c.overlay && c.canvas.contains(world));
+                    if !over_window {
+                        let factor = if vertical > 0.0 { 1.15 } else { 1.0 / 1.15 };
+                        session.camera.zoom_at(pointer, view, factor);
+                        log::info!("wheel zoom={:.2}", session.camera.zoom);
+                        need_render = true;
+                        return;
+                    }
+                }
                 let mut frame =
                     AxisFrame::new(event.time()).source(match event.source() {
                         InputAxisSource::Wheel => AxisSource::Wheel,

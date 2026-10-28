@@ -49,3 +49,8 @@ all live XWayland clients with core fonts + Xft configured headless.
 Fixes that made it possible: frame callbacks (`wl_callback.done`
 every presented frame — Xwayland throttles damage without them) and
 damage-only commit re-import from the kept shm buffer.
+
+Live canvas (`docs/v1-drag.png`, `docs/v1-zoom.png`, `docs/v1-pan.png`):
+left-drag past 6 world px moves the window (single-jump drags included),
+wheel over empty canvas zooms at the pointer, middle-drag pans the camera;
+wheel over a window still scrolls the client.
