@@ -172,12 +172,12 @@ impl Session {
     }
 
     /// Screen -> canvas plane coordinates (for hit-testing windows).
+    /// This is exactly the inverse of the render mapping, so it already
+    /// is canvas space: no extra offset is applied. (An earlier revision
+    /// subtracted the offset twice, which shifted every click/hover by
+    /// the pan distance and moved the Canvas tilt pivot off-centre.)
     pub fn to_canvas(&self, screen: Vec2, view: Vec2) -> Vec2 {
-        let world = self.to_world(screen, view);
-        Vec2::new(
-            world.x - self.canvas.offset.x,
-            world.y - self.canvas.offset.y,
-        )
+        self.to_world(screen, view)
     }
 
     pub fn to_screen(&self, world: Vec2, view: Vec2) -> Vec2 {
@@ -365,6 +365,24 @@ mod tests {
         s.camera.zoom = 2.0;
         s.pan_canvas(Vec2::new(40.0, -20.0));
         assert_eq!(s.canvas.offset, Vec2::new(20.0, -10.0));
+    }
+
+    #[test]
+    fn hit_testing_survives_pan() {
+        // A window's screen position after a pan must map back to the
+        // window itself: regression test for the double-subtracted offset
+        // that shifted every click/hover by the pan distance.
+        let mut s = Session::new();
+        let view = Vec2::new(1280.0, 800.0);
+        let win = Vec2::new(100.0, 100.0);
+        let screen_before = s.to_screen(win, view);
+        assert_eq!(s.to_canvas(screen_before, view), win);
+        s.pan_canvas(Vec2::new(200.0, 100.0));
+        let screen_after = s.to_screen(win, view);
+        assert_ne!(screen_after, screen_before);
+        let back = s.to_canvas(screen_after, view);
+        assert!((back.x - win.x).abs() < 1e-9);
+        assert!((back.y - win.y).abs() < 1e-9);
     }
 
     #[test]

@@ -296,11 +296,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             crate::chrome::hover_shortcut(evdev, mods_held > 0)
                         {
                             let cworld = session.to_canvas(pointer, view);
-                            let hover = server_state
-                                .windows
-                                .iter()
-                                .find(|(_, c)| c.canvas.contains(cworld))
-                                .map(|(id, _)| *id);
+                            let hover = server_state.topmost_at(cworld);
                             match action {
                                 crate::chrome::HoverKey::Fullscreen => {
                                     if pressed && !f_held {
@@ -376,6 +372,24 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     if consumed {
+                        return;
+                    }
+                    // Canvas mode is command mode: presses never reach the
+                    // apps (Super/Esc/hover-shortcuts act there instead).
+                    // Releases still go through so a key held across the
+                    // toggle never sticks down in the app.
+                    if session.state == crate::session::SuperState::Canvas {
+                        if !pressed {
+                            let xid = focused_id
+                                .and_then(|id| server_state.windows.get(&id))
+                                .and_then(|c| c.x11);
+                            match (xwm.as_ref(), xid) {
+                                (Some(wm), Some(xid)) => {
+                                    wm.xtest_key(xid, evdev, false)
+                                }
+                                _ => server.input_key(evdev, false),
+                            }
+                        }
                         return;
                     }
                     // X-backed focus eats keys via XTEST, not the wl seat.
@@ -479,10 +493,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     world.x,
                     world.y
                 );
-                let hit = server_state
-                    .windows
-                    .iter()
-                    .find(|(_, c)| c.canvas.contains(cworld));
+                let hit_id = server_state.topmost_at(cworld);
+                let hit = hit_id.and_then(|id| {
+                    server_state.windows.get(&id).map(|c| (id, c))
+                });
+                // Hyprland-style focus-follows-mouse: the window under the
+                // cursor takes keyboard focus (both modes, on change only,
+                // never mid-drag). Clicking still raises it to the front.
                 // Seat offset = surface origin in logical space; Smithay
                 // reports enter/motion coords as pointer minus this origin.
                 // X-backed windows additionally get XTEST motion in local px.
@@ -502,6 +519,29 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 if let (Some(wm), Some((xid, lx, ly))) = (xwm.as_ref(), x_motion) {
                     wm.xtest_motion(xid, lx, ly);
                 }
+                // Focus follows the pointer (keeps last focus over empty
+                // canvas; never steals mid-drag).
+                if grab.is_none()
+                    && panning.is_none()
+                    && e_grab.is_none()
+                    && r_resize.is_none()
+                {
+                    if hit_id != focused_id {
+                        if let Some(id) = hit_id {
+                            if let Some(c) = server_state.windows.get(&id) {
+                                server.focus_keyboard(c.surface.as_ref());
+                                if let (Some(wm), Some(xid)) =
+                                    (xwm.as_ref(), c.x11)
+                                {
+                                    wm.focus(xid);
+                                    server.focus_keyboard(None);
+                                }
+                            }
+                            focused_id = Some(id);
+                            known_ids.insert(id);
+                        }
+                    }
+                }
             }
             InputEvent::PointerButton { event } => {
                 let pressed = event.state() == ButtonState::Pressed;
@@ -513,14 +553,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     // replaces the held key); empty press starts a canvas pan.
                     if pressed && left {
                         let cw = session.to_canvas(pointer, view);
-                        let hit = server_state
-                            .windows
-                            .iter()
-                            .find(|(_, c)| c.canvas.contains(cw))
-                            .map(|(id, _)| *id);
+                        let hit = server_state.topmost_at(cw);
                         match hit {
                             Some(id) if session.dwell.armed == Some(id) => {
                                 grab = Some((id, cw, cw, true));
+                                server_state.raise(id);
                                 log::info!("canvas armed move window {}", id);
                             }
                             Some(id) => {
@@ -628,19 +665,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             && (event.button() == MouseButton::Left
                                 || event.button() == MouseButton::Right)
                         {
-                            if let Some((id, c)) = server_state
-                                .windows
-                                .iter()
-                                .find(|(_, c)| c.canvas.contains(cworld))
-                            {
-                                let id = *id;
-                                if let Some(edge) = crate::chrome::resize_edge(
-                                    &c.canvas,
-                                    cworld,
-                                    crate::chrome::RESIZE_GRAB,
-                                ) {
-                                    r_resize = Some((id, edge, cworld));
-                                    log::info!("resize start window {} {:?}", id, edge);
+                            if let Some(top) = server_state.topmost_at(cworld) {
+                                let id = top;
+                                if let Some(c) = server_state.windows.get(&id) {
+                                    if let Some(edge) = crate::chrome::resize_edge(
+                                        &c.canvas,
+                                        cworld,
+                                        crate::chrome::RESIZE_GRAB,
+                                    ) {
+                                        r_resize = Some((id, edge, cworld));
+                                        log::info!(
+                                            "resize start window {} {:?}",
+                                            id,
+                                            edge
+                                        );
+                                    }
                                 }
                             }
                             match event.button() {
@@ -651,13 +690,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             need_render = true;
                             return;
                         }
-                        if let Some((id, c)) = server_state
-                            .windows
-                            .iter()
-                            .find(|(_, c)| c.canvas.contains(cworld))
-                        {
-                            let id = *id;
-                            server.focus_keyboard(c.surface.as_ref());
+                        if let Some(id) = server_state.topmost_at(cworld) {
+                            if let Some(c) = server_state.windows.get(&id) {
+                                server.focus_keyboard(c.surface.as_ref());
+                            }
+                            server_state.raise(id);
                             focused_id = Some(id);
                             known_ids.insert(id);
                         }
@@ -755,11 +792,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         if session.state == crate::session::SuperState::Canvas {
             let now_ms = frame_clock.elapsed().as_millis() as u64;
             let cw = session.to_canvas(pointer, view);
-            let inside = server_state
-                .windows
-                .iter()
-                .find(|(_, c)| c.canvas.contains(cw))
-                .map(|(id, _)| *id);
+            let inside = server_state.topmost_at(cw);
             if session.dwell.update(inside, now_ms).is_some() {
                 log::debug!("dwell armed {:?}", session.dwell.armed);
             }
@@ -903,7 +936,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 );
                                 let vw = view.x as f32 * sc;
                                 let vh = view.y as f32 * sc;
-                                let mid = session.to_canvas(
+                                let mid = session.to_world(
                                     crate::canvas::Vec2::new(view.x / 2.0, view.y / 2.0),
                                     view,
                                 );
@@ -950,20 +983,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let mut chrome_now = None;
                 if session.state == crate::session::SuperState::Idle {
                     let cworld = session.to_canvas(pointer, view);
-                    if let Some((id, cw)) = server_state
-                        .windows
-                        .iter()
-                        .find(|(_, c)| c.canvas.contains(cworld))
-                        .map(|(id, c)| (*id, c))
-                    {
-                        let origin = session.to_screen(cw.canvas.pos, view);
-                        let zoom = session.view_camera().zoom;
-                        let size = crate::canvas::Vec2::new(
-                            cw.canvas.size.x * zoom,
-                            cw.canvas.size.y * zoom,
-                        );
-                        if let Some(layout) = crate::chrome::layout_for(origin, size, pointer) {
-                            chrome_now = Some((id, layout));
+                    if let Some(id) = server_state.topmost_at(cworld) {
+                        if let Some(cw) = server_state.windows.get(&id) {
+                            let origin = session.to_screen(cw.canvas.pos, view);
+                            let zoom = session.view_camera().zoom;
+                            let size = crate::canvas::Vec2::new(
+                                cw.canvas.size.x * zoom,
+                                cw.canvas.size.y * zoom,
+                            );
+                            if let Some(layout) =
+                                crate::chrome::layout_for(origin, size, pointer)
+                            {
+                                chrome_now = Some((id, layout));
+                            }
                         }
                     }
                 }

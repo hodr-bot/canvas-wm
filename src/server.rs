@@ -55,6 +55,8 @@ pub fn place_window(id: u64, n: usize) -> CanvasWindow {
 pub struct ServerState {
     pub windows: HashMap<u64, ClientWindow>,
     next_id: u64,
+    /// Stacking high-water mark; each raise bumps it.
+    z_top: u64,
     /// Every live wl_surface by its numeric id, XWayland's included.
     /// XWayland publishes each X window's surface id through the
     /// WL_SURFACE_ID client message; the backend resolves it here and
@@ -79,6 +81,8 @@ pub struct ClientWindow {
     /// Last imported buffer dims: the canvas follows the buffer only when
     /// the CLIENT resizes (manual moves/resizes never snap back).
     pub buf_size: Option<(u32, u32)>,
+    /// Stacking order: higher is on top. Bumped on click-focus and grab.
+    pub z: u64,
 }
 
 impl ClientWindow {
@@ -91,6 +95,7 @@ impl ClientWindow {
             x11: None,
             fullscreen_prev: None,
             buf_size: None,
+            z: 0,
         }
     }
 }
@@ -101,6 +106,7 @@ impl ServerState {
         self.next_id += 1;
         let win = ClientWindow::new(id, surface, self.windows.len());
         self.windows.insert(id, win);
+        self.raise(id);
         id
     }
 
@@ -112,6 +118,7 @@ impl ServerState {
         let mut win = ClientWindow::new(id, Some(surface), self.windows.len());
         win.x11 = Some(xid);
         self.windows.insert(id, win);
+        self.raise(id);
         id
     }
 
@@ -132,6 +139,27 @@ impl ServerState {
     /// Returns the X window id when the backend must kill it.
     pub fn close_window(&mut self, id: u64) -> Option<u32> {
         self.windows.remove(&id).and_then(|w| w.x11)
+    }
+
+    /// Topmost window containing a canvas-plane point (highest z wins).
+    /// All hover/click/dwell picks go through here so overlapping windows
+    /// resolve to the visible one.
+    pub fn topmost_at(&self, p: crate::canvas::Vec2) -> Option<u64> {
+        self.windows
+            .iter()
+            .filter(|(_, c)| c.canvas.contains(p))
+            .max_by_key(|(_, c)| c.z)
+            .map(|(id, _)| *id)
+    }
+
+    /// Bring a window to the front (click-focus, grab).
+    pub fn raise(&mut self, id: u64) {
+        if self.windows.contains_key(&id) {
+            self.z_top += 1;
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.z = self.z_top;
+            }
+        }
     }
 
     /// Toggle fullscreen: the window takes the whole view, restored on
@@ -421,6 +449,29 @@ mod tests {
         let wa = &s.windows[&first].canvas;
         let wb = &s.windows[&second].canvas;
         assert!(wb.pos.x > wa.pos.x && wb.pos.y > wa.pos.y);
+    }
+
+    #[test]
+    fn topmost_pick_and_raise() {
+        let mut s = ServerState::default();
+        let a = s.add_toplevel(None);
+        let b = s.add_toplevel(None);
+        // Stack both on the same spot: newest (b) starts on top.
+        {
+            let r = CanvasWindow::new(a, 0.0, 0.0, 100.0, 100.0);
+            s.windows.get_mut(&a).unwrap().canvas = r;
+            let r = CanvasWindow::new(b, 0.0, 0.0, 100.0, 100.0);
+            s.windows.get_mut(&b).unwrap().canvas = r;
+        }
+        assert_eq!(s.topmost_at(Vec2::new(10.0, 10.0)), Some(b));
+        // Click-focus raises a to the front; empty space hits nothing.
+        s.raise(a);
+        assert_eq!(s.topmost_at(Vec2::new(10.0, 10.0)), Some(a));
+        assert_eq!(s.topmost_at(Vec2::new(500.0, 500.0)), None);
+        // Raising an unknown id is a no-op (no panic, no reorder).
+        let before = s.topmost_at(Vec2::new(10.0, 10.0));
+        s.raise(9999);
+        assert_eq!(s.topmost_at(Vec2::new(10.0, 10.0)), before);
     }
 
     #[test]
