@@ -79,6 +79,27 @@
       };
     };
 
+    apps.${system} = {
+      # Zero-clone launcher: polls for readiness, discovers DISPLAY at
+      # runtime, then starts the given clients. No fixed sleep, and it
+      # never waits for the compositor to quit.
+      #   nix run github:hodr-bot/canvas-wm#launch -- xterm xcalc
+      launch = {
+        type = "app";
+        program = "${pkgs.stdenv.mkDerivation {
+          name = "canvas-launch";
+          src = ./scripts/launch-with-clients.sh;
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          installPhase = ''
+            mkdir -p $out/bin
+            makeWrapper $src $out/bin/canvas-launch \
+              --set-default CANVAS_CMD "${self.packages.${system}.compositor}/bin/canvas-wm --winit"
+          '';
+        }}/bin/canvas-launch";
+      };
+    };
+
     devShells.${system}.default = pkgs.mkShell {
       packages = with pkgs; [ cargo rustc pkg-config ];
     };
