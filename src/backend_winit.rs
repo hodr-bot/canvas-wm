@@ -826,6 +826,28 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     log::error!("clear failed: {}", err);
                 }
                 for (id, cw) in server_state.windows.iter_mut() {
+                    // View-locked layer panels stick to the viewport:
+                    // recompute the canvas rect from the anchor every
+                    // frame so camera moves never drag panels along.
+                    if let Some(lock) = cw.view_lock {
+                        let org = session.to_world(
+                            crate::canvas::Vec2::new(0.0, 0.0),
+                            view,
+                        );
+                        let (w, h) = (cw.canvas.size.x, cw.canvas.size.y);
+                        let x = if lock.anchor & crate::layer::ANCHOR_RIGHT != 0 {
+                            org.x + view.x - w - lock.margins[1] as f64
+                        } else {
+                            org.x + lock.margins[3] as f64
+                        };
+                        let y = if lock.anchor & crate::layer::ANCHOR_BOTTOM != 0 {
+                            org.y + view.y - h - lock.margins[2] as f64
+                        } else {
+                            org.y + lock.margins[0] as f64
+                        };
+                        cw.canvas.pos.x = x;
+                        cw.canvas.pos.y = y;
+                    }
                     // Import freshly committed shm buffers. New attaches
                     // upload the new buffer; damage-only commits repaint
                     // into the kept buffer, so re-upload that.

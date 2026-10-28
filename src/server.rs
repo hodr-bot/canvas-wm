@@ -25,7 +25,6 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_pointer::ButtonState as WlButtonState;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, Global};
-use smithay::wayland::output::{Mode, Output, PhysicalProperties};
 use slog::Drain as _;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::compositor_init;
@@ -80,8 +79,12 @@ pub struct ClientWindow {
     /// Fullscreen state: previous canvas rect, restored on toggle-off.
     pub fullscreen_prev: Option<CanvasWindow>,
     /// Last imported buffer dims: the canvas follows the buffer only when
-    /// the CLIENT resizes (manual moves/resizes never snap back).
+    /// the client resizes (manual moves/resizes never snap back).
     pub buf_size: Option<(u32, u32)>,
+    /// View lock for layer-shell panels: positioned per-frame from the
+    /// viewport anchor (sticks to the screen, never joins canvas layout,
+    /// hit-testing or keyboard focus).
+    pub view_lock: Option<crate::layer::ViewLock>,
     /// Stacking order: higher is on top. Bumped on click-focus and grab.
     pub z: u64,
 }
@@ -96,6 +99,7 @@ impl ClientWindow {
             x11: None,
             fullscreen_prev: None,
             buf_size: None,
+            view_lock: None,
             z: 0,
         }
     }
@@ -118,6 +122,22 @@ impl ServerState {
         self.next_id += 1;
         let mut win = ClientWindow::new(id, Some(surface), self.windows.len());
         win.x11 = Some(xid);
+        self.windows.insert(id, win);
+        self.raise(id);
+        id
+    }
+
+    /// Create a view-locked layer-shell panel: no cascade placement, no
+    /// focus steal, positioned per-frame by the backend from its anchor.
+    pub fn add_layer_panel(
+        &mut self,
+        surface: Option<WlSurface>,
+        lock: crate::layer::ViewLock,
+    ) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut win = ClientWindow::new(id, surface, 0);
+        win.view_lock = Some(lock);
         self.windows.insert(id, win);
         self.raise(id);
         id
@@ -148,7 +168,7 @@ impl ServerState {
     pub fn topmost_at(&self, p: crate::canvas::Vec2) -> Option<u64> {
         self.windows
             .iter()
-            .filter(|(_, c)| c.canvas.contains(p))
+            .filter(|(_, c)| c.view_lock.is_none() && c.canvas.contains(p))
             .max_by_key(|(_, c)| c.z)
             .map(|(id, _)| *id)
     }
@@ -239,6 +259,9 @@ pub struct Server {
     _xdg_v3: Global<smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWmBase>,
     /// Clipboard + drag-and-drop manager (foot, GTK, Qt all require it).
     _data_manager: Global<WlDataDeviceManager>,
+    /// Layer shell for panels and notifications (mako).
+    _layer_shell:
+        Global<smithay::reexports::wayland_protocols::wlr::unstable::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     /// Device registry shared with protocol handlers and the DnD grab.
     data_registry: crate::data::SharedRegistry,
     /// Last pressed pointer button, for drag-grab start data.
@@ -248,7 +271,7 @@ pub struct Server {
     last_focus: Option<(WlSurface, (i32, i32))>,
     _seat: Seat,
     _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
-    _output: Output,
+    /// Single wl_output v4 (Smithay's advertises v3, which mako refuses).
     _output_global: Global<WlOutput>,
     keyboard: KeyboardHandle,
     pointer: PointerHandle,
@@ -297,6 +320,8 @@ impl Server {
         let data_registry = crate::data::new_registry();
         let data_manager =
             crate::data::init_manager(&mut display.borrow_mut(), data_registry.clone());
+        // Layer shell for panels and notifications (mako).
+        let layer_shell = crate::layer::init_layer_shell(&mut display.borrow_mut());
         let socket = display.borrow_mut().add_socket_auto()?;
         let (mut seat, seat_global) =
             Seat::new(&mut display.borrow_mut(), "seat-0".into(), Some(seat_logger()));
@@ -306,32 +331,9 @@ impl Server {
         let pointer = seat.add_pointer(|_| {});
         // One output viewport on the shared canvas. XWayland sizes its
         // screen from wl_output and stalls without one; real clients use
-        // it for DPI/positioning. Extra viewports later reuse this.
-        let (output, output_global) = Output::new(
-            &mut display.borrow_mut(),
-            "WL-1".into(),
-            PhysicalProperties {
-                size: (0, 0).into(),
-                subpixel: smithay::reexports::wayland_server::protocol::wl_output::Subpixel::Unknown,
-                make: "canvas-wm".into(),
-                model: "canvas".into(),
-            },
-            None,
-        );
-        let mode = Mode {
-            size: (1280, 800).into(),
-            refresh: 60000,
-        };
-        output.add_mode(mode);
-        output.set_preferred(mode);
-        output.change_current_state(
-            Some(mode),
-            Some(
-                smithay::reexports::wayland_server::protocol::wl_output::Transform::Normal,
-            ),
-            Some(1),
-            Some((0, 0).into()),
-        );
+        // it for DPI/positioning. Our own v4 global: Smithay's advertises
+        // v3, which mako refuses to bind.
+        let output_global = crate::output::init_output(&mut display.borrow_mut());
         Ok((
             Self {
                 display,
@@ -343,13 +345,13 @@ impl Server {
                 _zxdg: zxdg,
                 _xdg_v3: xdg_v3,
                 _data_manager: data_manager,
+                _layer_shell: layer_shell,
                 data_registry,
                 last_press: None,
                 last_pointer: (0.0, 0.0),
                 last_focus: None,
                 _seat: seat,
                 _seat_global: seat_global,
-                _output: output,
                 _output_global: output_global,
                 keyboard,
                 pointer,
