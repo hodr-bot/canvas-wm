@@ -35,13 +35,13 @@
           dbus
           libxkbcommon
           xwayland
-          xorg.libX11
-          xorg.libXcursor
-          xorg.libXrandr
-          xorg.libXi
-          xorg.libXext
-          xorg.libXfixes
-          xorg.libXrender
+          libx11
+          libxcursor
+          libxrandr
+          libxi
+          libxext
+          libxfixes
+          libxrender
         ];
         # dlopen at runtime (winit X11, EGL, libwayland-server) needs the
         # libs on LD_LIBRARY_PATH, not just at link time. cargo test runs
@@ -66,13 +66,13 @@
               libdrm
               dbus
               libxkbcommon
-              xorg.libX11
-              xorg.libXcursor
-              xorg.libXrandr
-              xorg.libXi
-              xorg.libXext
-              xorg.libXfixes
-              xorg.libXrender
+              libx11
+              libxcursor
+              libxrandr
+              libxi
+              libxext
+              libxfixes
+              libxrender
             ]}" \
             --prefix PATH : "${lib.makeBinPath [ xwayland ]}"
         '';
