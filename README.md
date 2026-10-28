@@ -47,6 +47,15 @@ Fixes that made it possible: frame callbacks (`wl_callback.done`
 every presented frame — Xwayland throttles damage without them) and
 damage-only commit re-import from the kept shm buffer.
 
+Native Wayland (`docs/native-foot.png`, `docs/native-dnd.png`):
+foot terminal + weston-terminal map as pure Wayland clients
+(`xdg_shell` v3 for GTK4-era clients, own `wl_data_device_manager`
+v3 since Smithay 0.3 hides its DnD grab). Clipboard round-trips
+live: `wl-copy` sets, a minimal C probe pastes
+(`PASTE-DATA:clipboard-test-73`, exit 0). Drag-and-drop completes:
+weston-dnd `enter → motion ×6 → drop → dnd_drop_performed`,
+server logs `drag grab installed` + `drop completed (accepted=true)`.
+
 Live canvas (`docs/v1-drag.png`, `docs/v1-zoom.png`, `docs/v1-pan.png`):
 left-drag past 6 world px moves the window (single-jump drags included),
 wheel over empty canvas zooms at the pointer, middle-drag pans the camera;
