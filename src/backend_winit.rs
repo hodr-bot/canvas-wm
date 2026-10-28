@@ -251,20 +251,34 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     pressed
                 );
                 if sym == KEY_Escape && pressed {
-                    session.on_event(
+                    let action = session.on_event(
                         SuperEvent::Esc,
                         &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
                         view,
+                    );
+                    log::info!(
+                        "super {:?} state={:?} zoom={:.2} selected={}",
+                        action,
+                        session.state,
+                        session.camera.zoom,
+                        session.overview.selected.len()
                     );
                     need_render = true;
                 } else if is_super(sym) {
                     if pressed {
                         tap.note_super_press();
                     } else if tap.note_super_release() {
-                        session.on_event(
+                        let action = session.on_event(
                             SuperEvent::SuperTap,
                             &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
                             view,
+                        );
+                        log::info!(
+                            "super {:?} state={:?} zoom={:.2} selected={}",
+                            action,
+                            session.state,
+                            session.camera.zoom,
+                            session.overview.selected.len()
                         );
                         need_render = true;
                     }
@@ -358,16 +372,35 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         .find(|(_, c)| !c.overlay && c.canvas.contains(world))
                         .map(|(id, _)| *id);
                     match hit {
-                        Some(id) => session.on_event(
-                            SuperEvent::WindowClick(id),
-                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
-                            view,
-                        ),
-                        None => session.on_event(
-                            SuperEvent::CanvasClick,
-                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
-                            view,
-                        ),
+                        Some(id) => {
+                            let action = session.on_event(
+                                SuperEvent::WindowClick(id),
+                                &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                                view,
+                            );
+                            log::info!(
+                                "super {:?} click window {} state={:?} zoom={:.2} selected={}",
+                                action,
+                                id,
+                                session.state,
+                                session.camera.zoom,
+                                session.overview.selected.len()
+                            );
+                        }
+                        None => {
+                            let action = session.on_event(
+                                SuperEvent::CanvasClick,
+                                &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                                view,
+                            );
+                            log::info!(
+                                "super {:?} click canvas state={:?} zoom={:.2} selected={}",
+                                action,
+                                session.state,
+                                session.camera.zoom,
+                                session.overview.selected.len()
+                            );
+                        }
                     };
                     need_render = true;
                 } else {

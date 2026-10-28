@@ -32,3 +32,12 @@ canvas click delivers enter at exact local coords + button 272.
 XWayland proof (`docs/e2e-xwayland.png`): real xeyes under rootless Xwayland,
 linked zero-copy via WL_SURFACE_ID to canvas 1, buffer-sized 152x102
 (no stretch), pupils track the pointer.
+
+V1 photo series (all live under Xvfb, `docs/v1-*.png`):
+`v1-base` — two native clients in cascade + minimal bar (2 chips);
+`v1-overview` — Super tap, camera ×0.7, background deepens;
+`v1-select` — left-click window 1 then window 2 in overview
+(log: `click window 1 … selected=1`, `click window 2 … selected=2`);
+`v1-fit` — re-Super keeps both in view
+(log: `QuitWithFit … zoom=2.00 selected=2`, both windows fill the frame);
+`v1-xwayland` — xeyes alone, white eyes + pupils tracking the pointer.
