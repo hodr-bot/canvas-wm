@@ -81,7 +81,7 @@ new_x_display() {
     return 1
 }
 
-X_BEFORE="$(ls "$X11DIR" 2>/dev/null | sed 's/^X//' || true)"
+X_BEFORE="$(ls "$X11DIR" 2>/dev/null | sed 's/^X//' | tr '\n' ' ' || true)"
 : > "$LOG"
 # shellcheck disable=SC2086
 $CANVAS_CMD >>"$LOG" 2>&1 &
@@ -110,7 +110,11 @@ export DISPLAY=":$NUM"
 
 echo "launch-with-clients: compositor pid $COMP_PID, WAYLAND_DISPLAY=$WAYLAND_DISPLAY DISPLAY=$DISPLAY"
 if [ "$#" -eq 0 ]; then
-    echo "launch-with-clients: no clients given; run clients with that env, stop with: kill $COMP_PID"
+    echo "launch-with-clients: no clients given; stop with: kill $COMP_PID"
+    echo "launch-with-clients: run further clients with this env:"
+    echo "  bash: export WAYLAND_DISPLAY=$WAYLAND_DISPLAY DISPLAY=$DISPLAY"
+    echo "  fish: set -gx WAYLAND_DISPLAY $WAYLAND_DISPLAY DISPLAY $DISPLAY"
+    echo "launch-with-clients: clients started without this env open on the host, not in the canvas"
     exit 0
 fi
 
