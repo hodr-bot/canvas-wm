@@ -92,6 +92,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut panning: Option<crate::canvas::Vec2> = None;
     // Hover chrome: last frame's revealed buttons (window id + layout).
     let mut last_chrome: Option<(u64, crate::chrome::ChromeLayout)> = None;
+    // Hover keyboard shortcuts (Idle): modifier guard, F/Q repeat guards,
+    // E grab-move (window id + last canvas pointer), R resize mode.
+    let mut mods_held: u8 = 0;
+    let mut f_held = false;
+    let mut q_held = false;
+    let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
+    let mut r_held = false;
+    let mut r_resize: Option<(u64, crate::chrome::Edge, crate::canvas::Vec2)> = None;
+    let mut r_swallow_left = false;
+    let mut r_swallow_right = false;
     // Solid-colour GL program for window chrome (seed of the 3D engine).
     let mut solid_prog: Option<(u32, i32, i32, u32)> = None;
     // Textured GL program: windows as perspective planes in 3D.
@@ -266,6 +276,91 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     if pressed {
                         tap.note_other_press();
                     }
+                    // Modifier tracking: hover shortcuts only fire bare.
+                    if crate::chrome::MOD_CODES.contains(&evdev) {
+                        if pressed {
+                            mods_held = mods_held.saturating_add(1);
+                        } else {
+                            mods_held = mods_held.saturating_sub(1);
+                        }
+                    }
+                    // Hover shortcuts (Idle, window under pointer): F
+                    // fullscreen, Q close, E grab-move, R resize mode.
+                    // Consumed — never reaches the app.
+                    let mut consumed = false;
+                    if session.state == crate::session::SuperState::Idle {
+                        if let Some(action) =
+                            crate::chrome::hover_shortcut(evdev, mods_held > 0)
+                        {
+                            let cworld = session.to_canvas(pointer, view);
+                            let hover = server_state
+                                .windows
+                                .iter()
+                                .find(|(_, c)| c.canvas.contains(cworld))
+                                .map(|(id, _)| *id);
+                            match action {
+                                crate::chrome::HoverKey::Fullscreen => {
+                                    if pressed && !f_held {
+                                        if let Some(id) = hover {
+                                            let rect = crate::chrome::fullscreen_rect_for(
+                                                view,
+                                                &|s| session.to_canvas(s, view),
+                                            );
+                                            let on =
+                                                server_state.toggle_fullscreen(id, &rect);
+                                            log::info!(
+                                                "hover key fullscreen window {} on={}",
+                                                id,
+                                                on
+                                            );
+                                            need_render = true;
+                                        }
+                                    }
+                                    f_held = pressed;
+                                    consumed = true;
+                                }
+                                crate::chrome::HoverKey::Close => {
+                                    if pressed && !q_held {
+                                        if let Some(id) = hover {
+                                            log::info!("hover key close window {}", id);
+                                            if let Some(xid) = server_state.close_window(id) {
+                                                if let Some(wm) = xwm.as_ref() {
+                                                    wm.kill(xid);
+                                                }
+                                            }
+                                            if focused_id == Some(id) {
+                                                focused_id = None;
+                                            }
+                                            need_render = true;
+                                        }
+                                    }
+                                    q_held = pressed;
+                                    consumed = true;
+                                }
+                                crate::chrome::HoverKey::Grab => {
+                                    if pressed {
+                                        e_grab = hover.map(|id| (id, cworld));
+                                        if e_grab.is_some() {
+                                            log::info!("hover key grab window {:?}", hover);
+                                        }
+                                    } else {
+                                        e_grab = None;
+                                    }
+                                    consumed = true;
+                                }
+                                crate::chrome::HoverKey::Resize => {
+                                    r_held = pressed;
+                                    if !pressed {
+                                        r_resize = None;
+                                    }
+                                    consumed = true;
+                                }
+                            }
+                        }
+                    }
+                    if consumed {
+                        return;
+                    }
                     // X-backed focus eats keys via XTEST, not the wl seat.
                     let xid = focused_id
                         .and_then(|id| server_state.windows.get(&id))
@@ -308,6 +403,44 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         if grab.is_some() {
                             grab = Some((id, press_world, world_now, true));
                         }
+                    }
+                }
+                // E-grab: while E is held, the window follows the pointer —
+                // no button needed, release drops it.
+                if let Some((id, last)) = e_grab {
+                    let now = session.to_canvas(pointer, view);
+                    match server_state.windows.get_mut(&id) {
+                        Some(cw) => {
+                            cw.canvas.pos.x += now.x - last.x;
+                            cw.canvas.pos.y += now.y - last.y;
+                            need_render = true;
+                            e_grab = Some((id, now));
+                        }
+                        None => e_grab = None,
+                    }
+                }
+                // R-resize: while R is held, a border drag grows the window.
+                if let Some((id, edge, last)) = r_resize {
+                    let now = session.to_canvas(pointer, view);
+                    match server_state.windows.get_mut(&id) {
+                        Some(cw) => {
+                            let delta = crate::canvas::Vec2::new(
+                                now.x - last.x,
+                                now.y - last.y,
+                            );
+                            cw.canvas =
+                                crate::chrome::apply_resize(&cw.canvas, edge, delta);
+                            log::debug!(
+                                "resize window {} {:?} now {}x{}",
+                                id,
+                                edge,
+                                cw.canvas.size.x,
+                                cw.canvas.size.y
+                            );
+                            need_render = true;
+                            r_resize = Some((id, edge, now));
+                        }
+                        None => r_resize = None,
                     }
                 }
                 let world = session.to_world(logical, view);
@@ -454,6 +587,36 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                         }
                         let cworld = session.to_canvas(pointer, view);
+                        // R resize mode: left/right press on a border starts
+                        // a resize drag; every R-held press is swallowed so
+                        // the app never sees half of it.
+                        if r_held
+                            && (event.button() == MouseButton::Left
+                                || event.button() == MouseButton::Right)
+                        {
+                            if let Some((id, c)) = server_state
+                                .windows
+                                .iter()
+                                .find(|(_, c)| c.canvas.contains(cworld))
+                            {
+                                let id = *id;
+                                if let Some(edge) = crate::chrome::resize_edge(
+                                    &c.canvas,
+                                    cworld,
+                                    crate::chrome::RESIZE_GRAB,
+                                ) {
+                                    r_resize = Some((id, edge, cworld));
+                                    log::info!("resize start window {} {:?}", id, edge);
+                                }
+                            }
+                            match event.button() {
+                                MouseButton::Left => r_swallow_left = true,
+                                MouseButton::Right => r_swallow_right = true,
+                                _ => {}
+                            }
+                            need_render = true;
+                            return;
+                        }
                         if let Some((id, c)) = server_state
                             .windows
                             .iter()
@@ -466,6 +629,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     let code = button_code(event.button());
+                    // A release closes an R-swallowed press: never forwarded,
+                    // so the app never sees half a drag.
+                    if !pressed {
+                        let swallowed = match event.button() {
+                            MouseButton::Left => std::mem::replace(&mut r_swallow_left, false),
+                            MouseButton::Right => {
+                                std::mem::replace(&mut r_swallow_right, false)
+                            }
+                            _ => false,
+                        };
+                        if swallowed {
+                            r_resize = None;
+                            return;
+                        }
+                    }
                     server.input_button(code, pressed);
                     // X-backed focus: mirror press/release via XTEST.
                     let xid = focused_id
@@ -617,16 +795,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 );
                                 match renderer.import_shm_buffer(&buffer, None, &[damage]) {
                                     Ok(tex) => {
-                                        // Fit the canvas rect to the buffer on first
-                                        // import (or when the client resizes):
-                                        // floating windows are buffer-sized,
-                                        // positioned by cascade, never stretched.
+                                        // Follow the buffer only when the CLIENT
+                                        // resizes (first map or configure):
+                                        // manual moves/resizes never snap back.
                                         // Fullscreen windows keep their fitted
                                         // rect (aspect-preserved, centred).
+                                        let buf = (w as u32, h as u32);
                                         if cw.fullscreen_prev.is_none()
-                                            && ((cw.canvas.size.x - w as f64).abs() > 0.5
-                                                || (cw.canvas.size.y - h as f64).abs() > 0.5)
+                                            && cw.buf_size != Some(buf)
                                         {
+                                            cw.buf_size = Some(buf);
                                             cw.canvas.size.x = w as f64;
                                             cw.canvas.size.y = h as f64;
                                             log::info!(

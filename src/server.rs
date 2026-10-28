@@ -76,6 +76,9 @@ pub struct ClientWindow {
     pub x11: Option<u32>,
     /// Fullscreen state: previous canvas rect, restored on toggle-off.
     pub fullscreen_prev: Option<CanvasWindow>,
+    /// Last imported buffer dims: the canvas follows the buffer only when
+    /// the CLIENT resizes (manual moves/resizes never snap back).
+    pub buf_size: Option<(u32, u32)>,
 }
 
 impl ClientWindow {
@@ -87,6 +90,7 @@ impl ClientWindow {
             last_buffer: None,
             x11: None,
             fullscreen_prev: None,
+            buf_size: None,
         }
     }
 }

@@ -90,6 +90,111 @@ pub fn fullscreen_rect_for(view: Vec2, to_canvas: &dyn Fn(Vec2) -> Vec2) -> Canv
     )
 }
 
+// Hover keyboard shortcuts (Idle mode, no modifiers held): act on the
+// window under the pointer. evdev codes, layout-independent position.
+pub const KEY_Q: u32 = 16;
+pub const KEY_E: u32 = 18;
+pub const KEY_R: u32 = 19;
+pub const KEY_F: u32 = 33;
+
+/// Modifier evdev codes that cancel hover shortcuts (typing stays typing).
+pub const MOD_CODES: [u32; 6] = [42, 54, 29, 97, 56, 100];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HoverKey {
+    Fullscreen,
+    Close,
+    Grab,
+    Resize,
+}
+
+pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
+    if modifiers_held {
+        return None;
+    }
+    match code {
+        KEY_F => Some(HoverKey::Fullscreen),
+        KEY_Q => Some(HoverKey::Close),
+        KEY_E => Some(HoverKey::Grab),
+        KEY_R => Some(HoverKey::Resize),
+        _ => None,
+    }
+}
+
+/// Resize handle: window edges and corners, in canvas coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Edge proximity band (canvas px) for starting a resize drag.
+pub const RESIZE_GRAB: f64 = 12.0;
+/// Windows never shrink below this (canvas px).
+pub const MIN_WIN: f64 = 60.0;
+
+pub fn resize_edge(rect: &CanvasWindow, p: Vec2, grab: f64) -> Option<Edge> {
+    let (l, t) = (rect.pos.x, rect.pos.y);
+    let (r, b) = (l + rect.size.x, t + rect.size.y);
+    let nl = (p.x - l).abs() <= grab;
+    let nr = (p.x - r).abs() <= grab;
+    let nt = (p.y - t).abs() <= grab;
+    let nb = (p.y - b).abs() <= grab;
+    // Corners first, then single edges, else not on a handle.
+    if nl && nt {
+        Some(Edge::TopLeft)
+    } else if nr && nt {
+        Some(Edge::TopRight)
+    } else if nl && nb {
+        Some(Edge::BottomLeft)
+    } else if nr && nb {
+        Some(Edge::BottomRight)
+    } else if nl && !nr {
+        Some(Edge::Left)
+    } else if nr && !nl {
+        Some(Edge::Right)
+    } else if nt && !nb {
+        Some(Edge::Top)
+    } else if nb && !nt {
+        Some(Edge::Bottom)
+    } else {
+        None
+    }
+}
+
+/// Grow/shrink a window rect by a canvas-space drag delta on one handle.
+/// Minimum size clamps the moving side, never the anchored one.
+pub fn apply_resize(rect: &CanvasWindow, edge: Edge, delta: Vec2) -> CanvasWindow {
+    let (mut x, mut y, mut w, mut h) = (rect.pos.x, rect.pos.y, rect.size.x, rect.size.y);
+    let left = matches!(edge, Edge::Left | Edge::TopLeft | Edge::BottomLeft);
+    let right = matches!(edge, Edge::Right | Edge::TopRight | Edge::BottomRight);
+    let top = matches!(edge, Edge::Top | Edge::TopLeft | Edge::TopRight);
+    let bottom = matches!(edge, Edge::Bottom | Edge::BottomLeft | Edge::BottomRight);
+    if left {
+        let nw = (w - delta.x).max(MIN_WIN);
+        x += w - nw;
+        w = nw;
+    }
+    if right {
+        w = (w + delta.x).max(MIN_WIN);
+    }
+    if top {
+        let nh = (h - delta.y).max(MIN_WIN);
+        y += h - nh;
+        h = nh;
+    }
+    if bottom {
+        h = (h + delta.y).max(MIN_WIN);
+    }
+    CanvasWindow::new(rect.id, x, y, w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,7 +203,6 @@ mod tests {
         // Window top-left (800, 544), size 486x318 on screen.
         (Vec2::new(800.0, 544.0), Vec2::new(486.0, 318.0))
     }
-
     #[test]
     fn hidden_far_from_corner_and_deep_inside() {
         let (origin, size) = win();
@@ -130,5 +234,49 @@ mod tests {
         let rect = fullscreen_rect_for(view, &|s| s);
         assert_eq!(rect.pos, Vec2::new(0.0, 0.0));
         assert_eq!(rect.size, Vec2::new(1280.0, 800.0));
+    }
+
+    #[test]
+    fn hover_keys_map_without_modifiers_only() {
+        assert_eq!(hover_shortcut(KEY_F, false), Some(HoverKey::Fullscreen));
+        assert_eq!(hover_shortcut(KEY_Q, false), Some(HoverKey::Close));
+        assert_eq!(hover_shortcut(KEY_E, false), Some(HoverKey::Grab));
+        assert_eq!(hover_shortcut(KEY_R, false), Some(HoverKey::Resize));
+        assert_eq!(hover_shortcut(KEY_F, true), None);
+        assert_eq!(hover_shortcut(30, false), None); // A is for typing
+        assert!(MOD_CODES.contains(&42) && MOD_CODES.contains(&29));
+    }
+
+    #[test]
+    fn resize_handles_hit_edges_corners_only() {
+        let rect = CanvasWindow::new(7, 100.0, 100.0, 400.0, 300.0);
+        assert_eq!(resize_edge(&rect, Vec2::new(102.0, 250.0), RESIZE_GRAB), Some(Edge::Left));
+        assert_eq!(resize_edge(&rect, Vec2::new(498.0, 250.0), RESIZE_GRAB), Some(Edge::Right));
+        assert_eq!(resize_edge(&rect, Vec2::new(300.0, 103.0), RESIZE_GRAB), Some(Edge::Top));
+        assert_eq!(resize_edge(&rect, Vec2::new(300.0, 397.0), RESIZE_GRAB), Some(Edge::Bottom));
+        assert_eq!(resize_edge(&rect, Vec2::new(101.0, 101.0), RESIZE_GRAB), Some(Edge::TopLeft));
+        assert_eq!(resize_edge(&rect, Vec2::new(499.0, 399.0), RESIZE_GRAB), Some(Edge::BottomRight));
+        // Deep inside or far outside: no handle.
+        assert_eq!(resize_edge(&rect, Vec2::new(300.0, 250.0), RESIZE_GRAB), None);
+        assert_eq!(resize_edge(&rect, Vec2::new(0.0, 0.0), RESIZE_GRAB), None);
+    }
+
+    #[test]
+    fn apply_resize_grows_anchors_and_clamps() {
+        let rect = CanvasWindow::new(7, 100.0, 100.0, 400.0, 300.0);
+        // Right edge +40: grows, position anchored.
+        let r = apply_resize(&rect, Edge::Right, Vec2::new(40.0, 0.0));
+        assert_eq!((r.pos.x, r.size.x), (100.0, 440.0));
+        // Left edge +40 (drag right): shrinks from the left.
+        let l = apply_resize(&rect, Edge::Left, Vec2::new(40.0, 0.0));
+        assert_eq!((l.pos.x, l.size.x), (140.0, 360.0));
+        // Bottom-right corner grows both axes.
+        let c = apply_resize(&rect, Edge::BottomRight, Vec2::new(10.0, 20.0));
+        assert_eq!((c.size.x, c.size.y), (410.0, 320.0));
+        // Clamp: never below MIN_WIN, anchor side stays.
+        let s = apply_resize(&rect, Edge::Right, Vec2::new(-1000.0, 0.0));
+        assert_eq!(s.size.x, MIN_WIN);
+        let t = apply_resize(&rect, Edge::Left, Vec2::new(1000.0, 0.0));
+        assert_eq!((t.pos.x, t.size.x), (100.0 + 400.0 - MIN_WIN, MIN_WIN));
     }
 }
