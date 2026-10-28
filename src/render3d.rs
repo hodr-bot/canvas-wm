@@ -136,8 +136,9 @@ void main() { v_uv = uv; gl_Position = mvp * vec4(position, 0.0, 1.0); }
 const FRAG_TEX_SRC: &str = "#version 100
 precision mediump float;
 uniform sampler2D tex;
+uniform float opaque;
 varying vec2 v_uv;
-void main() { gl_FragColor = texture2D(tex, v_uv); }
+void main() { vec4 t = texture2D(tex, v_uv); gl_FragColor = vec4(t.rgb, mix(t.a, 1.0, opaque)); }
 ";
 
 /// Compile the solid-colour program. Returns the program id plus the
@@ -216,9 +217,9 @@ pub unsafe fn draw_solid(
     gl.Enable(ffi::SCISSOR_TEST);
 }
 
-/// Compile the textured program: (program, u_mvp, u_tex, a_pos, a_uv).
+/// Compile the textured program: (program, u_mvp, u_tex, u_opaque, a_pos, a_uv).
 #[cfg(feature = "compositor")]
-pub fn compile_textured(gl: &ffi::Gles2) -> Result<(u32, i32, i32, u32, u32), String> {
+pub fn compile_textured(gl: &ffi::Gles2) -> Result<(u32, i32, i32, i32, u32, u32), String> {
     let c = |s: &str| CString::new(s).unwrap();
     unsafe {
         let vert = compile(gl, ffi::VERTEX_SHADER, VERT_TEX_SRC)?;
@@ -239,30 +240,35 @@ pub fn compile_textured(gl: &ffi::Gles2) -> Result<(u32, i32, i32, u32, u32), St
         }
         let mvp = gl.GetUniformLocation(program, c("mvp").as_ptr() as *const _);
         let tex = gl.GetUniformLocation(program, c("tex").as_ptr() as *const _);
+        let opaque = gl.GetUniformLocation(program, c("opaque").as_ptr() as *const _);
         let pos = gl.GetAttribLocation(program, c("position").as_ptr() as *const _) as u32;
         let uv = gl.GetAttribLocation(program, c("uv").as_ptr() as *const _) as u32;
-        Ok((program, mvp, tex, pos, uv))
+        Ok((program, mvp, tex, opaque, pos, uv))
     }
 }
 
 /// Draw one textured quad: `verts` are (x, y, u, v) per corner, triangle
 /// strip order TL, TR, BL, BR. Y in MVP units (caller negates canvas y).
-/// Same blend contract as Smithay's own draws (premultiplied textures).
+/// Same blend contract as Smithay's own draws (premultiplied textures);
+/// `opaque` forces alpha to 1 for X-format buffers whose X byte is not
+/// real alpha (see `shm_format_is_opaque`).
 #[cfg(feature = "compositor")]
 pub unsafe fn draw_textured(
     gl: &ffi::Gles2,
-    prog: (u32, i32, i32, u32, u32),
+    prog: (u32, i32, i32, i32, u32, u32),
     mvp: &[f32; 16],
     tex_id: u32,
     verts: &[f32; 16],
+    opaque: bool,
 ) {
-    let (program, u_mvp, u_tex, a_pos, a_uv) = prog;
+    let (program, u_mvp, u_tex, u_opaque, a_pos, a_uv) = prog;
     gl.Disable(ffi::SCISSOR_TEST);
     gl.UseProgram(program);
     gl.UniformMatrix4fv(u_mvp, 1, ffi::FALSE as u8, mvp.as_ptr());
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.BindTexture(ffi::TEXTURE_2D, tex_id);
     gl.Uniform1i(u_tex, 0);
+    gl.Uniform1f(u_opaque, if opaque { 1.0 } else { 0.0 });
     // Fresh shm imports default to mipmapped minification (incomplete
     // texture = black); Smithay's own draws set LINEAR every time too.
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
@@ -292,6 +298,30 @@ pub unsafe fn draw_textured(
     gl.BindTexture(ffi::TEXTURE_2D, 0);
     gl.UseProgram(0);
     gl.Enable(ffi::SCISSOR_TEST);
+}
+
+/// True when an shm buffer format carries no real alpha: the X byte is
+/// whatever the X server left behind (usually 0x00), so sampling it as
+/// alpha turns the window transparent wherever nothing opaque was drawn
+/// (xterm text floats over the canvas; fresh selections vanish). The
+/// textured draw forces alpha to 1 for these; ARGB keeps its alpha.
+#[cfg(feature = "compositor")]
+pub fn shm_format_is_opaque(
+    format: smithay::reexports::wayland_server::protocol::wl_shm::Format,
+) -> bool {
+    use smithay::reexports::wayland_server::protocol::wl_shm::Format::*;
+    matches!(
+        format,
+        Xrgb8888
+            | Xbgr8888
+            | Xrgb4444
+            | Xbgr4444
+            | Xrgb1555
+            | Xbgr1555
+            | Rgb565
+            | Bgr565
+            | C8
+    )
 }
 
 #[cfg(test)]
@@ -356,5 +386,16 @@ mod tests {
         let (fx, fy) = project(&flat, 0.0, 0.0, 1280.0, 800.0);
         let (tx, ty) = project(&tilt, 0.0, 0.0, 1280.0, 800.0);
         assert!((tx - fx).abs() + (ty - fy).abs() > 1.0);
+    }
+
+    #[cfg(feature = "compositor")]
+    #[test]
+    fn x_formats_are_opaque_argb_is_not() {
+        use smithay::reexports::wayland_server::protocol::wl_shm::Format::*;
+        assert!(shm_format_is_opaque(Xrgb8888));
+        assert!(shm_format_is_opaque(Xbgr8888));
+        assert!(shm_format_is_opaque(Rgb565));
+        assert!(!shm_format_is_opaque(Argb8888));
+        assert!(!shm_format_is_opaque(Abgr8888));
     }
 }

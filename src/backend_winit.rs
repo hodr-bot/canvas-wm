@@ -107,7 +107,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Solid-colour GL program for window chrome (seed of the 3D engine).
     let mut solid_prog: Option<(u32, i32, i32, u32)> = None;
     // Textured GL program: windows as perspective planes in 3D.
-    let mut tex_prog: Option<(u32, i32, i32, u32, u32)> = None;
+    let mut tex_prog: Option<(u32, i32, i32, i32, u32, u32)> = None;
     // Canvas-mode press point: released without moving = plain canvas click.
     let mut pan_start: Option<crate::canvas::Vec2> = None;
 
@@ -203,6 +203,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 if let Some(sid) = sid {
                     server_state.forget_surface(sid);
                 }
+            }
+        }
+        // Mirror canvas raises into X stacking order: X button delivery
+        // targets the X-topmost window at the pointer, so a canvas raise
+        // without its X mirror sends clicks to the wrong client wherever
+        // X windows overlap in root space.
+        for xid in server_state.take_restacks() {
+            if let Some(wm) = xwm.as_ref() {
+                wm.restack_above(xid);
             }
         }
         // Newest canvas window steals keyboard focus, like any floating WM.
@@ -698,6 +707,18 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             server_state.raise(id);
                             focused_id = Some(id);
                             known_ids.insert(id);
+                            // Click diagnostics: which window the pick resolved
+                            // to, in canvas-local px and its X id (if any).
+                            if let Some(c) = server_state.windows.get(&id) {
+                                let local = cworld - c.canvas.pos;
+                                log::info!(
+                                    "click window {} local=({},{}) x11={:?}",
+                                    id,
+                                    local.x as i32,
+                                    local.y as i32,
+                                    c.x11
+                                );
+                            }
                         }
                     }
                     let code = button_code(event.button());
@@ -723,6 +744,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         .and_then(|c| c.x11);
                     if let (Some(wm), Some(xid)) = (xwm.as_ref(), xid) {
                         if pressed {
+                            // Restack BEFORE delivery: X button routing
+                            // targets the X-topmost window, so the focused
+                            // window must already be top when the press
+                            // lands (the per-frame drain only covers
+                            // raises from other paths).
+                            wm.restack_above(xid);
                             wm.focus(xid);
                             server.focus_keyboard(None);
                         }
@@ -826,7 +853,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 if let Err(err) = frame.clear(color) {
                     log::error!("clear failed: {}", err);
                 }
-                for (id, cw) in server_state.windows.iter_mut() {
+                // Painter's algorithm: lowest z first, so the visual top
+                // always matches the pick top (topmost_at). HashMap
+                // iteration is random; unsorted, an occluded window can
+                // paint over the focused one while clicks resolve to the
+                // focused one (click lands on an invisible window).
+                for id in server_state.paint_order() {
+                    let cw = match server_state.windows.get_mut(&id) {
+                        Some(cw) => cw,
+                        None => continue,
+                    };
                     // View-locked layer panels stick to the viewport:
                     // recompute the canvas rect from the anchor every
                     // frame so camera moves never drag panels along.
@@ -976,8 +1012,26 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     qx + qw, qy + qh, 1.0, 1.0,
                                 ];
                                 let tid = tex.tex_id();
+                                // X-format buffers carry no real alpha (the X
+                                // byte is server droppings); without forcing
+                                // opaque, the window renders transparent
+                                // wherever nothing opaque was drawn.
+                                let opaque = cw
+                                    .last_buffer
+                                    .as_ref()
+                                    .map(|buffer| {
+                                        with_buffer_contents(buffer, |_, data| {
+                                            crate::render3d::shm_format_is_opaque(
+                                                data.format,
+                                            )
+                                        })
+                                        .unwrap_or(false)
+                                    })
+                                    .unwrap_or(false);
                                 let _ = renderer.with_context(|_, gl| unsafe {
-                                    crate::render3d::draw_textured(gl, prog, &mvp, tid, &verts);
+                                    crate::render3d::draw_textured(
+                                        gl, prog, &mvp, tid, &verts, opaque,
+                                    );
                                 });
                                 continue;
                             }

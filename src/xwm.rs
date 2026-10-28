@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
-    EventMask, ImageOrder, InputFocus, MapState, WindowClass, BUTTON_PRESS_EVENT,
+    EventMask, ImageOrder, InputFocus, MapState, StackMode, WindowClass, BUTTON_PRESS_EVENT,
     BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::composite::{self, Redirect};
@@ -346,6 +346,22 @@ impl Xwm {
             0,
             0,
             0,
+        );
+        let _ = self.conn.flush();
+    }
+
+    /// Mirror a canvas raise into X stacking order (XRaiseWindow). Without
+    /// this, X stacking drifts from canvas stacking and XTEST/wl_pointer
+    /// button delivery (which targets the X-topmost window at the pointer)
+    /// lands on the wrong client wherever X windows overlap in root space
+    /// (Xwayland stacks them all at 0,0 by default).
+    pub fn restack_above(&self, xid: u32) {
+        if !self.wins.contains_key(&xid) {
+            return;
+        }
+        let _ = self.conn.configure_window(
+            xid,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
         );
         let _ = self.conn.flush();
     }

@@ -64,6 +64,12 @@ pub struct ServerState {
     surface_ids: HashMap<u32, WlSurface>,
     /// Surfaces already announced to wl_outputs (enter sent once).
     entered_outputs: HashSet<u32>,
+    /// X window ids whose canvas raise still needs its X restack mirror.
+    /// XTEST button delivery goes to the X-topmost window at the pointer,
+    /// so every canvas raise queues its xid here and the backend drains
+    /// the queue into XRaiseWindow each frame. Hover focus never raises,
+    /// so it never queues: hover focuses without restacking.
+    restack_queue: Vec<u32>,
 }
 
 /// A client window: canvas placement plus live surface and GPU texture.
@@ -175,14 +181,36 @@ impl ServerState {
             .map(|(id, _)| *id)
     }
 
+    /// Canvas ids back-to-front (painter's algorithm): the backend paints
+    /// in this order so the visual top always matches the pick top
+    /// (`topmost_at`). HashMap iteration is random; painting unsorted
+    /// lets an occluded window cover the focused one while clicks
+    /// resolve to the focused one.
+    pub fn paint_order(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.windows.keys().copied().collect();
+        ids.sort_by_key(|id| self.windows.get(id).map(|c| c.z).unwrap_or(0));
+        ids
+    }
+
     /// Bring a window to the front (click-focus, grab).
     pub fn raise(&mut self, id: u64) {
         if self.windows.contains_key(&id) {
             self.z_top += 1;
             if let Some(w) = self.windows.get_mut(&id) {
                 w.z = self.z_top;
+                // Queue the X mirror: without it, X stacking drifts from
+                // canvas stacking and clicks land on the wrong client
+                // wherever X windows overlap in root space.
+                if let Some(xid) = w.x11 {
+                    self.restack_queue.push(xid);
+                }
             }
         }
+    }
+
+    /// Drain queued X restacks (backend mirrors them into XRaiseWindow).
+    pub fn take_restacks(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.restack_queue)
     }
 
     /// Window owning `surface`, if any (activation focus, layer panels).
@@ -619,6 +647,33 @@ mod tests {
         let before = s.topmost_at(Vec2::new(10.0, 10.0));
         s.raise(9999);
         assert_eq!(s.topmost_at(Vec2::new(10.0, 10.0)), before);
+    }
+
+    #[test]
+    fn raise_queues_x_restack_for_x11_windows() {
+        let mut s = ServerState::default();
+        let id = s.add_toplevel(None);
+        // Map-time raise has no X window yet: nothing queued.
+        assert!(s.take_restacks().is_empty());
+        s.windows.get_mut(&id).unwrap().x11 = Some(42);
+        s.raise(id);
+        assert_eq!(s.take_restacks(), vec![42]);
+        // Drain is one-shot; unknown ids queue nothing.
+        assert!(s.take_restacks().is_empty());
+        s.raise(9999);
+        assert!(s.take_restacks().is_empty());
+    }
+
+    #[test]
+    fn paint_order_puts_raised_window_last() {
+        let mut s = ServerState::default();
+        let a = s.add_toplevel(None);
+        let b = s.add_toplevel(None);
+        // Newest (b) paints last; after raising a, a paints last, so the
+        // visual top always matches the pick top.
+        assert_eq!(s.paint_order().last(), Some(&b));
+        s.raise(a);
+        assert_eq!(s.paint_order().last(), Some(&a));
     }
 
     #[test]
