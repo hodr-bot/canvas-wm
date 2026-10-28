@@ -1,6 +1,6 @@
 // Session logic: pure, testable, no backend imports.
-// Multi-output viewports on one shared canvas, minimal status bar with
-// proximity chrome, Super-tap overview state machine.
+// Multi-output viewports on one shared canvas, no status strip (window
+// chrome lives on the windows), Super-tap canvas-mode state machine.
 
 use crate::canvas::{Camera, CanvasWindow, Overview, Vec2};
 

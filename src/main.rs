@@ -1,10 +1,9 @@
 mod canvas;
 mod session;
-mod bar;
+mod chrome;
+mod render3d;
 #[cfg(feature = "compositor")]
 mod backend_winit;
-#[cfg(feature = "compositor")]
-mod bar_client;
 #[cfg(feature = "compositor")]
 mod xwm;
 #[cfg(feature = "compositor")]

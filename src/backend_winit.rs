@@ -33,8 +33,6 @@ use crate::keys::{is_super, KeyMapper, TapTracker, KEY_Escape};
 use crate::server::{Server, ServerState};
 use crate::session::{drag_offset, Session, SuperEvent};
 use crate::xwm::Xwm;
-use crate::{bar, bar_client::BarClient};
-use crate::bar::BAR_HEIGHT;
 
 /// X display sockets before XWayland starts, to spot its display number.
 fn x11_sockets() -> Vec<String> {
@@ -85,43 +83,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Window ids the seat already knows about; a change re-asserts focus so
     // late-bound clients receive keyboard Enter on the newest window.
     let mut known_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    // Focused canvas window (chip highlight) and last bar state sent.
+    // Focused canvas window.
     let mut focused_id: Option<u64> = None;
-    let mut last_bar: (usize, Option<usize>) = (usize::MAX, None);
     // Live canvas gestures: left-drag on empty canvas space pans the canvas
     // (Canvas mode only); a dwell-armed window drag moves that window.
     // Press canvas coords + last canvas coords + whether past threshold.
     let mut grab: Option<(u64, crate::canvas::Vec2, crate::canvas::Vec2, bool)> = None;
     let mut panning: Option<crate::canvas::Vec2> = None;
+    // Hover chrome: last frame's revealed buttons (window id + layout).
+    let mut last_chrome: Option<(u64, crate::chrome::ChromeLayout)> = None;
+    // Solid-colour GL program for window chrome (seed of the 3D engine).
+    let mut solid_prog: Option<(u32, i32, i32, u32)> = None;
     // Canvas-mode press point: released without moving = plain canvas click.
     let mut pan_start: Option<crate::canvas::Vec2> = None;
-
-    // The internal bar maps first, before any external client can connect.
-    // It is tagged as overlay by matching its surface id (deterministic,
-    // no dependence on map order).
-    let mut bar = BarClient::connect(&socket, view.x as i32)
-        .map_err(|e| format!("bar client: {}", e))?;
-    for _ in 0..500 {
-        bar.progress();
-        server.pump(&mut server_state);
-        bar.pump();
-        if let Some(bar_sid) = bar.surface_id() {
-            if let Some(id) = server_state
-                .windows
-                .iter()
-                .find(|(_, c)| {
-                    c.surface
-                        .as_ref()
-                        .map(|s| s.as_ref().id() == bar_sid)
-                        .unwrap_or(false)
-                })
-                .map(|(id, _)| *id)
-            {
-                server_state.set_overlay(id);
-                break;
-            }
-        }
-    }
 
     // calloop loop just for the XWayland source; polled every frame.
     let mut event_loop: EventLoop<()> =
@@ -144,10 +118,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         .start()
         .map_err(|e| format!("Xwayland spawn: {}", e))?;
     let mut xwm: Option<Xwm> = None;
-
-    if !server_state.windows.values().any(|c| c.overlay) {
-        log::warn!("bar did not map; continuing without overlay");
-    }
 
     // Unmatched X surface links wait here; the surface may be created
     // server-side after the client message arrives.
@@ -308,11 +278,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let scale = graphics.window_size().scale_factor;
                 let logical = crate::canvas::Vec2::new(event.x() / scale, event.y() / scale);
                 pointer = logical;
-                // The bar captures the pointer: no client focus above it.
-                if bar::in_bar(logical) {
-                    server.input_motion((logical.x, logical.y), None);
-                    return;
-                }
                 // Live gestures before picking, in canvas-plane coordinates.
                 // Canvas pan: content follows the cursor, velocity-ready.
                 if let Some(last) = panning {
@@ -344,6 +309,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 let world = session.to_world(logical, view);
+                // Hover chrome reveals on proximity: repaint on motion so
+                // buttons appear/disappear with the pointer (Idle only;
+                // Canvas mode freezes the apps and their chrome).
+                if session.state == crate::session::SuperState::Idle {
+                    need_render = true;
+                }
                 // Hit-test in canvas-plane coordinates (windows live there).
                 let cworld = session.to_canvas(logical, view);
                 log::debug!(
@@ -359,7 +330,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let hit = server_state
                     .windows
                     .iter()
-                    .find(|(_, c)| !c.overlay && c.canvas.contains(cworld));
+                    .find(|(_, c)| c.canvas.contains(cworld));
                 // Seat offset = surface origin in logical space; Smithay
                 // reports enter/motion coords as pointer minus this origin.
                 // X-backed windows additionally get XTEST motion in local px.
@@ -383,26 +354,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             InputEvent::PointerButton { event } => {
                 let pressed = event.state() == ButtonState::Pressed;
                 let left = event.button() == MouseButton::Left;
-                // Bar clicks focus a chip's window and never reach clients.
-                if pressed && bar::in_bar(pointer) {
-                    let canvas = server_state.canvas_ids();
-                    if let Some(i) = bar::chip_at(pointer, canvas.len(), view.x) {
-                        if let Some(id) = canvas.get(i).copied() {
-                            if let Some(c) = server_state.windows.get(&id) {
-                                server.focus_keyboard(c.surface.as_ref());
-                            }
-                            focused_id = Some(id);
-                            need_render = true;
-                            if let (Some(wm), Some(xid)) = (
-                                xwm.as_ref(),
-                                server_state.windows.get(&id).and_then(|c| c.x11),
-                            ) {
-                                wm.focus(xid);
-                                server.focus_keyboard(None);
-                            }
-                        }
-                    }
-                } else if session.state == crate::session::SuperState::Canvas {
+                // Canvas-mode press starts here; Idle falls through to focus.
+                if session.state == crate::session::SuperState::Canvas {
                     // Canvas mode: apps are frozen, nothing reaches clients.
                     // Armed window + press = move it (Hyprland-style, dwell
                     // replaces the held key); empty press starts a canvas pan.
@@ -411,7 +364,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         let hit = server_state
                             .windows
                             .iter()
-                            .find(|(_, c)| !c.overlay && c.canvas.contains(cw))
+                            .find(|(_, c)| c.canvas.contains(cw))
                             .map(|(id, _)| *id);
                         match hit {
                             Some(id) if session.dwell.armed == Some(id) => {
@@ -464,11 +417,45 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     // Idle: click focuses the window, then the client
                     // receives the button. Plain left NEVER moves windows.
                     if pressed {
+                        // Window chrome first: a click on a revealed button
+                        // acts and never reaches the app.
+                        if let Some((chrome_id, layout)) = last_chrome {
+                            if let Some(btn) = layout.hit(pointer) {
+                                match btn {
+                                    crate::chrome::ChromeButton::Close => {
+                                        log::info!("chrome close window {}", chrome_id);
+                                        if let Some(xid) = server_state.close_window(chrome_id) {
+                                            if let Some(wm) = xwm.as_ref() {
+                                                wm.kill(xid);
+                                            }
+                                        }
+                                        if focused_id == Some(chrome_id) {
+                                            focused_id = None;
+                                        }
+                                    }
+                                    crate::chrome::ChromeButton::Fullscreen => {
+                                        let rect = crate::chrome::fullscreen_rect_for(view, &|s| {
+                                            session.to_canvas(s, view)
+                                        });
+                                        let on =
+                                            server_state.toggle_fullscreen(chrome_id, &rect);
+                                        log::info!(
+                                            "chrome fullscreen window {} on={}",
+                                            chrome_id,
+                                            on
+                                        );
+                                    }
+                                }
+                                need_render = true;
+                                last_chrome = None;
+                                return;
+                            }
+                        }
                         let cworld = session.to_canvas(pointer, view);
                         if let Some((id, c)) = server_state
                             .windows
                             .iter()
-                            .find(|(_, c)| !c.overlay && c.canvas.contains(cworld))
+                            .find(|(_, c)| c.canvas.contains(cworld))
                         {
                             let id = *id;
                             server.focus_keyboard(c.surface.as_ref());
@@ -498,12 +485,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     .amount(Axis::Vertical)
                     .or_else(|| event.amount_discrete(Axis::Vertical).map(|s| s as f64))
                     .unwrap_or(0.0);
-                if vertical != 0.0 && !bar::in_bar(pointer) {
+                if vertical != 0.0 {
                     let cworld = session.to_canvas(pointer, view);
                     let over_window = server_state
                         .windows
                         .iter()
-                        .any(|(_, c)| !c.overlay && c.canvas.contains(cworld));
+                        .any(|(_, c)| c.canvas.contains(cworld));
                     if !over_window {
                         let factor = if vertical > 0.0 { 1.15 } else { 1.0 / 1.15 };
                         session.zoom_at(pointer, view, factor);
@@ -557,27 +544,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             let inside = server_state
                 .windows
                 .iter()
-                .find(|(_, c)| !c.overlay && c.canvas.contains(cw))
+                .find(|(_, c)| c.canvas.contains(cw))
                 .map(|(id, _)| *id);
             if session.dwell.update(inside, now_ms).is_some() {
                 log::debug!("dwell armed {:?}", session.dwell.armed);
             }
         }
 
-        // Bar follows the canvas window set; redraw on change.
-        bar.pump();
-        let canvas = server_state.canvas_ids();
-        let focused_chip = focused_id.and_then(|id| canvas.iter().position(|c| *c == id));
-        if (canvas.len(), focused_chip) != last_bar {
-            last_bar = (canvas.len(), focused_chip);
-            log::debug!(
-                "bar update n={} focused_chip={:?}",
-                canvas.len(),
-                focused_chip
-            );
-            bar.redraw(canvas.len(), focused_chip);
-            need_render = true;
-        }
+        // (Bar removed: no status strip; window chrome lives on windows.)
 
         // Newly committed client buffers (native or XWayland) need a
         // frame even with no input: otherwise live apps (xterm text,
@@ -670,19 +644,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
-                    // Draw through the canvas camera, or screen-fixed for
-                    // the overlay bar.
+                    // Draw through the canvas camera.
                     if let Some(tex) = cw.texture.as_ref() {
-                        let dest = if cw.overlay {
-                            Rectangle::<f64, Physical>::from_loc_and_size(
-                                (0.0, 0.0),
-                                (view.x * scale, BAR_HEIGHT * scale),
-                            )
-                        } else {
-                            let (x, y, w, h) =
-                                window_screen_rect(&session.view_camera(), &cw.canvas, view, scale);
-                            Rectangle::<f64, Physical>::from_loc_and_size((x, y), (w, h))
-                        };
+                        let (x, y, w, h) =
+                            window_screen_rect(&session.view_camera(), &cw.canvas, view, scale);
+                        let dest = Rectangle::<f64, Physical>::from_loc_and_size((x, y), (w, h));
                         let src = Rectangle::<i32, BufferCoord>::from_loc_and_size(
                             (0, 0),
                             tex.size(),
@@ -698,6 +664,76 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+                // Window chrome (Idle only): probe the top hit window; when
+                // the pointer lingers near its top-right corner, two solid
+                // squares draw there — red close, blue fullscreen.
+                let mut chrome_now = None;
+                if session.state == crate::session::SuperState::Idle {
+                    let cworld = session.to_canvas(pointer, view);
+                    if let Some((id, cw)) = server_state
+                        .windows
+                        .iter()
+                        .find(|(_, c)| c.canvas.contains(cworld))
+                        .map(|(id, c)| (*id, c))
+                    {
+                        let origin = session.to_screen(cw.canvas.pos, view);
+                        let zoom = session.view_camera().zoom;
+                        let size = crate::canvas::Vec2::new(
+                            cw.canvas.size.x * zoom,
+                            cw.canvas.size.y * zoom,
+                        );
+                        if let Some(layout) = crate::chrome::layout_for(origin, size, pointer) {
+                            chrome_now = Some((id, layout));
+                        }
+                    }
+                }
+                if let Some((_, layout)) = chrome_now {
+                    if solid_prog.is_none() {
+                        match renderer.with_context(|_, gl| {
+                            crate::render3d::compile_solid(gl)
+                        }) {
+                            Ok(Ok(p)) => {
+                                solid_prog = Some(p);
+                                log::info!("chrome GL program ready");
+                            }
+                            Ok(Err(e)) => log::warn!("chrome GL program: {}", e),
+                            Err(e) => log::warn!("chrome GL context: {:?}", e),
+                        }
+                    }
+                    if let Some(prog) = solid_prog {
+                        let mvp =
+                            crate::render3d::ortho(view.x as f32, view.y as f32);
+                        let sc = scale as f32;
+                        let b = crate::chrome::CHROME_BUTTON as f32 * sc;
+                        let _ = renderer.with_context(|_, gl| unsafe {
+                            crate::render3d::draw_solid(
+                                gl,
+                                prog,
+                                &mvp,
+                                [0.85, 0.2, 0.2, 1.0],
+                                (
+                                    layout.close.x as f32 * sc,
+                                    layout.close.y as f32 * sc,
+                                    b,
+                                    b,
+                                ),
+                            );
+                            crate::render3d::draw_solid(
+                                gl,
+                                prog,
+                                &mvp,
+                                [0.2, 0.45, 0.9, 1.0],
+                                (
+                                    layout.fullscreen.x as f32 * sc,
+                                    layout.fullscreen.y as f32 * sc,
+                                    b,
+                                    b,
+                                ),
+                            );
+                        });
+                    }
+                }
+                last_chrome = chrome_now;
             })?;
             // Frame callbacks: tell clients this frame was presented, so
             // paced clients (Xwayland damage throttling, animations) keep

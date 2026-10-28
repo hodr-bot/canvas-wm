@@ -64,8 +64,6 @@ pub struct ServerState {
 
 /// A client window: canvas placement plus live surface and GPU texture.
 /// The texture is refreshed from newly committed shm buffers each frame.
-/// `overlay` marks non-canvas surfaces (the internal bar): drawn fixed in
-/// screen space, excluded from picking, focus and seat routing.
 /// `x11` marks XWayland-backed windows: the surface is XWayland's own
 /// (resolved from its WL_SURFACE_ID), rendered zero-copy like any window.
 pub struct ClientWindow {
@@ -75,8 +73,9 @@ pub struct ClientWindow {
     /// Last attached buffer, kept so damage-only commits (repaint into
     /// the same shm buffer, no new attach) can re-upload pixels.
     pub last_buffer: Option<WlBuffer>,
-    pub overlay: bool,
     pub x11: Option<u32>,
+    /// Fullscreen state: previous canvas rect, restored on toggle-off.
+    pub fullscreen_prev: Option<CanvasWindow>,
 }
 
 impl ClientWindow {
@@ -86,8 +85,8 @@ impl ClientWindow {
             surface,
             texture: None,
             last_buffer: None,
-            overlay: false,
             x11: None,
+            fullscreen_prev: None,
         }
     }
 }
@@ -99,14 +98,6 @@ impl ServerState {
         let win = ClientWindow::new(id, surface, self.windows.len());
         self.windows.insert(id, win);
         id
-    }
-
-    /// Tag a window as screen-space overlay (the bar). Only the backend
-    /// calls this, right after the internal bar client maps at startup.
-    pub fn set_overlay(&mut self, id: u64) {
-        if let Some(win) = self.windows.get_mut(&id) {
-            win.overlay = true;
-        }
     }
 
     /// Create a canvas window for an XWayland surface (resolved from its
@@ -121,7 +112,7 @@ impl ServerState {
     }
 
     /// Resolve a live surface by its numeric Wayland id (XWayland's
-    /// WL_SURFACE_ID, or any surface the backend knows by id, like the bar).
+    /// WL_SURFACE_ID).
     pub fn surface_by_id(&self, id: u32) -> Option<WlSurface> {
         self.surface_ids.get(&id).cloned()
     }
@@ -132,12 +123,34 @@ impl ServerState {
         self.surface_ids.remove(&id);
     }
 
-    /// Windows on the canvas, sorted by id; overlays excluded.
+    /// Close a window: XWayland-backed windows die through the WM (the
+    /// backend calls back with the xid); native windows drop here.
+    /// Returns the X window id when the backend must kill it.
+    pub fn close_window(&mut self, id: u64) -> Option<u32> {
+        self.windows.remove(&id).and_then(|w| w.x11)
+    }
+
+    /// Toggle fullscreen: fill the current view, restore the previous rect.
+    pub fn toggle_fullscreen(&mut self, id: u64, view: &CanvasWindow) -> bool {
+        if let Some(win) = self.windows.get_mut(&id) {
+            if let Some(prev) = win.fullscreen_prev.take() {
+                win.canvas = prev;
+                false
+            } else {
+                win.fullscreen_prev = Some(win.canvas);
+                win.canvas = *view;
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Windows on the canvas, sorted by id.
     pub fn canvas_ids(&self) -> Vec<u64> {
         let mut ids: Vec<u64> = self
             .windows
             .iter()
-            .filter(|(_, c)| !c.overlay)
             .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();

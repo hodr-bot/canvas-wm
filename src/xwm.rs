@@ -207,6 +207,15 @@ impl Xwm {
         log::info!("X window {} managed ({}x{} at {},{})", xid, w, h, x, y);
     }
 
+    /// Kill an X client (close button). The compositor drops its canvas
+    /// window; XWayland unmaps the surface on DestroyNotify.
+    pub fn kill(&self, xid: u32) {
+        if let Err(e) = self.conn.kill_client(xid) {
+            log::warn!("kill client {} failed: {}", xid, e);
+        }
+        let _ = self.conn.flush();
+    }
+
     /// Drain X11 events. Call every frame.
     pub fn poll(&mut self) {
         loop {
