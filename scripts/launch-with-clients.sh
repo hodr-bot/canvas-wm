@@ -26,6 +26,22 @@ CANVAS_CMD="${CANVAS_CMD:-nix run github:hodr-bot/canvas-wm#compositor -- --wini
 
 export XDG_RUNTIME_DIR="$RT"
 
+# The readiness probe greps the compositor log, so info logs must be on
+# (an unset RUST_LOG silences the ready line and always times out).
+: "${RUST_LOG:=canvas_wm=info}"
+export RUST_LOG
+
+# Print the compositor log tail to help diagnose startup failures.
+dump_log() {
+    echo "--- last 30 lines of $LOG ---" >&2
+    tail -30 "$LOG" >&2 || true
+    if kill -0 "$COMP_PID" 2>/dev/null; then
+        echo "--- compositor (pid $COMP_PID) still running ---" >&2
+    else
+        echo "--- compositor (pid $COMP_PID) already exited ---" >&2
+    fi
+}
+
 # Poll a probe command until it succeeds or the timeout expires.
 wait_for() { # $1 = description, $2 = timeout_s, $3... = probe
     local desc="$1" timeout="$2"
@@ -36,6 +52,7 @@ wait_for() { # $1 = description, $2 = timeout_s, $3... = probe
         i=$((i + 1))
         if [ "$i" -ge "$((timeout * 5))" ]; then
             echo "launch-with-clients: timeout waiting for $desc (log: $LOG)" >&2
+            dump_log
             kill "$COMP_PID" 2>/dev/null
             exit 1
         fi
@@ -75,6 +92,7 @@ while [ -z "$NUM" ]; do
         i=$((i + 1))
         if [ "$i" -ge "$((TIMEOUT * 5))" ]; then
             echo "launch-with-clients: timeout waiting for Xwayland socket (log: $LOG)" >&2
+            dump_log
             kill "$COMP_PID" 2>/dev/null
             exit 1
         fi
