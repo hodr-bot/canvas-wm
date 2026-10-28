@@ -54,3 +54,9 @@ Live canvas (`docs/v1-drag.png`, `docs/v1-zoom.png`, `docs/v1-pan.png`):
 left-drag past 6 world px moves the window (single-jump drags included),
 wheel over empty canvas zooms at the pointer, middle-drag pans the camera;
 wheel over a window still scrolls the client.
+
+Controls v2 (`docs/v2-armed-move.png`, `docs/v2-canvas-pan.png`): plain
+left never moves windows (pixel-identical before/after); Super toggles
+canvas mode with no zoom change; 1s dwell inside a window arms it, then
+drag moves it Hyprland-style; drag on empty space pans the canvas (offset
++ velocity fields, camera fixed); wheel zoom unchanged.

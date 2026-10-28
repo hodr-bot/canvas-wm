@@ -16,6 +16,12 @@ impl Vec2 {
     }
 }
 
+impl Default for Vec2 {
+    fn default() -> Self {
+        Self::new(0.0, 0.0)
+    }
+}
+
 impl std::ops::Sub for Vec2 {
     type Output = Vec2;
 
@@ -52,20 +58,6 @@ impl Camera {
             (screen.x - view.x * 0.5) / self.zoom + self.pos.x,
             (screen.y - view.y * 0.5) / self.zoom + self.pos.y,
         )
-    }
-
-    /// Zoom keeping the world point under `screen` fixed.
-    pub fn zoom_at(&mut self, screen: Vec2, view: Vec2, factor: f64) {
-        let anchor = self.screen_to_world(screen, view);
-        self.zoom = (self.zoom * factor).clamp(0.05, 4.0);
-        self.pos.x = anchor.x - (screen.x - view.x * 0.5) / self.zoom;
-        self.pos.y = anchor.y - (screen.y - view.y * 0.5) / self.zoom;
-    }
-
-    /// Pan by a screen-space delta (drag direction).
-    pub fn pan_by(&mut self, delta_screen: Vec2) {
-        self.pos.x -= delta_screen.x / self.zoom;
-        self.pos.y -= delta_screen.y / self.zoom;
     }
 }
 

@@ -88,10 +88,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Focused canvas window (chip highlight) and last bar state sent.
     let mut focused_id: Option<u64> = None;
     let mut last_bar: (usize, Option<usize>) = (usize::MAX, None);
-    // Live canvas gestures: left-drag moves a window (Idle only), middle-drag
-    // pans the camera. Press world + last world + whether past threshold.
+    // Live canvas gestures: left-drag on empty canvas space pans the canvas
+    // (Canvas mode only); a dwell-armed window drag moves that window.
+    // Press canvas coords + last canvas coords + whether past threshold.
     let mut grab: Option<(u64, crate::canvas::Vec2, crate::canvas::Vec2, bool)> = None;
     let mut panning: Option<crate::canvas::Vec2> = None;
+    // Canvas-mode press point: released without moving = plain canvas click.
+    let mut pan_start: Option<crate::canvas::Vec2> = None;
 
     // The internal bar maps first, before any external client can connect.
     // It is tagged as overlay by matching its surface id (deterministic,
@@ -310,17 +313,17 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     server.input_motion((logical.x, logical.y), None);
                     return;
                 }
-                // Live gestures before picking: middle-drag pans the camera,
-                // left-drag past threshold moves the grabbed window.
+                // Live gestures before picking, in canvas-plane coordinates.
+                // Canvas pan: content follows the cursor, velocity-ready.
                 if let Some(last) = panning {
                     let dx = pointer.x - last.x;
                     let dy = pointer.y - last.y;
-                    session.camera.pan_by(crate::canvas::Vec2::new(dx, dy));
+                    session.pan_canvas(crate::canvas::Vec2::new(dx, dy));
                     panning = Some(pointer);
                     need_render = true;
                 }
                 if let Some((id, press_world, last_world, moved)) = grab {
-                    let world_now = session.camera.screen_to_world(pointer, view);
+                    let world_now = session.to_canvas(pointer, view);
                     // Past the threshold, every motion moves the window by its
                     // delta — including the crossing event itself, so even a
                     // single-jump drag (press, one motion, release) moves.
@@ -340,7 +343,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                let world = session.camera.screen_to_world(logical, view);
+                let world = session.to_world(logical, view);
+                // Hit-test in canvas-plane coordinates (windows live there).
+                let cworld = session.to_canvas(logical, view);
                 log::debug!(
                     "motion physical=({},{}) scale={} logical=({},{}) world=({},{})",
                     event.x(),
@@ -354,19 +359,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let hit = server_state
                     .windows
                     .iter()
-                    .find(|(_, c)| !c.overlay && c.canvas.contains(world));
+                    .find(|(_, c)| !c.overlay && c.canvas.contains(cworld));
                 // Seat offset = surface origin in logical space; Smithay
                 // reports enter/motion coords as pointer minus this origin.
                 // X-backed windows additionally get XTEST motion in local px.
                 let mut x_motion: Option<(u32, i32, i32)> = None;
                 let focus = hit.and_then(|(_, c)| {
                     c.surface.clone().map(|s| {
-                        let local = world - c.canvas.pos;
+                        let local = cworld - c.canvas.pos;
                         if let Some(xid) = c.x11 {
                             x_motion = Some((xid, local.x as i32, local.y as i32));
                         }
                         let (ox, oy, _, _) =
-                            window_screen_rect(&session.camera, &c.canvas, view, scale);
+                            window_screen_rect(&session.view_camera(), &c.canvas, view, scale);
                         (s, ((ox / scale) as i32, (oy / scale) as i32))
                     })
                 });
@@ -377,19 +382,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
             InputEvent::PointerButton { event } => {
                 let pressed = event.state() == ButtonState::Pressed;
-                // Middle button is the canvas pan gesture; clients never see it.
-                if event.button() == MouseButton::Middle {
-                    if pressed {
-                        panning = Some(pointer);
-                    } else {
-                        panning = None;
-                    }
-                    return;
-                }
-                // A released left button ends any window drag.
-                if !pressed && event.button() == MouseButton::Left {
-                    grab = None;
-                }
+                let left = event.button() == MouseButton::Left;
                 // Bar clicks focus a chip's window and never reach clients.
                 if pressed && bar::in_bar(pointer) {
                     let canvas = server_state.canvas_ids();
@@ -409,67 +402,78 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
-                } else if pressed
-                    && event.button() == MouseButton::Left
-                    && session.state == crate::session::SuperState::Overview
-                {
-                    let world = session.camera.screen_to_world(pointer, view);
-                    let hit = server_state
-                        .windows
-                        .iter()
-                        .find(|(_, c)| !c.overlay && c.canvas.contains(world))
-                        .map(|(id, _)| *id);
-                    match hit {
-                        Some(id) => {
-                            let action = session.on_event(
-                                SuperEvent::WindowClick(id),
-                                &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
-                                view,
-                            );
-                            log::info!(
-                                "super {:?} click window {} state={:?} zoom={:.2} selected={}",
-                                action,
-                                id,
-                                session.state,
-                                session.camera.zoom,
-                                session.overview.selected.len()
-                            );
+                } else if session.state == crate::session::SuperState::Canvas {
+                    // Canvas mode: apps are frozen, nothing reaches clients.
+                    // Armed window + press = move it (Hyprland-style, dwell
+                    // replaces the held key); empty press starts a canvas pan.
+                    if pressed && left {
+                        let cw = session.to_canvas(pointer, view);
+                        let hit = server_state
+                            .windows
+                            .iter()
+                            .find(|(_, c)| !c.overlay && c.canvas.contains(cw))
+                            .map(|(id, _)| *id);
+                        match hit {
+                            Some(id) if session.dwell.armed == Some(id) => {
+                                grab = Some((id, cw, cw, true));
+                                log::info!("canvas armed move window {}", id);
+                            }
+                            Some(id) => {
+                                let action = session.on_event(
+                                    SuperEvent::WindowClick(id),
+                                    &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                                    view,
+                                );
+                                log::info!(
+                                    "super {:?} click window {} state={:?} zoom={:.2} selected={}",
+                                    action,
+                                    id,
+                                    session.state,
+                                    session.camera.zoom,
+                                    session.overview.selected.len()
+                                );
+                            }
+                            None => {
+                                pan_start = Some(pointer);
+                                panning = Some(pointer);
+                            }
                         }
-                        None => {
-                            let action = session.on_event(
-                                SuperEvent::CanvasClick,
-                                &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
-                                view,
-                            );
-                            log::info!(
-                                "super {:?} click canvas state={:?} zoom={:.2} selected={}",
-                                action,
-                                session.state,
-                                session.camera.zoom,
-                                session.overview.selected.len()
-                            );
+                    } else if !pressed && left {
+                        grab = None;
+                        panning = None;
+                        // Press + release without moving = plain canvas click.
+                        if let Some(start) = pan_start.take() {
+                            if drag_offset(start, pointer).is_none() {
+                                let action = session.on_event(
+                                    SuperEvent::CanvasClick,
+                                    &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                                    view,
+                                );
+                                log::info!(
+                                    "super {:?} click canvas state={:?} zoom={:.2} selected={}",
+                                    action,
+                                    session.state,
+                                    session.camera.zoom,
+                                    session.overview.selected.len()
+                                );
+                            }
                         }
-                    };
+                    }
                     need_render = true;
                 } else {
-                    // Click focuses the window under the cursor, then the
-                    // client receives the button.
+                    // Idle: click focuses the window, then the client
+                    // receives the button. Plain left NEVER moves windows.
                     if pressed {
-                        let world = session.camera.screen_to_world(pointer, view);
+                        let cworld = session.to_canvas(pointer, view);
                         if let Some((id, c)) = server_state
                             .windows
                             .iter()
-                            .find(|(_, c)| !c.overlay && c.canvas.contains(world))
+                            .find(|(_, c)| !c.overlay && c.canvas.contains(cworld))
                         {
                             let id = *id;
                             server.focus_keyboard(c.surface.as_ref());
                             focused_id = Some(id);
                             known_ids.insert(id);
-                            // Arm a potential drag (Idle only); past the
-                            // threshold, motion moves the window instead.
-                            if session.state == crate::session::SuperState::Idle {
-                                grab = Some((id, world, world, false));
-                            }
                         }
                     }
                     let code = button_code(event.button());
@@ -495,14 +499,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     .or_else(|| event.amount_discrete(Axis::Vertical).map(|s| s as f64))
                     .unwrap_or(0.0);
                 if vertical != 0.0 && !bar::in_bar(pointer) {
-                    let world = session.camera.screen_to_world(pointer, view);
+                    let cworld = session.to_canvas(pointer, view);
                     let over_window = server_state
                         .windows
                         .iter()
-                        .any(|(_, c)| !c.overlay && c.canvas.contains(world));
+                        .any(|(_, c)| !c.overlay && c.canvas.contains(cworld));
                     if !over_window {
                         let factor = if vertical > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                        session.camera.zoom_at(pointer, view, factor);
+                        session.zoom_at(pointer, view, factor);
                         log::info!("wheel zoom={:.2}", session.camera.zoom);
                         need_render = true;
                         return;
@@ -542,6 +546,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             Err(WinitInputError::WindowClosed) => {
                 log::info!("window closed after {} frames", frames);
                 break;
+            }
+        }
+
+        // Dwell-to-arm runs every frame (a still pointer sends no motion
+        // events): 1s inside one window arms it for moving, leaving resets.
+        if session.state == crate::session::SuperState::Canvas {
+            let now_ms = frame_clock.elapsed().as_millis() as u64;
+            let cw = session.to_canvas(pointer, view);
+            let inside = server_state
+                .windows
+                .iter()
+                .find(|(_, c)| !c.overlay && c.canvas.contains(cw))
+                .map(|(id, _)| *id);
+            if session.dwell.update(inside, now_ms).is_some() {
+                log::debug!("dwell armed {:?}", session.dwell.armed);
             }
         }
 
@@ -661,7 +680,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             )
                         } else {
                             let (x, y, w, h) =
-                                window_screen_rect(&session.camera, &cw.canvas, view, scale);
+                                window_screen_rect(&session.view_camera(), &cw.canvas, view, scale);
                             Rectangle::<f64, Physical>::from_loc_and_size((x, y), (w, h))
                         };
                         let src = Rectangle::<i32, BufferCoord>::from_loc_and_size(

@@ -2,7 +2,7 @@
 // Multi-output viewports on one shared canvas, minimal status bar with
 // proximity chrome, Super-tap overview state machine.
 
-use crate::canvas::{fit_view_for_selection, Camera, CanvasWindow, Overview, Vec2};
+use crate::canvas::{Camera, CanvasWindow, Overview, Vec2};
 
 #[derive(Debug, Clone)]
 pub struct Output {
@@ -71,7 +71,9 @@ pub fn drag_offset(press: Vec2, current: Vec2) -> Option<Vec2> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SuperState {
     Idle,
-    Overview,
+    /// Canvas mode: no zoom change, apps frozen. Drag on empty space pans
+    /// the canvas; a 1s dwell inside a window arms it for moving.
+    Canvas,
 }
 
 #[derive(Debug)]
@@ -85,17 +87,61 @@ pub enum SuperEvent {
 #[derive(Debug)]
 pub enum SuperAction {
     None,
-    EnterOverview { prev: Camera },
-    QuitWithFit { fit: Option<Camera> },
-    Restore { prev: Camera },
+    EnterCanvas,
+    QuitCanvas { centred: bool },
+    RestoreCanvas,
 }
 
-/// Drives overview enter/quit + multi-select, shared by all outputs.
+/// Canvas origin on the infinite plane, separate from the camera so future
+/// velocity/physics animate the content, never the viewpoint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CanvasOrigin {
+    pub offset: Vec2,
+    pub vel: Vec2,
+}
+
+/// Dwell-to-arm: staying inside one window for DWELL_ARM_MS (small moves
+/// inside allowed, leaving resets) arms it for moving, Hyprland-style but
+/// without holding a key.
+pub const DWELL_ARM_MS: u64 = 1000;
+
+#[derive(Debug, Default)]
+pub struct DwellTracker {
+    pub inside: Option<u64>,
+    pub since_ms: u64,
+    pub armed: Option<u64>,
+}
+
+impl DwellTracker {
+    pub fn update(&mut self, inside: Option<u64>, now_ms: u64) -> Option<u64> {
+        if inside != self.inside {
+            self.inside = inside;
+            self.since_ms = now_ms;
+            self.armed = None;
+        }
+        if let Some(id) = self.inside {
+            if self.armed.is_none() && now_ms.saturating_sub(self.since_ms) >= DWELL_ARM_MS {
+                self.armed = Some(id);
+            }
+        } else {
+            self.armed = None;
+        }
+        self.armed
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+/// Drives canvas mode enter/quit + multi-select, shared by all outputs.
 pub struct Session {
     pub state: SuperState,
     pub overview: Overview,
     pub camera: Camera,
-    pub prev_camera: Option<Camera>,
+    pub canvas: CanvasOrigin,
+    pub dwell: DwellTracker,
+    pub prev_offset: Option<Vec2>,
 }
 
 impl Session {
@@ -104,8 +150,56 @@ impl Session {
             state: SuperState::Idle,
             overview: Overview::default(),
             camera: Camera::new(),
-            prev_camera: None,
+            canvas: CanvasOrigin::default(),
+            dwell: DwellTracker::default(),
+            prev_offset: None,
         }
+    }
+
+    /// Effective viewpoint: canvas offset shifts content under a fixed camera.
+    pub fn view_camera(&self) -> Camera {
+        Camera {
+            pos: Vec2::new(
+                self.camera.pos.x - self.canvas.offset.x,
+                self.camera.pos.y - self.canvas.offset.y,
+            ),
+            zoom: self.camera.zoom,
+        }
+    }
+
+    pub fn to_world(&self, screen: Vec2, view: Vec2) -> Vec2 {
+        self.view_camera().screen_to_world(screen, view)
+    }
+
+    /// Screen -> canvas plane coordinates (for hit-testing windows).
+    pub fn to_canvas(&self, screen: Vec2, view: Vec2) -> Vec2 {
+        let world = self.to_world(screen, view);
+        Vec2::new(
+            world.x - self.canvas.offset.x,
+            world.y - self.canvas.offset.y,
+        )
+    }
+
+    pub fn to_screen(&self, world: Vec2, view: Vec2) -> Vec2 {
+        self.view_camera().world_to_screen(world, view)
+    }
+
+    /// Pan the canvas by a screen-space drag delta (content follows cursor).
+    pub fn pan_canvas(&mut self, delta_screen: Vec2) {
+        self.canvas.offset.x += delta_screen.x / self.camera.zoom;
+        self.canvas.offset.y += delta_screen.y / self.camera.zoom;
+        self.canvas.vel = Vec2::new(0.0, 0.0);
+    }
+
+    /// Zoom keeping the world point under `screen` fixed.
+    pub fn zoom_at(&mut self, screen: Vec2, view: Vec2, factor: f64) {
+        let anchor = self.to_world(screen, view);
+        self.camera.zoom = (self.camera.zoom * factor).clamp(0.05, 4.0);
+        // screen = (anchor + off - pos) * z' + v/2, solved for off.
+        self.canvas.offset.x = (screen.x - view.x * 0.5) / self.camera.zoom + self.camera.pos.x
+            - anchor.x;
+        self.canvas.offset.y = (screen.y - view.y * 0.5) / self.camera.zoom + self.camera.pos.y
+            - anchor.y;
     }
 
     pub fn on_event(
@@ -115,45 +209,61 @@ impl Session {
         view: Vec2,
     ) -> SuperAction {
         match (&self.state, event) {
+            // Tap Super: enter canvas mode, screen keeps its size, no zoom.
             (SuperState::Idle, SuperEvent::SuperTap) => {
-                self.prev_camera = Some(self.camera);
+                self.prev_offset = Some(self.canvas.offset);
                 self.overview.enter();
-                self.state = SuperState::Overview;
-                // Slight zoom-out overview; full styled animation lands in lot 1.
-                self.camera.zoom = (self.camera.zoom * 0.7).clamp(0.05, 2.0);
-                SuperAction::EnterOverview {
-                    prev: self.prev_camera.unwrap(),
-                }
+                self.state = SuperState::Canvas;
+                self.dwell = DwellTracker::default();
+                SuperAction::EnterCanvas
             }
-            (SuperState::Overview, SuperEvent::WindowClick(id)) => {
+            (SuperState::Canvas, SuperEvent::WindowClick(id)) => {
                 self.overview.toggle_select(id);
                 SuperAction::None
             }
-            (SuperState::Overview, SuperEvent::SuperTap) => {
+            // Re-tap: pan (never zoom) so the selection sits centred, then quit.
+            (SuperState::Canvas, SuperEvent::SuperTap) => {
                 let ids = self.overview.quit();
                 self.state = SuperState::Idle;
+                self.prev_offset = None;
+                self.dwell.disarm();
                 let selected: Vec<CanvasWindow> =
                     ids.iter().filter_map(|id| resolve(*id)).collect();
-                let refs: Vec<&CanvasWindow> = selected.iter().collect();
-                // Empty selection = plain focus-back, no forced fullscreen.
-                let fit = fit_view_for_selection(&self.camera, &refs, view, 80.0);
-                if let Some(fit) = fit {
-                    self.camera = fit;
-                } else if let Some(prev) = self.prev_camera.take() {
-                    self.camera = prev;
-                }
-                SuperAction::QuitWithFit { fit }
+                let centred = if selected.is_empty() {
+                    false
+                } else {
+                    let (mut sx, mut sy) = (0.0, 0.0);
+                    for w in &selected {
+                        sx += w.pos.x + w.size.x * 0.5;
+                        sy += w.pos.y + w.size.y * 0.5;
+                    }
+                    let n = selected.len() as f64;
+                    let target = Vec2::new(sx / n, sy / n);
+                    // Centre the selection with a pan (never a zoom):
+                    // screen-centre shows W iff off = pos - W.
+                    self.canvas.offset.x = self.camera.pos.x - target.x;
+                    self.canvas.offset.y = self.camera.pos.y - target.y;
+                    true
+                };
+                SuperAction::QuitCanvas { centred }
             }
-            (SuperState::Overview, SuperEvent::CanvasClick)
-            | (SuperState::Overview, SuperEvent::Esc) => {
+            // Esc: quit, drop the selection, undo canvas panning.
+            (SuperState::Canvas, SuperEvent::Esc) => {
                 self.overview.quit();
                 self.state = SuperState::Idle;
-                if let Some(prev) = self.prev_camera.take() {
-                    self.camera = prev;
-                    SuperAction::Restore { prev }
-                } else {
-                    SuperAction::None
+                self.dwell.disarm();
+                if let Some(prev) = self.prev_offset.take() {
+                    self.canvas.offset = prev;
                 }
+                SuperAction::RestoreCanvas
+            }
+            // Plain canvas click: quit, drop the selection, keep panning.
+            (SuperState::Canvas, SuperEvent::CanvasClick) => {
+                self.overview.quit();
+                self.state = SuperState::Idle;
+                self.dwell.disarm();
+                self.prev_offset = None;
+                SuperAction::None
             }
             _ => SuperAction::None,
         }
@@ -179,69 +289,95 @@ mod tests {
     }
 
     #[test]
-    fn super_tap_select_retap_keeps_both_in_view() {
+    fn canvas_mode_keeps_screen_size() {
         let mut s = Session::new();
         let wins = two_windows();
         let resolve = |id: u64| wins.get(&id).copied();
         let view = Vec2::new(1920.0, 1080.0);
+        let zoom_before = s.camera.zoom;
         assert!(matches!(
             s.on_event(SuperEvent::SuperTap, &resolve, view),
-            SuperAction::EnterOverview { .. }
+            SuperAction::EnterCanvas
         ));
-        s.on_event(SuperEvent::WindowClick(1), &resolve, view);
-        s.on_event(SuperEvent::WindowClick(2), &resolve, view);
-        let action = s.on_event(SuperEvent::SuperTap, &resolve, view);
-        let fit = match action {
-            SuperAction::QuitWithFit { fit } => fit.expect("both selected => fit"),
-            other => panic!("expected fit, got {:?}", other),
-        };
-        for w in wins.values() {
-            let sc = fit.world_to_screen(w.center(), view);
-            assert!(sc.x >= 0.0 && sc.x <= view.x, "x={} off view", sc.x);
-            assert!(s.state == SuperState::Idle);
-        }
+        assert_eq!(s.state, SuperState::Canvas);
+        assert_eq!(s.camera.zoom, zoom_before);
     }
 
     #[test]
-    fn esc_restores_previous_camera() {
+    fn retap_centres_selection_without_zoom() {
         let mut s = Session::new();
         let wins = two_windows();
         let resolve = |id: u64| wins.get(&id).copied();
         let view = Vec2::new(1920.0, 1080.0);
-        let before = s.camera;
         s.on_event(SuperEvent::SuperTap, &resolve, view);
-        assert_ne!(s.camera.zoom, before.zoom);
-        s.on_event(SuperEvent::Esc, &resolve, view);
-        assert_eq!(s.camera.zoom, before.zoom);
+        s.on_event(SuperEvent::WindowClick(1), &resolve, view);
+        s.on_event(SuperEvent::WindowClick(2), &resolve, view);
+        let zoom_before = s.camera.zoom;
+        let action = s.on_event(SuperEvent::SuperTap, &resolve, view);
+        assert!(matches!(
+            action,
+            SuperAction::QuitCanvas { centred: true }
+        ));
+        assert_eq!(s.camera.zoom, zoom_before);
+        assert_eq!(s.state, SuperState::Idle);
+        // Selection centre ((400+2400)/2, (300+1800)/2) sits screen-centred.
+        let centre = s.to_world(Vec2::new(960.0, 540.0), view);
+        assert!((centre.x - 1400.0).abs() < 1e-9);
+        assert!((centre.y - 1050.0).abs() < 1e-9);
     }
 
     #[test]
-    fn drag_offset_threshold() {
-        let press = Vec2::new(100.0, 100.0);
-        assert!(drag_offset(press, Vec2::new(103.0, 102.0)).is_none());
-        let moved = drag_offset(press, Vec2::new(120.0, 90.0)).expect("past threshold");
-        assert_eq!(moved, Vec2::new(20.0, -10.0));
+    fn esc_restores_canvas_offset() {
+        let mut s = Session::new();
+        let wins = two_windows();
+        let resolve = |id: u64| wins.get(&id).copied();
+        let view = Vec2::new(1920.0, 1080.0);
+        s.on_event(SuperEvent::SuperTap, &resolve, view);
+        s.pan_canvas(Vec2::new(100.0, 50.0));
+        assert_ne!(s.canvas.offset.x, 0.0);
+        assert!(matches!(
+            s.on_event(SuperEvent::Esc, &resolve, view),
+            SuperAction::RestoreCanvas
+        ));
+        assert_eq!(s.canvas.offset, Vec2::new(0.0, 0.0));
+        assert_eq!(s.state, SuperState::Idle);
     }
 
     #[test]
-    fn zoom_at_keeps_anchor_fixed() {
-        let mut cam = Camera::new();
+    fn dwell_arms_after_one_second_inside() {
+        let mut d = DwellTracker::default();
+        assert_eq!(d.update(None, 0), None);
+        assert_eq!(d.update(Some(1), 0), None);
+        // Small moves inside the same window do not reset the timer.
+        assert_eq!(d.update(Some(1), 500), None);
+        assert_eq!(d.update(Some(1), 999), None);
+        assert_eq!(d.update(Some(1), 1000), Some(1));
+        assert_eq!(d.update(Some(1), 5000), Some(1));
+        // Switching window resets; leaving disarms.
+        assert_eq!(d.update(Some(2), 5001), None);
+        assert_eq!(d.update(Some(2), 6001), Some(2));
+        assert_eq!(d.update(None, 6002), None);
+    }
+
+    #[test]
+    fn pan_canvas_follows_cursor() {
+        let mut s = Session::new();
+        s.camera.zoom = 2.0;
+        s.pan_canvas(Vec2::new(40.0, -20.0));
+        assert_eq!(s.canvas.offset, Vec2::new(20.0, -10.0));
+    }
+
+    #[test]
+    fn session_zoom_at_keeps_anchor_fixed() {
+        let mut s = Session::new();
         let view = Vec2::new(1280.0, 800.0);
         let screen = Vec2::new(900.0, 500.0);
-        let before = cam.screen_to_world(screen, view);
-        cam.zoom_at(screen, view, 2.0);
-        assert!((cam.zoom - 2.0).abs() < 1e-9);
-        let after = cam.screen_to_world(screen, view);
+        let before = s.to_world(screen, view);
+        s.zoom_at(screen, view, 2.0);
+        assert!((s.camera.zoom - 2.0).abs() < 1e-9);
+        let after = s.to_world(screen, view);
         assert!((after.x - before.x).abs() < 1e-9);
         assert!((after.y - before.y).abs() < 1e-9);
-    }
-
-    #[test]
-    fn pan_by_moves_camera_against_drag() {
-        let mut cam = Camera::new();
-        cam.zoom = 2.0;
-        cam.pan_by(Vec2::new(40.0, -20.0));
-        assert_eq!(cam.pos, Vec2::new(-20.0, 10.0));
     }
 
     #[test]
