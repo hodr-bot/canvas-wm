@@ -17,7 +17,7 @@ use smithay::backend::{
         KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
         PointerMotionAbsoluteEvent,
     },
-    renderer::{Frame, ImportShm, Texture, Transform},
+    renderer::{buffer_type, BufferType, Frame, ImportShm, Texture, Transform},
     winit::{self, WinitEvent, WinitInputError},
 };
 use smithay::reexports::calloop::EventLoop;
@@ -94,6 +94,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut last_chrome: Option<(u64, crate::chrome::ChromeLayout)> = None;
     // Solid-colour GL program for window chrome (seed of the 3D engine).
     let mut solid_prog: Option<(u32, i32, i32, u32)> = None;
+    // Textured GL program: windows as perspective planes in 3D.
+    let mut tex_prog: Option<(u32, i32, i32, u32, u32)> = None;
     // Canvas-mode press point: released without moving = plain canvas click.
     let mut pan_start: Option<crate::canvas::Vec2> = None;
 
@@ -619,8 +621,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         // import (or when the client resizes):
                                         // floating windows are buffer-sized,
                                         // positioned by cascade, never stretched.
-                                        if (cw.canvas.size.x - w as f64).abs() > 0.5
-                                            || (cw.canvas.size.y - h as f64).abs() > 0.5
+                                        // Fullscreen windows keep their fitted
+                                        // rect (aspect-preserved, centred).
+                                        if cw.fullscreen_prev.is_none()
+                                            && ((cw.canvas.size.x - w as f64).abs() > 0.5
+                                                || (cw.canvas.size.y - h as f64).abs() > 0.5)
                                         {
                                             cw.canvas.size.x = w as f64;
                                             cw.canvas.size.y = h as f64;
@@ -644,8 +649,70 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
-                    // Draw through the canvas camera.
+                    // Windows render as textured perspective planes (3D).
+                    // shm buffers go through our own program (tilt in Canvas
+                    // mode, flat 1:1 in Idle); anything else keeps Smithay's
+                    // flat path so exotic buffers never break the frame.
                     if let Some(tex) = cw.texture.as_ref() {
+                        let is_shm = matches!(
+                            cw.last_buffer.as_ref().and_then(buffer_type),
+                            Some(BufferType::Shm)
+                        );
+                        if tex_prog.is_none() {
+                            match renderer.with_context(|_, gl| {
+                                crate::render3d::compile_textured(gl)
+                            }) {
+                                Ok(Ok(p)) => {
+                                    tex_prog = Some(p);
+                                    log::info!("textured GL program ready");
+                                }
+                                Ok(Err(e)) => log::warn!("textured GL program: {}", e),
+                                Err(e) => log::warn!("textured GL context: {:?}", e),
+                            }
+                        }
+                        if is_shm {
+                            if let Some(prog) = tex_prog {
+                                let canvas_mode = session.state
+                                    == crate::session::SuperState::Canvas;
+                                let tilt = if canvas_mode { (0.14, 0.07) } else { (0.0, 0.0) };
+                                // Canvas-plane quad, y negated for clip space, with
+                                // upright UVs (buffer row 0 = top). The MVP
+                                // maps canvas -> screen; physical px = logical
+                                // times the output scale.
+                                let sc = scale as f32;
+                                let (qx, qy) = (
+                                    cw.canvas.pos.x as f32 * sc,
+                                    -(cw.canvas.pos.y as f32) * sc,
+                                );
+                                let (qw, qh) = (
+                                    cw.canvas.size.x as f32 * sc,
+                                    -(cw.canvas.size.y as f32) * sc,
+                                );
+                                let vw = view.x as f32 * sc;
+                                let vh = view.y as f32 * sc;
+                                let mid = session.to_canvas(
+                                    crate::canvas::Vec2::new(view.x / 2.0, view.y / 2.0),
+                                    view,
+                                );
+                                let mvp = crate::render3d::canvas_mvp(
+                                    (vw, vh),
+                                    (mid.x as f32 * sc, mid.y as f32 * sc),
+                                    session.view_camera().zoom as f32,
+                                    tilt,
+                                );
+                                let verts: [f32; 16] = [
+                                    qx, qy, 0.0, 0.0, //
+                                    qx + qw, qy, 1.0, 0.0, //
+                                    qx, qy + qh, 0.0, 1.0, //
+                                    qx + qw, qy + qh, 1.0, 1.0,
+                                ];
+                                let tid = tex.tex_id();
+                                let _ = renderer.with_context(|_, gl| unsafe {
+                                    crate::render3d::draw_textured(gl, prog, &mvp, tid, &verts);
+                                });
+                                continue;
+                            }
+                        }
                         let (x, y, w, h) =
                             window_screen_rect(&session.view_camera(), &cw.canvas, view, scale);
                         let dest = Rectangle::<f64, Physical>::from_loc_and_size((x, y), (w, h));

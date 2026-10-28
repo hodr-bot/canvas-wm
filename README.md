@@ -65,4 +65,13 @@ a minimal solid-colour GL program that seeds the 3D engine). Blue toggles
 fullscreen (edge-to-edge, second click restores pixel-identical); red kills
 the X client and its canvas window vanishes. Glyphs (X / ⛶) land later;
 colour + position carry the meaning for now. No move button: the 1s dwell
-already arms moves, a third button would duplicate it.
+already arms moves, a third button would duplicate it. Fullscreen fills
+without stretching: the buffer aspect is kept, centred in the view.
+
+3D planes (`docs/planes-flat.png`, `docs/planes-tilt.png`): windows render
+as textured perspective planes through our own GL program (Smithay only
+imports the shm buffers). Idle = flat 1:1, text readable, typing reaches
+X clients. Super canvas mode = light tilt (8°/4° about the view centre,
+centre pixel fixed); the logic plane stays 2D, presentation is 3D. Cost is
+~zero: same textures, same fill rate, one matrix per window. Non-shm
+buffers keep Smithay's flat path as fallback.

@@ -206,7 +206,7 @@ impl Session {
         &mut self,
         event: SuperEvent,
         resolve: &dyn Fn(u64) -> Option<CanvasWindow>,
-        view: Vec2,
+        _view: Vec2,
     ) -> SuperAction {
         match (&self.state, event) {
             // Tap Super: enter canvas mode, screen keeps its size, no zoom.
