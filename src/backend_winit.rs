@@ -5,7 +5,10 @@
 //! (Super-tap) and session wiring land next; this proves the window,
 //! renderer, and event-pump path end to end.
 
+use std::cell::RefCell;
 use std::error::Error;
+use std::os::unix::net::UnixStream;
+use std::rc::Rc;
 use std::time::Duration;
 
 use smithay::backend::{
@@ -17,18 +20,32 @@ use smithay::backend::{
     renderer::{Frame, ImportShm, Texture, Transform},
     winit::{self, WinitEvent, WinitInputError},
 };
+use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis as WlAxis, AxisSource};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle};
 use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
 use smithay::wayland::seat::AxisFrame;
 use smithay::wayland::shm::with_buffer_contents;
+use smithay::xwayland::{XWayland, XWaylandEvent};
 
 use crate::canvas::{window_screen_rect, Camera};
 use crate::keys::{is_super, KeyMapper, TapTracker, KEY_Escape};
 use crate::server::{Server, ServerState};
 use crate::session::{Session, SuperEvent};
+use crate::xwm::Xwm;
 use crate::{bar, bar_client::BarClient};
 use crate::bar::BAR_HEIGHT;
+
+/// X display sockets before XWayland starts, to spot its display number.
+fn x11_sockets() -> Vec<String> {
+    std::fs::read_dir("/tmp/.X11-unix")
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// winit mouse buttons to evdev codes clients expect.
 fn button_code(button: MouseButton) -> u32 {
@@ -73,29 +90,129 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut last_bar: (usize, Option<usize>) = (usize::MAX, None);
 
     // The internal bar maps first, before any external client can connect.
-    // Tag window 0 as the screen-space overlay once the server sees it.
+    // It is tagged as overlay by matching its surface id (deterministic,
+    // no dependence on map order).
     let mut bar = BarClient::connect(&socket, view.x as i32)
         .map_err(|e| format!("bar client: {}", e))?;
     for _ in 0..500 {
         bar.progress();
         server.pump(&mut server_state);
         bar.pump();
-        if server_state.windows.contains_key(&0) {
-            server_state.set_overlay(0);
-            break;
+        if let Some(bar_sid) = bar.surface_id() {
+            if let Some(id) = server_state
+                .windows
+                .iter()
+                .find(|(_, c)| {
+                    c.surface
+                        .as_ref()
+                        .map(|s| s.as_ref().id() == bar_sid)
+                        .unwrap_or(false)
+                })
+                .map(|(id, _)| *id)
+            {
+                server_state.set_overlay(id);
+                break;
+            }
         }
     }
-    if !server_state
-        .windows
-        .get(&0)
-        .map(|c| c.overlay)
-        .unwrap_or(false)
+
+    // calloop loop just for the XWayland source; polled every frame.
+    let mut event_loop: EventLoop<()> =
+        EventLoop::try_new().map_err(|e| format!("calloop: {}", e))?;
+    let x11_ready: Rc<RefCell<Option<UnixStream>>> = Rc::new(RefCell::new(None));
+    let (xwayland, xwayland_source) = XWayland::new(event_loop.handle(), server.display(), None);
     {
+        let x11_ready = Rc::clone(&x11_ready);
+        event_loop
+            .handle()
+            .insert_source(xwayland_source, move |event, &mut (), _| {
+                if let XWaylandEvent::Ready { connection, .. } = event {
+                    *x11_ready.borrow_mut() = Some(connection);
+                }
+            })
+            .map_err(|e| format!("xwayland source: {}", e))?;
+    }
+    let x11_before = x11_sockets();
+    xwayland
+        .start()
+        .map_err(|e| format!("Xwayland spawn: {}", e))?;
+    let mut xwm: Option<Xwm> = None;
+
+    if !server_state.windows.values().any(|c| c.overlay) {
         log::warn!("bar did not map; continuing without overlay");
     }
 
+    // Unmatched X surface links wait here; the surface may be created
+    // server-side after the client message arrives.
+    let mut pending_x: Vec<(u32, u32)> = Vec::new();
+
     loop {
+        if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(0)), &mut ()) {
+            log::warn!("calloop dispatch: {}", e);
+        }
+        // XWayland ready => become its window manager (once).
+        if xwm.is_none() {
+            if let Some(stream) = x11_ready.borrow_mut().take() {
+                match Xwm::new(stream) {
+                    Ok(wm) => {
+                        for sock in x11_sockets() {
+                            if !x11_before.contains(&sock) {
+                                if let Some(num) = sock.strip_prefix('X') {
+                                    let display = format!(":{}", num);
+                                    std::env::set_var("DISPLAY", &display);
+                                    log::info!("XWayland ready on DISPLAY={}", display);
+                                }
+                            }
+                        }
+                        xwm = Some(wm);
+                    }
+                    Err(e) => log::warn!("Xwm failed: {}", e),
+                }
+            }
+        }
+        if let Some(wm) = xwm.as_mut() {
+            wm.poll();
+        }
         server.pump(&mut server_state);
+        // Link X windows to their Wayland surfaces (zero-copy). Fresh links
+        // from the WM plus retries; surfaces may lag the client message.
+        if let Some(wm) = xwm.as_mut() {
+            pending_x.extend(wm.surface_links.drain(..));
+            let mut still_pending = Vec::new();
+            for (xid, sid) in pending_x.drain(..) {
+                match server_state.surface_by_id(sid) {
+                    Some(surface) => {
+                        if let Some(id) = server_state
+                            .windows
+                            .iter()
+                            .find(|(_, c)| c.x11 == Some(xid))
+                            .map(|(id, _)| *id)
+                        {
+                            server_state.windows.get_mut(&id).unwrap().surface = Some(surface);
+                        } else {
+                            let id = server_state.add_x11_window(surface, xid);
+                            log::info!("linked X window {} -> canvas {}", xid, id);
+                        }
+                    }
+                    None => still_pending.push((xid, sid)),
+                }
+            }
+            pending_x = still_pending;
+            // Drop canvas windows whose X window died.
+            for (xid, sid) in wm.dead.drain(..) {
+                if let Some(id) = server_state
+                    .windows
+                    .iter()
+                    .find(|(_, c)| c.x11 == Some(xid))
+                    .map(|(id, _)| *id)
+                {
+                    server_state.windows.remove(&id);
+                }
+                if let Some(sid) = sid {
+                    server_state.forget_surface(sid);
+                }
+            }
+        }
         // Newest canvas window steals keyboard focus, like any floating WM.
         let ids: std::collections::HashSet<u64> = server_state.windows.keys().copied().collect();
         if ids != known_ids {
@@ -109,6 +226,17 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             server.focus_keyboard(None);
             server.focus_keyboard(surface.as_ref());
             focused_id = newest;
+            // X-backed focus also moves the X input focus.
+            if let Some(id) = newest {
+                let xid = server_state
+                    .windows
+                    .get(&id)
+                    .and_then(|c| c.x11);
+                if let (Some(wm), Some(xid)) = (xwm.as_ref(), xid) {
+                    wm.focus(xid);
+                    server.focus_keyboard(None);
+                }
+            }
         }
         let mut need_render = false;
         match input.dispatch_new_events(|event| match event {
@@ -144,7 +272,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     if pressed {
                         tap.note_other_press();
                     }
-                    server.input_key(evdev, pressed);
+                    // X-backed focus eats keys via XTEST, not the wl seat.
+                    let xid = focused_id
+                        .and_then(|id| server_state.windows.get(&id))
+                        .and_then(|c| c.x11);
+                    match (xwm.as_ref(), xid) {
+                        (Some(wm), Some(xid)) => wm.xtest_key(xid, evdev, pressed),
+                        _ => server.input_key(evdev, pressed),
+                    }
                 }
             }
             InputEvent::PointerMotionAbsolute { event } => {
@@ -173,14 +308,23 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     .find(|(_, c)| !c.overlay && c.canvas.contains(world));
                 // Seat offset = surface origin in logical space; Smithay
                 // reports enter/motion coords as pointer minus this origin.
+                // X-backed windows additionally get XTEST motion in local px.
+                let mut x_motion: Option<(u32, i32, i32)> = None;
                 let focus = hit.and_then(|(_, c)| {
                     c.surface.clone().map(|s| {
+                        let local = world - c.canvas.pos;
+                        if let Some(xid) = c.x11 {
+                            x_motion = Some((xid, local.x as i32, local.y as i32));
+                        }
                         let (ox, oy, _, _) =
                             window_screen_rect(&session.camera, &c.canvas, view, scale);
                         (s, ((ox / scale) as i32, (oy / scale) as i32))
                     })
                 });
                 server.input_motion((logical.x, logical.y), focus);
+                if let (Some(wm), Some((xid, lx, ly))) = (xwm.as_ref(), x_motion) {
+                    wm.xtest_motion(xid, lx, ly);
+                }
             }
             InputEvent::PointerButton { event } => {
                 let pressed = event.state() == ButtonState::Pressed;
@@ -194,6 +338,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                             focused_id = Some(id);
                             need_render = true;
+                            if let (Some(wm), Some(xid)) = (
+                                xwm.as_ref(),
+                                server_state.windows.get(&id).and_then(|c| c.x11),
+                            ) {
+                                wm.focus(xid);
+                                server.focus_keyboard(None);
+                            }
                         }
                     }
                 } else if pressed
@@ -235,7 +386,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             known_ids.insert(id);
                         }
                     }
-                    server.input_button(button_code(event.button()), pressed);
+                    let code = button_code(event.button());
+                    server.input_button(code, pressed);
+                    // X-backed focus: mirror press/release via XTEST.
+                    let xid = focused_id
+                        .and_then(|id| server_state.windows.get(&id))
+                        .and_then(|c| c.x11);
+                    if let (Some(wm), Some(xid)) = (xwm.as_ref(), xid) {
+                        if pressed {
+                            wm.focus(xid);
+                            server.focus_keyboard(None);
+                        }
+                        wm.xtest_button(xid, code, pressed);
+                    }
                 }
             }
             InputEvent::PointerAxis { event } => {
@@ -319,6 +482,22 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 );
                                 match renderer.import_shm_buffer(&buffer, None, &[damage]) {
                                     Ok(tex) => {
+                                        // Fit the canvas rect to the buffer on first
+                                        // import (or when the client resizes):
+                                        // floating windows are buffer-sized,
+                                        // positioned by cascade, never stretched.
+                                        if (cw.canvas.size.x - w as f64).abs() > 0.5
+                                            || (cw.canvas.size.y - h as f64).abs() > 0.5
+                                        {
+                                            cw.canvas.size.x = w as f64;
+                                            cw.canvas.size.y = h as f64;
+                                            log::info!(
+                                                "window {} sized to {}x{}",
+                                                id,
+                                                w,
+                                                h
+                                            );
+                                        }
                                         log::info!(
                                             "imported {}x{} shm buffer for window {}",
                                             w,

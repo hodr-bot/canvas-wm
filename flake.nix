@@ -34,6 +34,7 @@
           libdrm
           dbus
           libxkbcommon
+          xwayland
           xorg.libX11
           xorg.libXcursor
           xorg.libXrandr
@@ -72,7 +73,8 @@
               xorg.libXext
               xorg.libXfixes
               xorg.libXrender
-            ]}"
+            ]}" \
+            --prefix PATH : "${lib.makeBinPath [ xwayland ]}"
         '';
       };
     };

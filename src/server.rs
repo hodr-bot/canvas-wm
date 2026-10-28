@@ -4,9 +4,11 @@
 //! xdg-toplevel becomes a CanvasWindow with cascade placement on the shared
 //! canvas. Client buffer rendering and seat input land next.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,9 +19,11 @@ use smithay::reexports::wayland_protocols::xdg_shell::server::xdg_wm_base::XdgWm
 use smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor;
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_pointer::ButtonState as WlButtonState;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, Global};
+use smithay::wayland::output::{Mode, Output, PhysicalProperties};
 use slog::Drain as _;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::compositor_init;
@@ -50,17 +54,25 @@ pub fn place_window(id: u64, n: usize) -> CanvasWindow {
 pub struct ServerState {
     pub windows: HashMap<u64, ClientWindow>,
     next_id: u64,
+    /// Every live wl_surface by its numeric id, XWayland's included.
+    /// XWayland publishes each X window's surface id through the
+    /// WL_SURFACE_ID client message; the backend resolves it here and
+    /// renders the real surface zero-copy (no GetImage bridge).
+    surface_ids: HashMap<u32, WlSurface>,
 }
 
 /// A client window: canvas placement plus live surface and GPU texture.
 /// The texture is refreshed from newly committed shm buffers each frame.
 /// `overlay` marks non-canvas surfaces (the internal bar): drawn fixed in
 /// screen space, excluded from picking, focus and seat routing.
+/// `x11` marks XWayland-backed windows: the surface is XWayland's own
+/// (resolved from its WL_SURFACE_ID), rendered zero-copy like any window.
 pub struct ClientWindow {
     pub canvas: CanvasWindow,
     pub surface: Option<WlSurface>,
     pub texture: Option<Gles2Texture>,
     pub overlay: bool,
+    pub x11: Option<u32>,
 }
 
 impl ClientWindow {
@@ -70,6 +82,7 @@ impl ClientWindow {
             surface,
             texture: None,
             overlay: false,
+            x11: None,
         }
     }
 }
@@ -89,6 +102,29 @@ impl ServerState {
         if let Some(win) = self.windows.get_mut(&id) {
             win.overlay = true;
         }
+    }
+
+    /// Create a canvas window for an XWayland surface (resolved from its
+    /// WL_SURFACE_ID) and tag it with its X window id for XTEST routing.
+    pub fn add_x11_window(&mut self, surface: WlSurface, xid: u32) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut win = ClientWindow::new(id, Some(surface), self.windows.len());
+        win.x11 = Some(xid);
+        self.windows.insert(id, win);
+        id
+    }
+
+    /// Resolve a live surface by its numeric Wayland id (XWayland's
+    /// WL_SURFACE_ID, or any surface the backend knows by id, like the bar).
+    pub fn surface_by_id(&self, id: u32) -> Option<WlSurface> {
+        self.surface_ids.get(&id).cloned()
+    }
+
+    /// Drop a surface id when its window dies (called with the sid the Xwm
+    /// reported for the destroyed X window).
+    pub fn forget_surface(&mut self, id: u32) {
+        self.surface_ids.remove(&id);
     }
 
     /// Windows on the canvas, sorted by id; overlays excluded.
@@ -138,7 +174,7 @@ fn seat_logger() -> slog::Logger {
 /// Also owns the seat: one keyboard + one pointer. The backend feeds raw
 /// input here; the seat routes it to the focused surfaces.
 pub struct Server {
-    display: Display,
+    display: Rc<RefCell<Display>>,
     _compositor: Global<WlCompositor>,
     _subcompositor: Global<WlSubcompositor>,
     _shm: Global<wl_shm::WlShm>,
@@ -147,6 +183,8 @@ pub struct Server {
     _zxdg: Global<ZxdgShellV6>,
     _seat: Seat,
     _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
+    _output: Output,
+    _output_global: Global<WlOutput>,
     keyboard: KeyboardHandle,
     pointer: PointerHandle,
     serial: u32,
@@ -155,16 +193,25 @@ pub struct Server {
 
 impl Server {
     pub fn new() -> io::Result<(Self, OsString)> {
-        let mut display = Display::new();
-        let (compositor, subcompositor) =
-            compositor_init(&mut display, |_surface, _dispatch| {}, None);
+        let display = Rc::new(RefCell::new(Display::new()));
+        let (compositor, subcompositor) = compositor_init(
+            &mut display.borrow_mut(),
+            |surface, mut dispatch| {
+                if let Some(state) = dispatch.get::<ServerState>() {
+                    let sid = surface.as_ref().id();
+                    log::info!("surface created id={}", sid);
+                    state.surface_ids.insert(sid, surface.clone());
+                }
+            },
+            None,
+        );
         let shm = init_shm_global(
-            &mut display,
+            &mut display.borrow_mut(),
             vec![wl_shm::Format::Argb8888, wl_shm::Format::Xrgb8888],
             None,
         );
         let (shell_state, xdg, zxdg) = xdg_shell_init(
-            &mut display,
+            &mut display.borrow_mut(),
             |request, mut dispatch| match request {
                 XdgRequest::NewToplevel { surface } => {
                     if let Some(state) = dispatch.get::<ServerState>() {
@@ -178,13 +225,41 @@ impl Server {
             },
             None,
         );
-        let socket = display.add_socket_auto()?;
+        let socket = display.borrow_mut().add_socket_auto()?;
         let (mut seat, seat_global) =
-            Seat::new(&mut display, "seat-0".into(), Some(seat_logger()));
+            Seat::new(&mut display.borrow_mut(), "seat-0".into(), Some(seat_logger()));
         let keyboard = seat
             .add_keyboard(XkbConfig::default(), 200, 25, |_, _| {})
             .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("seat keyboard: {:?}", err)))?;
         let pointer = seat.add_pointer(|_| {});
+        // One output viewport on the shared canvas. XWayland sizes its
+        // screen from wl_output and stalls without one; real clients use
+        // it for DPI/positioning. Extra viewports later reuse this.
+        let (output, output_global) = Output::new(
+            &mut display.borrow_mut(),
+            "WL-1".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::reexports::wayland_server::protocol::wl_output::Subpixel::Unknown,
+                make: "canvas-wm".into(),
+                model: "canvas".into(),
+            },
+            None,
+        );
+        let mode = Mode {
+            size: (1280, 800).into(),
+            refresh: 60000,
+        };
+        output.add_mode(mode);
+        output.set_preferred(mode);
+        output.change_current_state(
+            Some(mode),
+            Some(
+                smithay::reexports::wayland_server::protocol::wl_output::Transform::Normal,
+            ),
+            Some(1),
+            Some((0, 0).into()),
+        );
         Ok((
             Self {
                 display,
@@ -196,6 +271,8 @@ impl Server {
                 _zxdg: zxdg,
                 _seat: seat,
                 _seat_global: seat_global,
+                _output: output,
+                _output_global: output_global,
                 keyboard,
                 pointer,
                 serial: 0,
@@ -209,8 +286,14 @@ impl Server {
     pub fn pump(&mut self, state: &mut ServerState) {
         let _ = self
             .display
+            .borrow_mut()
             .dispatch(Duration::from_millis(0), state);
-        self.display.flush_clients(state);
+        self.display.borrow_mut().flush_clients(state);
+    }
+
+    /// Shared display handle, for XWayland startup (same-thread use).
+    pub fn display(&self) -> Rc<RefCell<Display>> {
+        Rc::clone(&self.display)
     }
 
     fn next_serial(&mut self) -> Serial {

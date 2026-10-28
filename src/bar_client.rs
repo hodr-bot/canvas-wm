@@ -39,6 +39,8 @@ pub struct BarClient {
     bound: Option<Bound>,
     last_drawn: Option<(usize, Option<usize>)>,
     width: i32,
+    /// Wayland numeric id of the bar surface, for overlay tagging.
+    surface_id: Option<u32>,
 }
 
 impl BarClient {
@@ -57,7 +59,13 @@ impl BarClient {
             bound: None,
             last_drawn: None,
             width,
+            surface_id: None,
         })
+    }
+
+    /// Numeric Wayland id of the bar surface (None until mapped).
+    pub fn surface_id(&self) -> Option<u32> {
+        self.surface_id
     }
 
     /// Non-blocking pump: flush requests, read what is available, dispatch.
@@ -136,6 +144,7 @@ impl BarClient {
         );
         surface.attach(Some(&buffer), 0, 0);
         surface.commit();
+        self.surface_id = Some(surface.as_ref().id());
         self.bound = Some(Bound {
             surface,
             pool,

@@ -29,3 +29,6 @@ Bar proof (`docs/e2e-bar.png`): internal bar client maps first as overlay
 window 0, full-width strip with one green chip per canvas window.
 Verified live: chip click focuses without leaking the button to clients,
 canvas click delivers enter at exact local coords + button 272.
+XWayland proof (`docs/e2e-xwayland.png`): real xeyes under rootless Xwayland,
+linked zero-copy via WL_SURFACE_ID to canvas 1, buffer-sized 152x102
+(no stretch), pupils track the pointer.
