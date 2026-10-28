@@ -216,6 +216,17 @@ impl Xwm {
         let _ = self.conn.flush();
     }
 
+    /// Resize an X window (fullscreen on/off): the client gets a real
+    /// ConfigureNotify and recommits at the new size, so the buffer
+    /// follows instead of stretching.
+    pub fn configure(&self, xid: u32, w: u32, h: u32) {
+        let aux = ConfigureWindowAux::new().width(w).height(h);
+        if let Err(e) = self.conn.configure_window(xid, &aux) {
+            log::warn!("configure {} to {}x{} failed: {}", xid, w, h, e);
+        }
+        let _ = self.conn.flush();
+    }
+
     /// Drain X11 events. Call every frame.
     pub fn poll(&mut self) {
         loop {

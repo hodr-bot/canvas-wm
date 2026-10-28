@@ -62,11 +62,11 @@ Window chrome (`docs/chrome-hover.png`, `docs/chrome-full.png`,
 `docs/chrome-closed.png`): no bar anywhere — hovering near a window's
 top-right corner reveals two squares (red close, blue fullscreen, drawn by
 a minimal solid-colour GL program that seeds the 3D engine). Blue toggles
-fullscreen (edge-to-edge, second click restores pixel-identical); red kills
+fullscreen (true fullscreen: the client is resized to the view, second
+click restores pixel-identical); red kills
 the X client and its canvas window vanishes. Glyphs (X / ⛶) land later;
 colour + position carry the meaning for now. No move button: the 1s dwell
-already arms moves, a third button would duplicate it. Fullscreen fills
-without stretching: the buffer aspect is kept, centred in the view.
+already arms moves, a third button would duplicate it.
 
 3D planes (`docs/planes-flat.png`, `docs/planes-tilt.png`): windows render
 as textured perspective planes through our own GL program (Smithay only
@@ -77,7 +77,8 @@ centre pixel fixed); the logic plane stays 2D, presentation is 3D. Cost is
 buffers keep Smithay's flat path as fallback.
 
 Hover keys, no modifiers (`docs/keys-close/fullscreen/move/resize.png`):
-`F` fullscreen without moving, `Q` close, `E` grab-move (window follows
+`F` fullscreen without moving (the client is resized to the view),
+`Q` close, `E` grab-move (window follows
 the pointer while held, no button needed), `R` resize mode while held
 (left/right drag on edges and corners grows the rect, min 60px, never
 snaps back on repaint). Tradeoff: typing q/e/r/f with the pointer over a

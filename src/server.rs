@@ -134,26 +134,18 @@ impl ServerState {
         self.windows.remove(&id).and_then(|w| w.x11)
     }
 
-    /// Toggle fullscreen: fill the current view, restore the previous rect.
-    /// Fills without stretching: the buffer aspect is kept, the window is
-    /// centred in the view with canvas background around it.
+    /// Toggle fullscreen: the window takes the whole view, restored on
+    /// toggle-off. The rect fills the view exactly (true fullscreen);
+    /// the backend also configures X clients to the new size so their
+    /// buffer follows instead of stretching.
     pub fn toggle_fullscreen(&mut self, id: u64, view: &CanvasWindow) -> bool {
         if let Some(win) = self.windows.get_mut(&id) {
             if let Some(prev) = win.fullscreen_prev.take() {
                 win.canvas = prev;
                 false
             } else {
-                let (bw, bh) = (win.canvas.size.x, win.canvas.size.y);
-                let s = (view.size.x / bw).min(view.size.y / bh);
-                let (w, h) = (bw * s, bh * s);
                 win.fullscreen_prev = Some(win.canvas);
-                win.canvas = CanvasWindow::new(
-                    win.canvas.id,
-                    view.pos.x + (view.size.x - w) / 2.0,
-                    view.pos.y + (view.size.y - h) / 2.0,
-                    w,
-                    h,
-                );
+                win.canvas = CanvasWindow::new(win.canvas.id, view.pos.x, view.pos.y, view.size.x, view.size.y);
                 true
             }
         } else {
@@ -432,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_keeps_aspect_and_restores() {
+    fn fullscreen_fills_view_and_restores() {
         let mut s = ServerState::default();
         let id = s.add_toplevel(None);
         // Pretend the client buffer is 486x318 at cascade position.
@@ -443,11 +435,9 @@ mod tests {
         let view = CanvasWindow::new(u64::MAX, 0.0, 0.0, 1280.0, 800.0);
         assert!(s.toggle_fullscreen(id, &view));
         let full = s.windows[&id].canvas;
-        // Height fills the view, width follows the buffer aspect, centred.
-        assert!((full.size.y - 800.0).abs() < 0.01);
-        assert!((full.size.x - 486.0 * (800.0 / 318.0)).abs() < 0.5);
-        assert!((full.pos.x - (1280.0 - full.size.x) / 2.0).abs() < 0.01);
-        assert_eq!(full.pos.y, 0.0);
+        // True fullscreen: the rect IS the view, no letterbox.
+        assert_eq!(full.pos, Vec2::new(0.0, 0.0));
+        assert_eq!(full.size, Vec2::new(1280.0, 800.0));
         assert!(!s.toggle_fullscreen(id, &view));
         let back = s.windows[&id].canvas;
         assert_eq!(back.pos, Vec2::new(40.0, 40.0));

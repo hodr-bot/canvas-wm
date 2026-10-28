@@ -308,6 +308,20 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             );
                                             let on =
                                                 server_state.toggle_fullscreen(id, &rect);
+                                            if let Some(xid) = server_state
+                                                .windows
+                                                .get(&id)
+                                                .and_then(|c| c.x11)
+                                            {
+                                                let r = server_state.windows[&id].canvas;
+                                                if let Some(wm) = xwm.as_ref() {
+                                                    wm.configure(
+                                                        xid,
+                                                        r.size.x as u32,
+                                                        r.size.y as u32,
+                                                    );
+                                                }
+                                            }
                                             log::info!(
                                                 "hover key fullscreen window {} on={}",
                                                 id,
@@ -574,6 +588,23 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         });
                                         let on =
                                             server_state.toggle_fullscreen(chrome_id, &rect);
+                                        // True fullscreen: tell the X client its
+                                        // new size so the buffer follows.
+                                        if let Some(xid) = server_state
+                                            .windows
+                                            .get(&chrome_id)
+                                            .and_then(|c| c.x11)
+                                        {
+                                            let r =
+                                                server_state.windows[&chrome_id].canvas;
+                                            if let Some(wm) = xwm.as_ref() {
+                                                wm.configure(
+                                                    xid,
+                                                    r.size.x as u32,
+                                                    r.size.y as u32,
+                                                );
+                                            }
+                                        }
                                         log::info!(
                                             "chrome fullscreen window {} on={}",
                                             chrome_id,
@@ -798,8 +829,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         // Follow the buffer only when the CLIENT
                                         // resizes (first map or configure):
                                         // manual moves/resizes never snap back.
-                                        // Fullscreen windows keep their fitted
-                                        // rect (aspect-preserved, centred).
+                                        // Fullscreen windows keep the exact view
+                                        // rect (true fullscreen); the client
+                                        // buffer follows via configure.
                                         let buf = (w as u32, h as u32);
                                         if cw.fullscreen_prev.is_none()
                                             && cw.buf_size != Some(buf)
