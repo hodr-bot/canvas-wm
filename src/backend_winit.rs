@@ -1145,22 +1145,28 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 }
             }
             InputEvent::PointerAxis { event } => {
-                // Wheel over empty canvas zooms at the pointer; over a window
-                // it scrolls the client instead.
+                // Wheel: in Canvas mode it ALWAYS zooms at the pointer —
+                // apps are frozen, so scrolling a client would go nowhere
+                // (that dead wheel over windows was the bug). In Idle the
+                // old split stays: empty canvas zooms, a window under the
+                // cursor scrolls its client. Zoom glides (smooth fade,
+                // momentum kept), never snaps by notches.
                 let vertical = event
                     .amount(Axis::Vertical)
                     .or_else(|| event.amount_discrete(Axis::Vertical).map(|s| s as f64))
                     .unwrap_or(0.0);
                 if vertical != 0.0 {
+                    let canvas_mode =
+                        session.state == crate::session::SuperState::Canvas;
                     let cworld = session.to_canvas(pointer, view);
                     let over_window = server_state
                         .windows
                         .iter()
                         .any(|(_, c)| c.canvas.contains(cworld));
-                    if !over_window {
+                    if canvas_mode || !over_window {
                         let factor = if vertical > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                        session.zoom_at(pointer, view, factor);
-                        log::info!("wheel zoom={:.2}", session.camera.zoom);
+                        session.zoom_glide_at(pointer, view, factor);
+                        log::info!("wheel zoom->{:.2}", session.camera.zoom_target);
                         need_render = true;
                         return;
                     }

@@ -218,6 +218,22 @@ impl Session {
             - anchor.y;
     }
 
+    /// Wheel zoom: same anchor as [`zoom_at`], but the zoom GLIDES to
+    /// the goal instead of snapping (smooth fade, momentum kept), and
+    /// each notch composes onto the SETTLED target — never the live
+    /// mid-glide value, so fast scrolling never ratchets or kills a
+    /// glide-back in progress (quitting Super then touching the wheel
+    /// keeps the return trip, it just aims it a notch further).
+    pub fn zoom_glide_at(&mut self, screen: Vec2, view: Vec2, factor: f64) {
+        let anchor = self.to_world(screen, view);
+        let zt = (self.camera.zoom_target * factor).clamp(0.05, 4.0);
+        self.camera.zoom_to(zt);
+        self.canvas.offset.x =
+            (screen.x - view.x * 0.5) / zt + self.camera.pos.x - anchor.x;
+        self.canvas.offset.y =
+            (screen.y - view.y * 0.5) / zt + self.camera.pos.y - anchor.y;
+    }
+
     pub fn on_event(
         &mut self,
         event: SuperEvent,
@@ -380,6 +396,43 @@ mod tests {
         }
         assert_eq!(s.camera.zoom, 1.0);
         assert!(!s.camera.flying());
+    }
+
+    #[test]
+    fn wheel_glides_without_snapping_and_survives_quit() {
+        let mut s = Session::new();
+        let view = Vec2::new(1920.0, 1080.0);
+        let at = Vec2::new(960.0, 540.0);
+        // Notch 1: no snap — the live zoom barely moved, the target did.
+        s.zoom_glide_at(at, view, 1.15);
+        assert!((s.camera.zoom_target - 1.15).abs() < 1e-12);
+        assert!((s.camera.zoom - 1.0).abs() < 0.05);
+        // Notch 2 composes onto the settled target, not the live value.
+        s.zoom_glide_at(at, view, 1.15);
+        assert!((s.camera.zoom_target - 1.15 * 1.15).abs() < 1e-12);
+        // Quit mid-glide then wheel: the return trip survives — the
+        // notch re-aims it instead of snapping over it.
+        let wins = two_windows();
+        let resolve = |id: u64| wins.get(&id).copied();
+        s.on_event(SuperEvent::SuperTap, &resolve, view);
+        s.on_event(SuperEvent::CanvasClick, &resolve, view);
+        s.zoom_glide_at(at, view, 1.15);
+        assert!(s.camera.zoom_target > 1.0);
+        assert!((s.camera.zoom_vel - 0.0).abs() > 1e-9 || s.camera.zoom != s.camera.zoom_target);
+        // Anchor: the world point under the cursor is identical before
+        // the glide and after landing (position never moved here).
+        let mut s2 = Session::new();
+        let before = s2.to_world(at, view);
+        s2.zoom_glide_at(at, view, 1.5);
+        for _ in 0..1200 {
+            if !s2.camera.step(1.0 / 120.0) {
+                break;
+            }
+        }
+        assert!(!s2.camera.flying());
+        let after = s2.to_world(at, view);
+        assert!((after.x - before.x).abs() < 1e-9);
+        assert!((after.y - before.y).abs() < 1e-9);
     }
 
     #[test]
