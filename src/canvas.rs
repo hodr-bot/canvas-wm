@@ -110,10 +110,14 @@ impl Camera {
             self.vel = Vec2::new(0.0, 0.0);
             moving = false;
         }
-        // Zoom glides on its own critically-damped spring, same feel as
-        // position (~0.45s, no overshoot, exact snap so frames stop).
+        // Zoom glides on its own SOFTER spring: a slow fade (~0.9s),
+        // not the snappy position feel — the zoom value visibly melts
+        // while the tracked anchor (see Session::track_zoom_anchor)
+        // keeps the content glued under the cursor every frame.
+        const ZOOM_STIFFNESS: f64 = 26.0;
+        let zoom_damping = 2.0 * ZOOM_STIFFNESS.sqrt();
         let dz = self.zoom_target - self.zoom;
-        let za = STIFFNESS * dz - damping * self.zoom_vel;
+        let za = ZOOM_STIFFNESS * dz - zoom_damping * self.zoom_vel;
         self.zoom_vel += za * dt;
         self.zoom += self.zoom_vel * dt;
         let dz2 = self.zoom_target - self.zoom;

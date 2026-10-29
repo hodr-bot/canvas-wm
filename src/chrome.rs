@@ -105,7 +105,7 @@ pub enum HoverKey {
     Fullscreen,
     Close,
     Grab,
-    Resize,
+    Scale,
 }
 
 pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
@@ -116,83 +116,28 @@ pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
         KEY_F => Some(HoverKey::Fullscreen),
         KEY_Q => Some(HoverKey::Close),
         KEY_E => Some(HoverKey::Grab),
-        KEY_R => Some(HoverKey::Resize),
+        KEY_R => Some(HoverKey::Scale),
         _ => None,
     }
 }
 
-/// Resize handle: window edges and corners, in canvas coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Edge {
-    Left,
-    Right,
-    Top,
-    Bottom,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
+/// Centre-anchored scale (the R key): while R is held, the window centre
+/// stays pinned and each axis follows the mouse away from the grab point —
+/// move right to widen, down to heighten, both to grow. Minimum size
+/// clamps the rect, never the centre.
+pub const SCALE_MIN_W: f64 = 120.0;
+pub const SCALE_MIN_H: f64 = 80.0;
 
-/// Edge proximity band (canvas px) for starting a resize drag.
-pub const RESIZE_GRAB: f64 = 12.0;
-/// Windows never shrink below this (canvas px).
-pub const MIN_WIN: f64 = 60.0;
-
-pub fn resize_edge(rect: &CanvasWindow, p: Vec2, grab: f64) -> Option<Edge> {
-    let (l, t) = (rect.pos.x, rect.pos.y);
-    let (r, b) = (l + rect.size.x, t + rect.size.y);
-    let nl = (p.x - l).abs() <= grab;
-    let nr = (p.x - r).abs() <= grab;
-    let nt = (p.y - t).abs() <= grab;
-    let nb = (p.y - b).abs() <= grab;
-    // Corners first, then single edges, else not on a handle.
-    if nl && nt {
-        Some(Edge::TopLeft)
-    } else if nr && nt {
-        Some(Edge::TopRight)
-    } else if nl && nb {
-        Some(Edge::BottomLeft)
-    } else if nr && nb {
-        Some(Edge::BottomRight)
-    } else if nl && !nr {
-        Some(Edge::Left)
-    } else if nr && !nl {
-        Some(Edge::Right)
-    } else if nt && !nb {
-        Some(Edge::Top)
-    } else if nb && !nt {
-        Some(Edge::Bottom)
-    } else {
-        None
-    }
-}
-
-/// Grow/shrink a window rect by a canvas-space drag delta on one handle.
-/// Minimum size clamps the moving side, never the anchored one.
-pub fn apply_resize(rect: &CanvasWindow, edge: Edge, delta: Vec2) -> CanvasWindow {
-    let (mut x, mut y, mut w, mut h) = (rect.pos.x, rect.pos.y, rect.size.x, rect.size.y);
-    let left = matches!(edge, Edge::Left | Edge::TopLeft | Edge::BottomLeft);
-    let right = matches!(edge, Edge::Right | Edge::TopRight | Edge::BottomRight);
-    let top = matches!(edge, Edge::Top | Edge::TopLeft | Edge::TopRight);
-    let bottom = matches!(edge, Edge::Bottom | Edge::BottomLeft | Edge::BottomRight);
-    if left {
-        let nw = (w - delta.x).max(MIN_WIN);
-        x += w - nw;
-        w = nw;
-    }
-    if right {
-        w = (w + delta.x).max(MIN_WIN);
-    }
-    if top {
-        let nh = (h - delta.y).max(MIN_WIN);
-        y += h - nh;
-        h = nh;
-    }
-    if bottom {
-        h = (h + delta.y).max(MIN_WIN);
-    }
-    CanvasWindow::new(rect.id, x, y, w, h)
+/// Scale step: centre stays, size tracks the mouse delta from the grab
+/// point, clamped to the minimum. Pure: unit-tested below.
+pub fn apply_scale(
+    center: Vec2,
+    size0: Vec2,
+    mouse_delta: Vec2,
+) -> (Vec2, Vec2) {
+    let w = (size0.x + mouse_delta.x).max(SCALE_MIN_W);
+    let h = (size0.y + mouse_delta.y).max(SCALE_MIN_H);
+    (Vec2::new(center.x - w * 0.5, center.y - h * 0.5), Vec2::new(w, h))
 }
 
 #[cfg(test)]
@@ -241,42 +186,30 @@ mod tests {
         assert_eq!(hover_shortcut(KEY_F, false), Some(HoverKey::Fullscreen));
         assert_eq!(hover_shortcut(KEY_Q, false), Some(HoverKey::Close));
         assert_eq!(hover_shortcut(KEY_E, false), Some(HoverKey::Grab));
-        assert_eq!(hover_shortcut(KEY_R, false), Some(HoverKey::Resize));
+        assert_eq!(hover_shortcut(KEY_R, false), Some(HoverKey::Scale));
         assert_eq!(hover_shortcut(KEY_F, true), None);
         assert_eq!(hover_shortcut(30, false), None); // A is for typing
         assert!(MOD_CODES.contains(&42) && MOD_CODES.contains(&29));
     }
 
     #[test]
-    fn resize_handles_hit_edges_corners_only() {
-        let rect = CanvasWindow::new(7, 100.0, 100.0, 400.0, 300.0);
-        assert_eq!(resize_edge(&rect, Vec2::new(102.0, 250.0), RESIZE_GRAB), Some(Edge::Left));
-        assert_eq!(resize_edge(&rect, Vec2::new(498.0, 250.0), RESIZE_GRAB), Some(Edge::Right));
-        assert_eq!(resize_edge(&rect, Vec2::new(300.0, 103.0), RESIZE_GRAB), Some(Edge::Top));
-        assert_eq!(resize_edge(&rect, Vec2::new(300.0, 397.0), RESIZE_GRAB), Some(Edge::Bottom));
-        assert_eq!(resize_edge(&rect, Vec2::new(101.0, 101.0), RESIZE_GRAB), Some(Edge::TopLeft));
-        assert_eq!(resize_edge(&rect, Vec2::new(499.0, 399.0), RESIZE_GRAB), Some(Edge::BottomRight));
-        // Deep inside or far outside: no handle.
-        assert_eq!(resize_edge(&rect, Vec2::new(300.0, 250.0), RESIZE_GRAB), None);
-        assert_eq!(resize_edge(&rect, Vec2::new(0.0, 0.0), RESIZE_GRAB), None);
-    }
-
-    #[test]
-    fn apply_resize_grows_anchors_and_clamps() {
-        let rect = CanvasWindow::new(7, 100.0, 100.0, 400.0, 300.0);
-        // Right edge +40: grows, position anchored.
-        let r = apply_resize(&rect, Edge::Right, Vec2::new(40.0, 0.0));
-        assert_eq!((r.pos.x, r.size.x), (100.0, 440.0));
-        // Left edge +40 (drag right): shrinks from the left.
-        let l = apply_resize(&rect, Edge::Left, Vec2::new(40.0, 0.0));
-        assert_eq!((l.pos.x, l.size.x), (140.0, 360.0));
-        // Bottom-right corner grows both axes.
-        let c = apply_resize(&rect, Edge::BottomRight, Vec2::new(10.0, 20.0));
-        assert_eq!((c.size.x, c.size.y), (410.0, 320.0));
-        // Clamp: never below MIN_WIN, anchor side stays.
-        let s = apply_resize(&rect, Edge::Right, Vec2::new(-1000.0, 0.0));
-        assert_eq!(s.size.x, MIN_WIN);
-        let t = apply_resize(&rect, Edge::Left, Vec2::new(1000.0, 0.0));
-        assert_eq!((t.pos.x, t.size.x), (100.0 + 400.0 - MIN_WIN, MIN_WIN));
+    fn apply_scale_pins_center_and_clamps() {
+        let center = Vec2::new(300.0, 250.0);
+        let size0 = Vec2::new(400.0, 300.0);
+        // +40/+20 from the grab point: grows, centre pinned.
+        let (pos, size) = apply_scale(center, size0, Vec2::new(40.0, 20.0));
+        assert_eq!((size.x, size.y), (440.0, 320.0));
+        assert_eq!((pos.x, pos.y), (300.0 - 220.0, 250.0 - 160.0));
+        // Shrink: centre still pinned.
+        let (pos, size) = apply_scale(center, size0, Vec2::new(-100.0, -50.0));
+        assert_eq!((size.x, size.y), (300.0, 250.0));
+        assert_eq!((pos.x, pos.y), (150.0, 125.0));
+        // Clamp: never below the minimum, centre still pinned.
+        let (pos, size) = apply_scale(center, size0, Vec2::new(-1000.0, -1000.0));
+        assert_eq!((size.x, size.y), (SCALE_MIN_W, SCALE_MIN_H));
+        assert_eq!(
+            (pos.x, pos.y),
+            (300.0 - SCALE_MIN_W * 0.5, 250.0 - SCALE_MIN_H * 0.5)
+        );
     }
 }

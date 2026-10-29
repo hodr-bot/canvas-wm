@@ -181,7 +181,7 @@ fn surface_implementation(
             id.configure(0, 0, vec![4, 0, 0, 0]);
             xdg_surface.configure(serial.into());
         }
-        xdg_surface::Request::GetPopup { id, .. } => {
+        xdg_surface::Request::GetPopup { id, parent, .. } => {
             let data = xdg_surface
                 .as_ref()
                 .user_data()
@@ -194,21 +194,44 @@ fn surface_implementation(
             {
                 return;
             }
-            let win_id = dispatch
-                .get::<ServerState>()
-                .map(|state| state.add_toplevel(Some(data.wl_surface.clone())));
+            // Popups are child OVERLAYS, never canvas windows: a tooltip
+            // mapped as a window used to steal every pick/focus and
+            // freeze the parent app (Kate). The protocol parent is an
+            // xdg_surface: resolve it to its wl_surface, then to the
+            // owning window. Unknown parent drops the popup.
+            let parent_surf = parent.as_ref().and_then(|p| {
+                p.as_ref()
+                    .user_data()
+                    .get::<SurfaceData>()
+                    .map(|d| d.wl_surface.clone())
+            });
+            let parent_win = parent_surf.as_ref().and_then(|ps| {
+                dispatch.get::<ServerState>().and_then(|state| {
+                    state
+                        .windows
+                        .iter()
+                        .find(|(_, c)| c.surface.as_ref() == Some(ps))
+                        .map(|(id, _)| *id)
+                })
+            });
+            let win_id = parent_win.and_then(|pw| {
+                dispatch.get::<ServerState>().and_then(|state| {
+                    state.add_popup(pw, Some(data.wl_surface.clone()))
+                })
+            });
             let serial = next_serial();
             id.quick_assign(|_, _, _| {});
             id.assign_destructor(Filter::new(
                 move |_: Resource<xdg_popup::XdgPopup>, _, mut data| {
                 if let Some(win_id) = win_id {
                     if let Some(state) = data.get::<ServerState>() {
-                        state.close_window(win_id);
+                        state.remove_popup(win_id);
+                        log::info!("xdg v3 popup {} dismissed", win_id);
                     }
                 }
             }));
             if let Some(win_id) = win_id {
-                log::info!("xdg v3 new popup -> canvas window {}", win_id);
+                log::info!("xdg v3 new popup {} for window {} (overlay)", win_id, parent_win.unwrap());
             }
             id.configure(0, 0, 0, 0);
             xdg_surface.configure(serial.into());

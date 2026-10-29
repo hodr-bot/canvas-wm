@@ -54,6 +54,10 @@ pub fn place_window(id: u64, n: usize) -> CanvasWindow {
 #[derive(Default)]
 pub struct ServerState {
     pub windows: HashMap<u64, ClientWindow>,
+    /// xdg popup overlays (tooltips, menus): rendered above everything,
+    /// routed to the seat first — but NEVER canvas windows, so they can
+    /// neither steal picks/focus nor be grabbed/moved/resized.
+    pub popups: HashMap<u64, PopupWindow>,
     next_id: u64,
     /// Stacking high-water mark; each raise bumps it.
     z_top: u64,
@@ -113,6 +117,44 @@ impl ClientWindow {
     }
 }
 
+/// An xdg popup (tooltip, menu): a child overlay of its parent window.
+/// Rendered above all windows at parent.pos + offset; the offset is set
+/// from the cursor at first map (popups open at the pointer), the size is
+/// learned from the first committed buffer. Never pickable as a window.
+pub struct PopupWindow {
+    pub id: u64,
+    pub parent: u64,
+    pub surface: Option<WlSurface>,
+    pub offset: Option<Vec2>,
+    pub size: Vec2,
+    pub texture: Option<Gles2Texture>,
+    pub last_buffer: Option<WlBuffer>,
+}
+
+impl PopupWindow {
+    fn new(id: u64, parent: u64, surface: Option<WlSurface>) -> Self {
+        Self {
+            id,
+            parent,
+            surface,
+            offset: None,
+            size: Vec2::new(0.0, 0.0),
+            texture: None,
+            last_buffer: None,
+        }
+    }
+
+    /// Canvas rect, once placed and sized.
+    pub fn rect(&self, parent_pos: Vec2) -> Option<(Vec2, Vec2)> {
+        match (self.offset, self.size) {
+            (Some(off), s) if s.x > 0.0 && s.y > 0.0 => {
+                Some((Vec2::new(parent_pos.x + off.x, parent_pos.y + off.y), s))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl ServerState {
     pub fn add_toplevel(&mut self, surface: Option<WlSurface>) -> u64 {
         let id = self.next_id;
@@ -166,8 +208,49 @@ impl ServerState {
     /// Close a window: XWayland-backed windows die through the WM (the
     /// backend calls back with the xid); native windows drop here.
     /// Returns the X window id when the backend must kill it.
+    /// Orphaned popups of the window die with it.
     pub fn close_window(&mut self, id: u64) -> Option<u32> {
+        self.popups.retain(|_, p| p.parent != id);
         self.windows.remove(&id).and_then(|w| w.x11)
+    }
+
+    /// Register an xdg popup overlay for a parent window. Returns the
+    /// popup id (None when the parent is unknown — the popup is dropped).
+    pub fn add_popup(&mut self, parent: u64, surface: Option<WlSurface>) -> Option<u64> {
+        if !self.windows.contains_key(&parent) {
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.popups.insert(id, PopupWindow::new(id, parent, surface));
+        Some(id)
+    }
+
+    /// Drop a popup overlay (unmapped/destroyed). Never touches windows.
+    pub fn remove_popup(&mut self, id: u64) {
+        self.popups.remove(&id);
+    }
+
+    /// Topmost popup containing a canvas-plane point (newest wins).
+    /// The seat consults popups BEFORE windows so menus and tooltips
+    /// receive input; canvas picking (`topmost_at`) never sees them.
+    pub fn popup_at(&self, p: crate::canvas::Vec2) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for (id, pop) in self.popups.iter() {
+            let parent_pos = match self.windows.get(&pop.parent) {
+                Some(w) => w.canvas.pos,
+                None => continue,
+            };
+            if let Some((org, size)) = pop.rect(parent_pos) {
+                if p.x >= org.x && p.x < org.x + size.x && p.y >= org.y && p.y < org.y + size.y
+                {
+                    if best.map(|b| *id > b).unwrap_or(true) {
+                        best = Some(*id);
+                    }
+                }
+            }
+        }
+        best
     }
 
     /// Topmost window containing a canvas-plane point (highest z wins).
@@ -660,6 +743,36 @@ mod tests {
         let wa = &s.windows[&first].canvas;
         let wb = &s.windows[&second].canvas;
         assert!(wb.pos.x > wa.pos.x && wb.pos.y > wa.pos.y);
+    }
+
+    #[test]
+    fn popups_never_become_windows() {
+        use crate::canvas::Vec2;
+        let mut s = ServerState::default();
+        // Unknown parent: popup dropped, no window created.
+        assert_eq!(s.add_popup(999, None), None);
+        assert!(s.windows.is_empty());
+        let w = s.add_toplevel(None);
+        let wpos = s.windows[&w].canvas.pos;
+        let p = s.add_popup(w, None).expect("popup");
+        // Unplaced/unsized: invisible to the seat, and never a window.
+        assert_eq!(s.popup_at(wpos), None);
+        assert!(s.topmost_at(wpos) == Some(w));
+        // Placed + sized: seat hit, still not a window.
+        s.popups.get_mut(&p).unwrap().offset = Some(Vec2::new(10.0, 10.0));
+        s.popups.get_mut(&p).unwrap().size = Vec2::new(100.0, 40.0);
+        let inside = Vec2::new(wpos.x + 50.0, wpos.y + 20.0);
+        assert_eq!(s.popup_at(inside), Some(p));
+        assert_eq!(s.topmost_at(inside), Some(w));
+        // Dismissed: gone from the seat.
+        s.remove_popup(p);
+        assert_eq!(s.popup_at(inside), None);
+        // Parent closed: orphan popups die with it.
+        let p2 = s.add_popup(w, None).expect("popup");
+        s.popups.get_mut(&p2).unwrap().offset = Some(Vec2::new(0.0, 0.0));
+        s.popups.get_mut(&p2).unwrap().size = Vec2::new(10.0, 10.0);
+        s.close_window(w);
+        assert!(s.popups.is_empty());
     }
 
     #[test]

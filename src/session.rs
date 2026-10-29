@@ -150,6 +150,10 @@ pub struct Session {
     /// (default 0.90 = Normal 10%). Enter multiplies the settled zoom
     /// by this; keeps the "Recul" option logic in core, GL-free.
     pub super_dolly: f64,
+    /// Wheel-zoom anchor: (screen point, world point) glued together
+    /// while the zoom fade glides. Set by [`zoom_glide_at`], consumed
+    /// every frame by [`track_zoom_anchor`], dropped on landing.
+    pub zoom_anchor: Option<(Vec2, Vec2)>,
 }
 
 impl Session {
@@ -163,6 +167,7 @@ impl Session {
             prev_offset: None,
             prev_zoom: None,
             super_dolly: 0.90,
+            zoom_anchor: None,
         }
     }
 
@@ -200,6 +205,8 @@ impl Session {
         self.canvas.offset.x += delta_screen.x / self.camera.zoom;
         self.canvas.offset.y += delta_screen.y / self.camera.zoom;
         self.canvas.vel = Vec2::new(0.0, 0.0);
+        // Manual pan owns the offset now: drop any zoom tracking.
+        self.zoom_anchor = None;
     }
 
     /// Zoom keeping the world point under `screen` fixed.
@@ -238,6 +245,29 @@ impl Session {
         self.camera.zoom_to(zt);
         self.canvas.offset.x = (screen.x - view.x * 0.5) / zt + base_p.x - anchor.x;
         self.canvas.offset.y = (screen.y - view.y * 0.5) / zt + base_p.y - anchor.y;
+        // Pin (screen, world) for the fade: every frame re-solves the
+        // offset at the LIVE zoom so the content stays glued under the
+        // cursor while the value melts (see track_zoom_anchor). The
+        // pinned world is the settled one, not the live mid-glide one.
+        self.zoom_anchor = Some((screen, anchor));
+    }
+
+    /// After each camera step, re-solve the canvas offset so a tracked
+    /// wheel-zoom anchor stays glued under its screen point through the
+    /// fade. Drops the anchor on landing (exact by construction).
+    /// Call every frame after `camera.step`.
+    pub fn track_zoom_anchor(&mut self, view: Vec2) {
+        if self.camera.zoom == self.camera.zoom_target && self.camera.zoom_vel == 0.0 {
+            self.zoom_anchor = None;
+            return;
+        }
+        if let Some((screen, world)) = self.zoom_anchor {
+            let z = self.camera.zoom;
+            self.canvas.offset.x =
+                (screen.x - view.x * 0.5) / z + self.camera.pos.x - world.x;
+            self.canvas.offset.y =
+                (screen.y - view.y * 0.5) / z + self.camera.pos.y - world.y;
+        }
     }
 
     pub fn on_event(
@@ -264,6 +294,7 @@ impl Session {
                 self.overview.enter();
                 self.state = SuperState::Canvas;
                 self.dwell = DwellTracker::default();
+                self.zoom_anchor = None;
                 SuperAction::EnterCanvas
             }
             (SuperState::Canvas, SuperEvent::WindowClick(id)) => {
@@ -278,6 +309,7 @@ impl Session {
                 let _ids = self.overview.quit();
                 self.state = SuperState::Idle;
                 self.prev_offset = None;
+                self.zoom_anchor = None;
                 if let Some(z) = self.prev_zoom.take() {
                     self.camera.zoom_to(z);
                 }
@@ -289,6 +321,7 @@ impl Session {
                 self.overview.quit();
                 self.state = SuperState::Idle;
                 self.dwell.disarm();
+                self.zoom_anchor = None;
                 if let Some(prev) = self.prev_offset.take() {
                     self.canvas.offset = prev;
                 }
@@ -304,6 +337,7 @@ impl Session {
                 self.state = SuperState::Idle;
                 self.dwell.disarm();
                 self.prev_offset = None;
+                self.zoom_anchor = None;
                 if let Some(z) = self.prev_zoom.take() {
                     self.camera.zoom_to(z);
                 }
@@ -439,6 +473,38 @@ mod tests {
         let after = s2.to_world(at, view);
         assert!((after.x - before.x).abs() < 1e-9);
         assert!((after.y - before.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_fade_tracks_anchor_every_frame() {
+        let mut s = Session::new();
+        let view = Vec2::new(1920.0, 1080.0);
+        let at = Vec2::new(1400.0, 800.0);
+        s.zoom_glide_at(at, view, 1.5);
+        assert!(s.zoom_anchor.is_some());
+        // Mid-fade: the pinned world never leaves its screen point.
+        for i in 0..400 {
+            s.camera.step(1.0 / 120.0);
+            s.track_zoom_anchor(view);
+            if s.zoom_anchor.is_none() {
+                break;
+            }
+            let held = s.to_world(at, view);
+            let (_, world) = s.zoom_anchor.unwrap();
+            assert!(
+                (held.x - world.x).abs() < 1e-6 && (held.y - world.y).abs() < 1e-6,
+                "drift at frame {}: ({},{}) vs ({},{})",
+                i,
+                held.x,
+                held.y,
+                world.x,
+                world.y
+            );
+        }
+        // Lands exactly on target, anchor dropped, frames can stop.
+        assert_eq!(s.camera.zoom, s.camera.zoom_target);
+        assert!(!s.camera.flying());
+        assert!(s.zoom_anchor.is_none());
     }
 
     #[test]
