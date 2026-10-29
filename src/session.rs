@@ -226,8 +226,14 @@ impl Session {
             // never touched on enter/quit.
             (SuperState::Idle, SuperEvent::SuperTap) => {
                 self.prev_offset = Some(self.canvas.offset);
-                self.prev_zoom = Some(self.camera.zoom);
-                self.camera.zoom_to(self.camera.zoom * 0.9);
+                // Snapshot the SETTLED zoom (target), never the mid-glide
+                // transient: re-tapping mid-animation must curve back to
+                // the pre-Super level, not ratchet down a level each
+                // cycle. At rest target == zoom, so this changes nothing
+                // for clean taps; mid-glide it makes enter/quit idempotent
+                // and the spring superimposes the U-turn for free.
+                self.prev_zoom = Some(self.camera.zoom_target);
+                self.camera.zoom_to(self.camera.zoom_target * 0.9);
                 self.overview.enter();
                 self.state = SuperState::Canvas;
                 self.dwell = DwellTracker::default();
@@ -340,6 +346,35 @@ mod tests {
         assert_eq!(s.state, SuperState::Idle);
         // ...and the zoom glides back to the saved level.
         assert!((s.camera.zoom_target - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rapid_super_taps_never_ratchet_zoom() {
+        let mut s = Session::new();
+        let wins = two_windows();
+        let resolve = |id: u64| wins.get(&id).copied();
+        let view = Vec2::new(1920.0, 1080.0);
+        // Mash enter/quit mid-glide several times: each cycle snapshots
+        // the settled intent, so the zoom can never spiral down.
+        for _ in 0..4 {
+            s.on_event(SuperEvent::SuperTap, &resolve, view);
+            for _ in 0..10 {
+                s.camera.step(1.0 / 120.0);
+            }
+            assert_eq!(s.state, SuperState::Canvas);
+            s.on_event(SuperEvent::SuperTap, &resolve, view);
+            for _ in 0..10 {
+                s.camera.step(1.0 / 120.0);
+            }
+            assert_eq!(s.state, SuperState::Idle);
+        }
+        for _ in 0..600 {
+            if !s.camera.step(1.0 / 120.0) {
+                break;
+            }
+        }
+        assert_eq!(s.camera.zoom, 1.0);
+        assert!(!s.camera.flying());
     }
 
     #[test]
