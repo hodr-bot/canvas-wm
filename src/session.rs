@@ -142,6 +142,10 @@ pub struct Session {
     pub canvas: CanvasOrigin,
     pub dwell: DwellTracker,
     pub prev_offset: Option<Vec2>,
+    /// Zoom before Super mode, for the dolly-back-and-return. Enter
+    /// glides to 90%, every quit path glides back here — the view
+    /// never moves position on enter/quit, only breathes in zoom.
+    pub prev_zoom: Option<f64>,
 }
 
 impl Session {
@@ -153,6 +157,7 @@ impl Session {
             canvas: CanvasOrigin::default(),
             dwell: DwellTracker::default(),
             prev_offset: None,
+            prev_zoom: None,
         }
     }
 
@@ -196,6 +201,11 @@ impl Session {
     pub fn zoom_at(&mut self, screen: Vec2, view: Vec2, factor: f64) {
         let anchor = self.to_world(screen, view);
         self.camera.zoom = (self.camera.zoom * factor).clamp(0.05, 4.0);
+        // Direct manipulation owns the zoom: snap the glide spring onto
+        // the new value, otherwise it would drag the zoom back to a
+        // stale target and burn frames forever.
+        self.camera.zoom_target = self.camera.zoom;
+        self.camera.zoom_vel = 0.0;
         // screen = (anchor + off - pos) * z' + v/2, solved for off.
         self.canvas.offset.x = (screen.x - view.x * 0.5) / self.camera.zoom + self.camera.pos.x
             - anchor.x;
@@ -206,13 +216,18 @@ impl Session {
     pub fn on_event(
         &mut self,
         event: SuperEvent,
-        resolve: &dyn Fn(u64) -> Option<CanvasWindow>,
+        _resolve: &dyn Fn(u64) -> Option<CanvasWindow>,
         _view: Vec2,
     ) -> SuperAction {
         match (&self.state, event) {
-            // Tap Super: enter canvas mode, screen keeps its size, no zoom.
+            // Tap Super: enter canvas mode. No pan, no pivot — the camera
+            // only dollies back ~10% (glide, momentum kept), and quitting
+            // always glides back to the saved zoom. Screen position is
+            // never touched on enter/quit.
             (SuperState::Idle, SuperEvent::SuperTap) => {
                 self.prev_offset = Some(self.canvas.offset);
+                self.prev_zoom = Some(self.camera.zoom);
+                self.camera.zoom_to(self.camera.zoom * 0.9);
                 self.overview.enter();
                 self.state = SuperState::Canvas;
                 self.dwell = DwellTracker::default();
@@ -222,33 +237,21 @@ impl Session {
                 self.overview.toggle_select(id);
                 SuperAction::None
             }
-            // Re-tap: pan (never zoom) so the selection sits centred, then quit.
+            // Re-tap: quit, drop the selection, glide back to the saved
+            // zoom. Position is NEVER touched here: the old re-centring
+            // pan yanked the view on most quits (any selection, even an
+            // accidental click-select) — that drift was the bug.
             (SuperState::Canvas, SuperEvent::SuperTap) => {
-                let ids = self.overview.quit();
+                let _ids = self.overview.quit();
                 self.state = SuperState::Idle;
                 self.prev_offset = None;
+                if let Some(z) = self.prev_zoom.take() {
+                    self.camera.zoom_to(z);
+                }
                 self.dwell.disarm();
-                let selected: Vec<CanvasWindow> =
-                    ids.iter().filter_map(|id| resolve(*id)).collect();
-                let centred = if selected.is_empty() {
-                    false
-                } else {
-                    let (mut sx, mut sy) = (0.0, 0.0);
-                    for w in &selected {
-                        sx += w.pos.x + w.size.x * 0.5;
-                        sy += w.pos.y + w.size.y * 0.5;
-                    }
-                    let n = selected.len() as f64;
-                    let target = Vec2::new(sx / n, sy / n);
-                    // Centre the selection with a pan (never a zoom):
-                    // screen-centre shows W iff off = pos - W.
-                    self.canvas.offset.x = self.camera.pos.x - target.x;
-                    self.canvas.offset.y = self.camera.pos.y - target.y;
-                    true
-                };
-                SuperAction::QuitCanvas { centred }
+                SuperAction::QuitCanvas { centred: false }
             }
-            // Esc: quit, drop the selection, undo canvas panning.
+            // Esc: quit, drop the selection, undo canvas panning, zoom back.
             (SuperState::Canvas, SuperEvent::Esc) => {
                 self.overview.quit();
                 self.state = SuperState::Idle;
@@ -256,14 +259,21 @@ impl Session {
                 if let Some(prev) = self.prev_offset.take() {
                     self.canvas.offset = prev;
                 }
+                if let Some(z) = self.prev_zoom.take() {
+                    self.camera.zoom_to(z);
+                }
                 SuperAction::RestoreCanvas
             }
-            // Plain canvas click: quit, drop the selection, keep panning.
+            // Plain canvas click: quit, drop the selection, keep panning,
+            // zoom back to the saved level.
             (SuperState::Canvas, SuperEvent::CanvasClick) => {
                 self.overview.quit();
                 self.state = SuperState::Idle;
                 self.dwell.disarm();
                 self.prev_offset = None;
+                if let Some(z) = self.prev_zoom.take() {
+                    self.camera.zoom_to(z);
+                }
                 SuperAction::None
             }
             _ => SuperAction::None,
@@ -290,22 +300,27 @@ mod tests {
     }
 
     #[test]
-    fn canvas_mode_keeps_screen_size() {
+    fn canvas_mode_dollies_back_without_moving() {
         let mut s = Session::new();
         let wins = two_windows();
         let resolve = |id: u64| wins.get(&id).copied();
         let view = Vec2::new(1920.0, 1080.0);
-        let zoom_before = s.camera.zoom;
+        let (off_before, pos_before) = (s.canvas.offset, s.camera.pos);
         assert!(matches!(
             s.on_event(SuperEvent::SuperTap, &resolve, view),
             SuperAction::EnterCanvas
         ));
         assert_eq!(s.state, SuperState::Canvas);
-        assert_eq!(s.camera.zoom, zoom_before);
+        // Position untouched; zoom glides (target 90%, value still 1.0
+        // this instant — no snap).
+        assert_eq!(s.canvas.offset, off_before);
+        assert_eq!(s.camera.pos, pos_before);
+        assert_eq!(s.camera.zoom, 1.0);
+        assert!((s.camera.zoom_target - 0.9).abs() < 1e-12);
     }
 
     #[test]
-    fn retap_centres_selection_without_zoom() {
+    fn retap_quits_without_moving_view() {
         let mut s = Session::new();
         let wins = two_windows();
         let resolve = |id: u64| wins.get(&id).copied();
@@ -313,18 +328,43 @@ mod tests {
         s.on_event(SuperEvent::SuperTap, &resolve, view);
         s.on_event(SuperEvent::WindowClick(1), &resolve, view);
         s.on_event(SuperEvent::WindowClick(2), &resolve, view);
-        let zoom_before = s.camera.zoom;
+        let off_before = s.canvas.offset;
+        // Even with a selection, re-tap quits WITHOUT the old
+        // re-centring pan: the view must not drift.
         let action = s.on_event(SuperEvent::SuperTap, &resolve, view);
         assert!(matches!(
             action,
-            SuperAction::QuitCanvas { centred: true }
+            SuperAction::QuitCanvas { centred: false }
         ));
-        assert_eq!(s.camera.zoom, zoom_before);
+        assert_eq!(s.canvas.offset, off_before);
         assert_eq!(s.state, SuperState::Idle);
-        // Selection centre ((400+2400)/2, (300+1800)/2) sits screen-centred.
-        let centre = s.to_world(Vec2::new(960.0, 540.0), view);
-        assert!((centre.x - 1400.0).abs() < 1e-9);
-        assert!((centre.y - 1050.0).abs() < 1e-9);
+        // ...and the zoom glides back to the saved level.
+        assert!((s.camera.zoom_target - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn super_round_trip_returns_exact_view() {
+        let mut s = Session::new();
+        let wins = two_windows();
+        let resolve = |id: u64| wins.get(&id).copied();
+        let view = Vec2::new(1920.0, 1080.0);
+        s.on_event(SuperEvent::SuperTap, &resolve, view);
+        for _ in 0..600 {
+            if !s.camera.step(1.0 / 120.0) {
+                break;
+            }
+        }
+        assert!((s.camera.zoom - 0.9).abs() < 1e-9);
+        s.on_event(SuperEvent::SuperTap, &resolve, view);
+        for _ in 0..600 {
+            if !s.camera.step(1.0 / 120.0) {
+                break;
+            }
+        }
+        assert_eq!(s.camera.zoom, 1.0);
+        assert_eq!(s.canvas.offset, Vec2::new(0.0, 0.0));
+        assert_eq!(s.camera.pos, Vec2::new(0.0, 0.0));
+        assert!(!s.camera.flying());
     }
 
     #[test]

@@ -41,6 +41,11 @@ pub struct Camera {
     pub vel: Vec2,
     /// Where `pos` is flying to. Equals `pos` at rest.
     pub target: Vec2,
+    /// Zoom glide velocity (zoom units/s). Same rule as `vel`: a goal
+    /// change mid-glide keeps momentum, never snaps.
+    pub zoom_vel: f64,
+    /// Where `zoom` is gliding to. Equals `zoom` at rest.
+    pub zoom_target: f64,
 }
 
 impl Camera {
@@ -50,6 +55,8 @@ impl Camera {
             zoom: 1.0,
             vel: Vec2::new(0.0, 0.0),
             target: Vec2::new(0.0, 0.0),
+            zoom_vel: 0.0,
+            zoom_target: 1.0,
         }
     }
 
@@ -58,9 +65,18 @@ impl Camera {
         self.target = target;
     }
 
-    /// True while flying (position or velocity off rest).
+    /// New zoom goal, glide momentum kept. Clamped to the same range
+    /// as manual zoom so springs and fingers never disagree.
+    pub fn zoom_to(&mut self, zoom: f64) {
+        self.zoom_target = zoom.clamp(0.05, 4.0);
+    }
+
+    /// True while flying (position, zoom, or either velocity off rest).
     pub fn flying(&self) -> bool {
-        self.pos != self.target || self.vel != Vec2::new(0.0, 0.0)
+        self.pos != self.target
+            || self.vel != Vec2::new(0.0, 0.0)
+            || self.zoom != self.zoom_target
+            || self.zoom_vel != 0.0
     }
 
     /// Advance the spring by `dt` seconds. Critically damped: fast,
@@ -86,15 +102,28 @@ impl Camera {
         self.pos.y += self.vel.y * dt;
         let dx = self.target.x - self.pos.x;
         let dy = self.target.y - self.pos.y;
+        let mut moving = true;
         if dx * dx + dy * dy < 0.25
             && self.vel.x * self.vel.x + self.vel.y * self.vel.y < 25.0
         {
             self.pos = self.target;
             self.vel = Vec2::new(0.0, 0.0);
-            false
-        } else {
-            true
+            moving = false;
         }
+        // Zoom glides on its own critically-damped spring, same feel as
+        // position (~0.45s, no overshoot, exact snap so frames stop).
+        let dz = self.zoom_target - self.zoom;
+        let za = STIFFNESS * dz - damping * self.zoom_vel;
+        self.zoom_vel += za * dt;
+        self.zoom += self.zoom_vel * dt;
+        let dz2 = self.zoom_target - self.zoom;
+        if dz2 * dz2 < 1e-6 && self.zoom_vel * self.zoom_vel < 1e-4 {
+            self.zoom = self.zoom_target;
+            self.zoom_vel = 0.0;
+        } else {
+            moving = true;
+        }
+        moving
     }
 }
 
@@ -506,6 +535,33 @@ mod tests {
         }
         assert!(!cam.flying());
         assert_eq!(cam.pos, Vec2::new(-500.0, 0.0));
+    }
+
+    #[test]
+    fn zoom_glide_converges_without_overshoot() {
+        let mut cam = Camera::new();
+        cam.zoom_to(0.9);
+        assert!(cam.flying());
+        for _ in 0..600 {
+            cam.step(1.0 / 120.0);
+            assert!(cam.zoom <= 1.0, "zoom overshoot past start");
+            if !cam.flying() {
+                break;
+            }
+        }
+        assert_eq!(cam.zoom, 0.9);
+        assert!(!cam.flying());
+        // Mid-glide re-target keeps momentum (no snap back to rest).
+        cam.zoom_to(1.0);
+        cam.step(1.0 / 120.0);
+        cam.zoom_to(0.9);
+        assert!(cam.flying());
+        for _ in 0..600 {
+            if !cam.step(1.0 / 120.0) {
+                break;
+            }
+        }
+        assert_eq!(cam.zoom, 0.9);
     }
 
     #[test]
