@@ -212,6 +212,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut settings = crate::settings::Settings::default();
     session.super_dolly = settings.dolly_factor();
     let mut menu = crate::menu::MenuState::default();
+    // Slide-in animation clock: set when the menu opens, cleared on
+    // close; the panel drops a few px over ~0.18s.
+    let mut menu_opened_at: Option<std::time::Instant> = None;
     // Ambient background: compiled program, animation clock (seconds at
     // current speed; frozen in eco), and last repaint for the slow-drift
     // throttle. Off = flat clear, zero shader cost.
@@ -222,6 +225,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // wallpaper) plus a fade gliding with Canvas mode.
     let mut glow_time: f32 = 0.0;
     let mut glow_f: f32 = 0.0;
+    // Wave field clock: own travel time (eco-frozen with the rest).
+    let mut wave_time: f32 = 0.0;
     let mut last_bg_paint = std::time::Instant::now();
     // Glyph atlas texture for menu text (uploaded once, 128x64 RGBA).
     let mut atlas_tex: Option<
@@ -448,11 +453,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                             crate::menu::KEY_ENTER => {
                                 if let Some(id) =
-                                    crate::menu::MenuState::activate_at(menu.selected, &mut settings)
+                                    crate::menu::MenuState::activate_at(
+                                        menu.tab,
+                                        menu.selected,
+                                        &mut settings,
+                                    )
                                 {
                                     log::info!("menu option {} changed", id);
                                 }
                                 session.super_dolly = settings.dolly_factor();
+                                need_render = true;
+                                return;
+                            }
+                            crate::menu::KEY_TAB => {
+                                menu.next_tab();
+                                log::info!("menu tab {}", crate::menu::TABS[menu.tab]);
                                 need_render = true;
                                 return;
                             }
@@ -533,6 +548,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         && (evdev == crate::menu::KEY_COMMA || evdev == crate::menu::KEY_I)
                     {
                         menu.open = !menu.open;
+                        menu_opened_at = if menu.open {
+                            Some(std::time::Instant::now())
+                        } else {
+                            None
+                        };
                         log::info!("menu open={}", menu.open);
                         need_render = true;
                         return;
@@ -1033,15 +1053,22 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         // centre in SCREEN px (never canvas), hit-tested
                         // with the raw pointer — pan/zoom proof.
                         let lay = crate::menu::layout(
-                            view.x,
-                            view.y,
+                            menu.tab,
                             view.x / 2.0,
                             view.y / 2.0,
                         );
+                        // The tab bar switches tabs; items activate.
+                        if let Some(t) = crate::menu::tab_at(&lay, pointer.x, pointer.y) {
+                            menu.set_tab(t);
+                            log::info!("menu tab {}", crate::menu::TABS[menu.tab]);
+                            need_render = true;
+                            return;
+                        }
                         match crate::menu::item_at(&lay, pointer.x, pointer.y) {
                             Some(i) => {
                                 menu.selected = i;
                                 if let Some(id) = crate::menu::MenuState::activate_at(
+                                    menu.tab,
                                     menu.selected,
                                     &mut settings,
                                 ) {
@@ -1377,7 +1404,18 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         if settings.glow_flow() > 0.0 {
             glow_time += fx_dt * settings.glow_flow();
         }
+        if settings.wave_speed() > 0.0 {
+            wave_time += fx_dt * settings.wave_speed();
+        }
         last_bg_paint = fx_now;
+        // Menu slide-in holds a few frames while dropping in.
+        if menu.open {
+            if let Some(t) = menu_opened_at {
+                if t.elapsed().as_secs_f32() < 0.25 {
+                    need_render = true;
+                }
+            }
+        }
         let glow_target =
             if session.state == crate::session::SuperState::Canvas
                 && settings.glow_intensity() > 0.0
@@ -1431,6 +1469,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     if let Some(prog) = bg_prog {
                         let sc = scale as f32;
                         let (gcol_a, gcol_b) = settings.glow_hue();
+                        let tint = settings.bg_tint();
+                        let wcol = settings.wave_col();
+                        // Super mode dims the wallpaper into a backdrop.
+                        let dim = settings.bg_dim()
+                            * if session.state == crate::session::SuperState::Canvas {
+                                settings.super_dim()
+                            } else {
+                                1.0
+                            };
                         let _ = renderer.with_context(|_, gl| unsafe {
                             crate::render3d::draw_bg(
                                 gl,
@@ -1439,10 +1486,23 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 view.y as f32 * sc,
                                 bg_time,
                                 session.view_camera().zoom as f32,
-                                settings.bg_dim(),
-                                settings.halo(),
+                                dim,
+                                1.0,
                                 settings.depth_on(),
                                 if settings.bg_anim { 1.0 } else { 0.0 },
+                                settings.bg_pattern() as f32,
+                                settings.bg_scale(),
+                                settings.bg_grain(),
+                                settings.bg_vig(),
+                                tint,
+                                settings.wave_amp(),
+                                settings.wave_shape() as f32,
+                                settings.wave_octaves() as f32,
+                                settings.wave_freq(),
+                                settings.wave_dir(),
+                                settings.wave_crisp(),
+                                wcol,
+                                wave_time,
                                 glow_f,
                                 gcol_a,
                                 gcol_b,
@@ -2006,14 +2066,25 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         // SCREEN px, drawn 1:1 — Super dolly and pans never
                         // resize or move it.
                         let lay = crate::menu::layout(
-                            view.x,
-                            view.y,
+                            menu.tab,
                             view.x / 2.0,
                             view.y / 2.0,
                         );
                         let to_px =
                             |wx: f64, wy: f64| ((wx as f32) * sc, (wy as f32) * sc);
+                        // Slide-in: the panel drops into place over ~0.18s.
+                        let slide_k = menu_opened_at
+                            .map(|t| {
+                                (std::time::Instant::now()
+                                    .duration_since(t)
+                                    .as_secs_f32()
+                                    / 0.18)
+                                    .clamp(0.0, 1.0)
+                            })
+                            .unwrap_or(1.0);
+                        let slide_px = -26.0 * sc * (1.0 - slide_k);
                         let (px0, py0) = to_px(lay.x, lay.y);
+                        let py0 = py0 + slide_px;
                         // Popup scale is the output scale ONLY — never the
                         // canvas zoom (impossible to resize by zooming).
                         let pw = lay.w as f32 * sc;
@@ -2021,9 +2092,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         let pad = crate::menu::PANEL_PAD as f32 * sc;
                         let row_h = crate::menu::ROW_H as f32 * sc;
                         let atlas_id = atlas.tex_id();
-                        let rows = crate::menu::items();
+                        // House accent: deep teal, ambience-grade.
+                        let accent = [0.20, 0.75, 0.70, 1.0];
+                        let rows = crate::menu::tab_items(menu.tab);
+                        let feet = crate::menu::feet();
                         let _ = renderer.with_context(|_, gl| unsafe {
-                            // Border, then panel.
+                            // Drop shadow, then border, then panel.
+                            crate::render3d::draw_solid(
+                                gl,
+                                sprog,
+                                &mvp,
+                                [0.01, 0.015, 0.03, 1.0],
+                                (px0 - 6.0 * sc, py0 - 2.0 * sc + 12.0 * sc, pw + 12.0 * sc, ph + 8.0 * sc),
+                            );
                             crate::render3d::draw_solid(
                                 gl,
                                 sprog,
@@ -2038,40 +2119,132 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 [0.078, 0.094, 0.13, 1.0],
                                 (px0, py0, pw, ph),
                             );
+                            // Tab bar: active tab bracketed + underlined.
+                            // Names are left-aligned in their cell (no
+                            // centering pads: every pad char is a glyph
+                            // the atlas must survive).
+                            let tab_top = py0 + pad;
+                            let cell_w = pw / crate::menu::TABS.len() as f32;
+                            for (ti, name) in crate::menu::TABS.iter().enumerate() {
+                                let active = ti == menu.tab;
+                                let cell_text = if active {
+                                    format!("[{}]", name)
+                                } else {
+                                    format!(" {}", name)
+                                };
+                                let (tx, _) = to_px(
+                                    lay.x + crate::menu::PANEL_PAD
+                                        + ti as f64 * (lay.w / crate::menu::TABS.len() as f64),
+                                    0.0,
+                                );
+                                draw_menu_line(
+                                    gl, tprog, sprog, &mvp, atlas_id, tx,
+                                    tab_top + 7.0 * sc, sc, &cell_text,
+                                );
+                                if active {
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        sprog,
+                                        &mvp,
+                                        accent,
+                                        (
+                                            px0 + ti as f32 * cell_w + 8.0 * sc,
+                                            tab_top + row_h - 4.0 * sc,
+                                            cell_w - 16.0 * sc,
+                                            3.0 * sc,
+                                        ),
+                                    );
+                                }
+                            }
+                            // Option rows below the tab bar.
                             let mut item_idx = 0usize;
                             for (i, row) in rows.iter().enumerate() {
-                                let (_, rpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + i as f64 * crate::menu::ROW_H);
+                                let (_, rpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + (i + 1) as f64 * crate::menu::ROW_H);
+                                let rpy = rpy + slide_px;
                                 let ty = rpy + 7.0 * sc;
-                                match row {
-                                    crate::menu::Row::Header(label)
-                                    | crate::menu::Row::Foot(label) => {
-                                        draw_menu_line(
-                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, sc,
-                                            label,
-                                        );
-                                    }
-                                    crate::menu::Row::Item(it) => {
-                                        if item_idx == menu.selected {
-                                            crate::render3d::draw_solid(
-                                                gl,
-                                                sprog,
-                                                &mvp,
-                                                [0.14, 0.18, 0.30, 1.0],
-                                                (px0, rpy, pw, row_h),
-                                            );
-                                        }
-                                        let line = format!(
-                                            "{}{}",
-                                            it.label,
-                                            it.state_text(&settings)
-                                        );
-                                        draw_menu_line(
-                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, sc,
-                                            &line,
-                                        );
-                                        item_idx += 1;
-                                    }
+                                let crate::menu::Row::Item(it) = row else {
+                                    continue;
+                                };
+                                if item_idx == menu.selected {
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        sprog,
+                                        &mvp,
+                                        [0.13, 0.16, 0.26, 1.0],
+                                        (px0, rpy, pw, row_h),
+                                    );
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        sprog,
+                                        &mvp,
+                                        accent,
+                                        (px0, rpy, 4.0 * sc, row_h),
+                                    );
                                 }
+                                let line = format!(
+                                    "{}{}",
+                                    it.label,
+                                    it.state_text(&settings)
+                                );
+                                draw_menu_line(
+                                    gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, sc,
+                                    &line,
+                                );
+                                // Slider track + fill under the text.
+                                if let Some(fill) = it.slider_fill(&settings) {
+                                    let tw = 260.0 * sc;
+                                    let th = 5.0 * sc;
+                                    let tx0 = px0 + pad;
+                                    let ty0 = rpy + row_h - 9.0 * sc;
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        sprog,
+                                        &mvp,
+                                        [0.17, 0.22, 0.33, 1.0],
+                                        (tx0, ty0, tw, th),
+                                    );
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        sprog,
+                                        &mvp,
+                                        accent,
+                                        (tx0, ty0, tw * fill.clamp(0.0, 1.0), th),
+                                    );
+                                }
+                                // Live colour swatch, right-aligned.
+                                if let Some(rgb) = it.swatch.map(|f| f(&settings)) {
+                                    let sw = 20.0 * sc;
+                                    let sx = px0 + pw - pad - sw;
+                                    let sy = rpy + 5.0 * sc;
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        sprog,
+                                        &mvp,
+                                        [0.16, 0.21, 0.33, 1.0],
+                                        (sx - 2.0 * sc, sy - 2.0 * sc, sw + 4.0 * sc, sw + 4.0 * sc),
+                                    );
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        sprog,
+                                        &mvp,
+                                        [
+                                            rgb[0] as f32 / 255.0,
+                                            rgb[1] as f32 / 255.0,
+                                            rgb[2] as f32 / 255.0,
+                                            1.0,
+                                        ],
+                                        (sx, sy, sw, sw),
+                                    );
+                                }
+                                item_idx += 1;
+                            }
+                            // Feet under the rows.
+                            for (fi, foot) in feet.iter().enumerate() {
+                                let (_, fpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + (rows.len() + 1 + fi) as f64 * crate::menu::ROW_H);
+                                draw_menu_line(
+                                    gl, tprog, sprog, &mvp, atlas_id, px0 + pad,
+                                    fpy + slide_px + 7.0 * sc, sc, foot,
+                                );
                             }
                         });
                     }

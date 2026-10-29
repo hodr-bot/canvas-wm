@@ -1,27 +1,55 @@
 //! Shared user settings, edited through the Options menu.
 //!
 //! The menu owns the UI; this struct owns the values. Every frame the
-//! backend reads them (background animation, Super edge glow, dolly).
-//! Parameters nest in groups (Fond / Lueurs Super / Mode Super): each
-//! group is a header in `menu.rs`, each parameter one line of data
+//! backend reads them (wallpaper, waves, Super edge glow, dolly).
+//! Parameters nest in per-tab groups (Fond / Vagues / Lueurs / Super):
+//! each tab is a section in `menu.rs`, each parameter one line of data
 //! there. Adding a parameter = a field + default + accessor here, one
-//! `MenuItem` literal there. Choices are always 3 labelled levels with
-//! a numeric meaning (`CHOICE_VALUES`-style tables per parameter).
+//! `MenuItem` literal there. Continuous knobs are `u8` percents
+//! (0-100, RGB channels 0-255) mapped to shader ranges by accessors;
+//! small fixed sets stay 3-level `Choice`s with numeric tables below.
 
 /// Live user settings (Options menu).
 #[derive(Debug, Clone)]
 pub struct Settings {
-    // -- Fond d'écran --
+    // -- Fond d'écran (procedural wallpaper) --
     /// Animated ambient wallpaper (procedural shader). Off = flat clear.
     pub bg_anim: bool,
-    /// Background drift speed level: 0 Lente, 1 Normale, 2 Vive.
-    pub bg_speed: u8,
-    /// Halo intensity level: 0 Doux, 1 Moyen, 2 Fort.
-    pub bg_halo: u8,
+    /// Wallpaper motif: 0 Calme, 1 Dérive, 2 Nébuleuse.
+    pub bg_pattern: u8,
+    /// Motif scale percent (0 = tight, 100 = wide).
+    pub bg_scale: u8,
+    /// Drift speed percent (0 = frozen).
+    pub bg_drift: u8,
+    /// Film grain percent.
+    pub bg_grain: u8,
+    /// Vignette strength percent.
+    pub bg_vig: u8,
+    /// Base tint, exact RGB channels.
+    pub bg_tint: [u8; 3],
     /// Relief with zoom-out (depth darkening). Off = flat at any zoom.
     pub bg_depth: bool,
     /// Energy saver: freezes all motion and dims slightly.
     pub eco: bool,
+    // -- Vagues (procedural wave field over the wallpaper) --
+    /// Master switch for the wave field.
+    pub wave_on: bool,
+    /// Waveform: 0 Sinus, 1 Triangle, 2 Bruit.
+    pub wave_shape: u8,
+    /// Octave count percent mapped to 1-4.
+    pub wave_octaves: u8,
+    /// Spatial frequency percent.
+    pub wave_freq: u8,
+    /// Amplitude percent.
+    pub wave_amp: u8,
+    /// Travel speed percent (0 = frozen).
+    pub wave_speed: u8,
+    /// Travel direction percent mapped to a full turn.
+    pub wave_dir: u8,
+    /// Crest sharpness percent (sine soft .. ridged).
+    pub wave_crisp: u8,
+    /// Wave colour, exact RGB channels.
+    pub wave_col: [u8; 3],
     // -- Lueurs Super (edge glow in Canvas mode) --
     /// Master switch for the Super edge glow.
     pub glow_on: bool,
@@ -31,18 +59,23 @@ pub struct Settings {
     pub glow_flow: u8,
     /// Band width level: 0 Fines, 1 Moyennes, 2 Larges.
     pub glow_width: u8,
-    /// Palette level: 0 Mer, 1 Brume, 2 Mousse.
-    pub glow_hue: u8,
+    /// Deep glow colour, exact RGB channels.
+    pub glow_deep: [u8; 3],
+    /// Light glow colour, exact RGB channels.
+    pub glow_light: [u8; 3],
     // -- Mode Super --
     /// Dolly-back depth level: 0 Léger (5%), 1 Normal (10%), 2 Large (15%).
     pub dolly: u8,
+    /// Wallpaper dimming in Super mode, percent.
+    pub super_dim: u8,
 }
 
-/// Numeric meaning of the 3 speed levels (time multiplier).
-pub const BG_SPEED_VALUES: [f32; 3] = [0.35, 1.0, 2.0];
-/// Halo brightness multiplier per level.
-pub const BG_HALO_VALUES: [f32; 3] = [0.5, 1.0, 1.6];
-/// Glow brightness per level.
+/// Map a u8 percent to 0.0-1.0.
+fn pct(v: u8) -> f32 {
+    (v.min(100) as f32) / 100.0
+}
+
+/// Numeric meaning of the 3 glow-brightness levels.
 pub const GLOW_INTENSITY_VALUES: [f32; 3] = [0.35, 0.7, 1.2];
 /// Glow flow speed per level (own time multiplier).
 pub const GLOW_FLOW_VALUES: [f32; 3] = [0.4, 1.0, 2.2];
@@ -50,14 +83,6 @@ pub const GLOW_FLOW_VALUES: [f32; 3] = [0.4, 1.0, 2.2];
 pub const GLOW_WIDTH_VALUES: [f32; 3] = [0.06, 0.12, 0.20];
 /// Dolly-back factor per level (zoom multiplier on Super enter).
 pub const DOLLY_VALUES: [f64; 3] = [0.95, 0.90, 0.85];
-/// Glow palettes (deep colour, light colour) per hue level:
-/// Mer (teal), Brume (violet), Mousse (green). Dark and desaturated,
-/// ambience-grade — never neon.
-pub const GLOW_HUES: [([f32; 3], [f32; 3]); 3] = [
-    ([0.05, 0.35, 0.38], [0.20, 0.75, 0.70]),
-    ([0.25, 0.16, 0.42], [0.55, 0.42, 0.85]),
-    ([0.12, 0.32, 0.14], [0.35, 0.70, 0.32]),
-];
 
 /// Clamp a level to its 3 options (corrupt values can't escape).
 fn level(v: u8) -> usize {
@@ -68,33 +93,69 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             bg_anim: true,
-            bg_speed: 1,
-            bg_halo: 1,
+            bg_pattern: 1,
+            bg_scale: 50,
+            bg_drift: 50,
+            bg_grain: 20,
+            bg_vig: 60,
+            bg_tint: [15, 18, 26],
             bg_depth: true,
             eco: false,
+            wave_on: true,
+            wave_shape: 0,
+            wave_octaves: 50,
+            wave_freq: 40,
+            wave_amp: 35,
+            wave_speed: 50,
+            wave_dir: 15,
+            wave_crisp: 35,
+            wave_col: [32, 120, 112],
             glow_on: true,
             glow_intensity: 1,
             glow_flow: 1,
             glow_width: 1,
-            glow_hue: 0,
+            glow_deep: [13, 89, 97],
+            glow_light: [51, 191, 179],
             dolly: 1,
+            super_dim: 25,
         }
     }
 }
 
 impl Settings {
-    /// Background time scale (0 = frozen).
+    /// Wallpaper time scale (0 = frozen).
     pub fn bg_speed(&self) -> f32 {
         if !self.bg_anim || self.eco {
             0.0
         } else {
-            BG_SPEED_VALUES[level(self.bg_speed)]
+            pct(self.bg_drift) * 2.0
         }
     }
 
-    /// Halo brightness multiplier.
-    pub fn halo(&self) -> f32 {
-        BG_HALO_VALUES[level(self.bg_halo)]
+    /// Wallpaper motif selector (0 Calme, 1 Dérive, 2 Nébuleuse).
+    pub fn bg_pattern(&self) -> usize {
+        level(self.bg_pattern)
+    }
+
+    /// Motif scale (0.5 tight .. 2.0 wide).
+    pub fn bg_scale(&self) -> f32 {
+        0.5 + pct(self.bg_scale) * 1.5
+    }
+
+    /// Film grain amount (0 .. 0.15).
+    pub fn bg_grain(&self) -> f32 {
+        pct(self.bg_grain) * 0.15
+    }
+
+    /// Vignette strength (0 .. 1).
+    pub fn bg_vig(&self) -> f32 {
+        pct(self.bg_vig)
+    }
+
+    /// Base wallpaper tint (linear 0-1).
+    pub fn bg_tint(&self) -> [f32; 3] {
+        let c = self.bg_tint;
+        [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
     }
 
     /// Zoom depth on (1.0) or off (0.0) for the shader.
@@ -108,10 +169,11 @@ impl Settings {
 
     /// How often the background repaints while anything moves: a slow
     /// drift, never a hot loop. None = paint once (or never again).
-    /// The Super glow pulses on its own clock, so it holds frames in
-    /// Canvas mode even with the wallpaper frozen or off.
+    /// Waves and the Super glow pulse on their own clocks, so they
+    /// hold frames in Canvas mode even with the wallpaper frozen.
     pub fn bg_frame_interval(&self, glow_animating: bool) -> Option<std::time::Duration> {
-        if self.bg_speed() > 0.0 || glow_animating {
+        let waves_move = self.wave_on && !self.eco && self.wave_speed > 0;
+        if self.bg_speed() > 0.0 || waves_move || glow_animating {
             Some(std::time::Duration::from_millis(120))
         } else {
             None
@@ -125,6 +187,60 @@ impl Settings {
         } else {
             1.0
         }
+    }
+
+    /// Wallpaper dimming while in Super mode (1 = none).
+    pub fn super_dim(&self) -> f32 {
+        1.0 - pct(self.super_dim) * 0.5
+    }
+
+    /// Waveform selector (0 Sinus, 1 Triangle, 2 Bruit).
+    pub fn wave_shape(&self) -> usize {
+        level(self.wave_shape)
+    }
+
+    /// Wave octave count (1-4).
+    pub fn wave_octaves(&self) -> usize {
+        1 + ((self.wave_octaves.min(100) as usize) * 3) / 100
+    }
+
+    /// Wave spatial frequency (0.5 .. 5.5).
+    pub fn wave_freq(&self) -> f32 {
+        0.5 + pct(self.wave_freq) * 5.0
+    }
+
+    /// Wave amplitude (0 .. 0.6).
+    pub fn wave_amp(&self) -> f32 {
+        if !self.wave_on {
+            0.0
+        } else {
+            pct(self.wave_amp) * 0.6
+        }
+    }
+
+    /// Wave travel speed (0 = frozen, shares the eco freeze).
+    pub fn wave_speed(&self) -> f32 {
+        if self.eco {
+            0.0
+        } else {
+            pct(self.wave_speed) * 2.0
+        }
+    }
+
+    /// Wave travel direction, radians over a full turn.
+    pub fn wave_dir(&self) -> f32 {
+        pct(self.wave_dir) * std::f32::consts::TAU
+    }
+
+    /// Crest sharpness (0.5 soft .. 3.5 ridged).
+    pub fn wave_crisp(&self) -> f32 {
+        0.5 + pct(self.wave_crisp) * 3.0
+    }
+
+    /// Wave colour (linear 0-1).
+    pub fn wave_col(&self) -> [f32; 3] {
+        let c = self.wave_col;
+        [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
     }
 
     /// Glow brightness (0 when disabled: shader skips the band).
@@ -150,9 +266,14 @@ impl Settings {
         GLOW_WIDTH_VALUES[level(self.glow_width)]
     }
 
-    /// Glow palette (deep, light).
+    /// Glow palette (deep, light) from the exact RGB channels.
     pub fn glow_hue(&self) -> ([f32; 3], [f32; 3]) {
-        GLOW_HUES[level(self.glow_hue)]
+        let d = self.glow_deep;
+        let l = self.glow_light;
+        (
+            [d[0] as f32 / 255.0, d[1] as f32 / 255.0, d[2] as f32 / 255.0],
+            [l[0] as f32 / 255.0, l[1] as f32 / 255.0, l[2] as f32 / 255.0],
+        )
     }
 
     /// Super dolly-back factor.
@@ -166,12 +287,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_animate_with_glow_without_eco() {
+    fn defaults_animate_with_waves_and_glow_without_eco() {
         let s = Settings::default();
-        assert!(s.bg_anim && !s.eco && s.glow_on);
-        assert_eq!(s.bg_speed(), 1.0);
+        assert!(s.bg_anim && !s.eco && s.glow_on && s.wave_on);
+        assert!((s.bg_speed() - 1.0).abs() < 1e-6);
         assert!(s.bg_frame_interval(false).is_some());
         assert_eq!(s.dolly_factor(), 0.90);
+        assert_eq!(s.wave_octaves(), 2);
+        assert_eq!(s.bg_pattern(), 1);
     }
 
     #[test]
@@ -180,6 +303,7 @@ mod tests {
         s.eco = true;
         assert_eq!(s.bg_speed(), 0.0);
         assert_eq!(s.glow_flow(), 0.0);
+        assert_eq!(s.wave_speed(), 0.0);
         assert!(s.bg_frame_interval(false).is_none());
         assert!(s.bg_dim() < 1.0);
     }
@@ -188,6 +312,8 @@ mod tests {
     fn glow_holds_frames_with_wallpaper_off() {
         let mut s = Settings::default();
         s.bg_anim = false;
+        s.bg_drift = 0;
+        s.wave_on = false;
         // Frozen wallpaper alone: no frames...
         assert!(s.bg_frame_interval(false).is_none());
         // ...but a pulsing glow still needs its cadence.
@@ -195,14 +321,42 @@ mod tests {
     }
 
     #[test]
-    fn levels_clamp_and_map() {
+    fn waves_hold_frames_with_wallpaper_off() {
         let mut s = Settings::default();
-        s.bg_speed = 9;
-        s.glow_hue = 255;
-        assert_eq!(s.bg_speed(), 2.0);
+        s.bg_anim = false;
+        s.bg_drift = 0;
+        s.wave_on = true;
+        s.wave_speed = 60;
+        assert!(s.bg_frame_interval(false).is_some());
+        s.wave_speed = 0;
+        assert!(s.bg_frame_interval(false).is_none());
+    }
+
+    #[test]
+    fn mappings_span_their_ranges() {
+        let mut s = Settings::default();
+        s.bg_scale = 0;
+        assert!((s.bg_scale() - 0.5).abs() < 1e-6);
+        s.bg_scale = 100;
+        assert!((s.bg_scale() - 2.0).abs() < 1e-6);
+        s.wave_octaves = 0;
+        assert_eq!(s.wave_octaves(), 1);
+        s.wave_octaves = 100;
+        assert_eq!(s.wave_octaves(), 4);
+        s.wave_dir = 100;
+        assert!((s.wave_dir() - std::f32::consts::TAU).abs() < 1e-6);
+        s.wave_amp = 0;
+        assert_eq!(s.wave_amp(), 0.0);
+        // RGB channels map exactly.
+        s.glow_deep = [13, 89, 97];
         let (deep, _) = s.glow_hue();
-        assert!((deep[0] - 0.12).abs() < 1e-6);
-        s.dolly = 0;
-        assert_eq!(s.dolly_factor(), 0.95);
+        assert!((deep[0] - 13.0 / 255.0).abs() < 1e-6);
+        // Corrupt values can't escape.
+        s.bg_drift = 255;
+        assert!((s.bg_speed() - 2.0).abs() < 1e-6);
+        s.dolly = 9;
+        assert_eq!(s.dolly_factor(), 0.85);
+        s.wave_shape = 77;
+        assert_eq!(s.wave_shape(), 2);
     }
 }

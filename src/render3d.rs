@@ -351,6 +351,19 @@ uniform float dim;
 uniform float halo;
 uniform float depth_on;
 uniform float bgon;
+uniform float bg_pattern;
+uniform float bg_scale;
+uniform float bg_grain;
+uniform float bg_vig;
+uniform vec3 bg_tint;
+uniform float w_amp;
+uniform float w_shape;
+uniform float w_oct;
+uniform float w_freq;
+uniform float w_dir;
+uniform float w_crisp;
+uniform vec3 w_col;
+uniform float wt;
 uniform float glow;
 uniform vec3 gcol_a;
 uniform vec3 gcol_b;
@@ -377,15 +390,62 @@ float fbm(vec2 p) { return vnoise(p) * 0.55 + vnoise(p * 2.13) * 0.28 + vnoise(p
 void main() {
     float aspect = res.x / res.y;
     vec2 p = vec2(v_uv.x * aspect, v_uv.y);
+    vec2 q = p * bg_scale;
     float slow = t * 0.03;
-    float warp = fbm(p * 1.1 - slow * 0.3);
-    float n = fbm(p * 1.6 + vec2(slow * 0.7, slow * 0.4) + warp * 0.6);
+    // Motif: 0 Calme (flat + faint gradient), 1 Dérive (slow warp),
+    // 2 Nébuleuse (two-scale clouds). Branching on a uniform is fine.
+    float drift_n;
+    if (bg_pattern < 0.5) {
+        drift_n = (0.5 - v_uv.y) * 0.18 + (fbm(q * 0.8 + slow * 0.2) - 0.5) * 0.30;
+    } else if (bg_pattern < 1.5) {
+        float warp = fbm(q * 1.1 - slow * 0.3);
+        drift_n = fbm(q * 1.6 + vec2(slow * 0.7, slow * 0.4) + warp * 0.6) - 0.5;
+    } else {
+        float neb = fbm(q * 0.9 + vec2(-slow * 0.4, slow * 0.2));
+        float neb2 = fbm(q * 2.3 + vec2(slow * 0.5, -slow * 0.3) + neb);
+        drift_n = (neb * 0.6 + neb2 * 0.4 - 0.5) * 1.6;
+    }
     float depth = mix(1.0, clamp(0.35 + zoom * 0.65, 0.35, 1.0), depth_on);
-    vec3 base = vec3(0.060, 0.070, 0.100) * depth;
-    vec3 drift = vec3(0.070, 0.090, 0.140) * (n - 0.5) * 0.9 * halo * bgon;
+    vec3 base = bg_tint * depth;
+    vec3 drift_col = bg_tint * 1.2 + vec3(0.008, 0.010, 0.016);
+    vec3 col = base + drift_col * drift_n * 0.9 * halo * bgon;
+    // Procedural wave field: shaped octaves travelling along w_dir,
+    // crest-sharpened, brighter where it crests, breathing with wt.
+    if (w_amp > 0.001) {
+        vec2 wdir = vec2(cos(w_dir), sin(w_dir));
+        float s = dot(p, wdir) * w_freq;
+        float acc = 0.0;
+        float amp = 1.0;
+        float fr = 1.0;
+        float norm = 0.0;
+        for (int i = 0; i < 4; i++) {
+            if (float(i) < w_oct) {
+                float ph = s * fr + wt * (0.6 + 0.35 * float(i));
+                float o;
+                if (w_shape < 0.5) {
+                    o = sin(ph);
+                } else if (w_shape < 1.5) {
+                    o = asin(sin(ph)) * 0.6366;
+                } else {
+                    o = vnoise(vec2(ph * 0.5, wt * 0.25 + float(i) * 7.3)) * 2.0 - 1.0;
+                }
+                acc += o * amp;
+                norm += amp;
+                amp *= 0.55;
+                fr *= 2.03;
+            }
+        }
+        float w = acc / max(norm, 0.001);
+        w = sign(w) * pow(abs(w), w_crisp);
+        vec2 c2 = v_uv - 0.5;
+        float wveil = 1.0 - smoothstep(0.0, 0.85, length(c2));
+        col += w_col * (w * 0.5 + 0.5) * w_amp * mix(0.35, 1.0, wveil) * bgon;
+    }
+    // Film grain: per-pixel hash, strength from the menu.
+    col += (hash(v_uv * res) - 0.5) * bg_grain * bgon;
     vec2 c = v_uv - 0.5;
     float vig = 1.0 - smoothstep(0.25, 0.95, length(c * vec2(1.0, 0.85)));
-    vec3 col = (base + drift) * mix(0.45, 1.0, vig);
+    col *= mix(1.0, mix(0.45, 1.0, vig), bg_vig);
     // Super edge glow: aurora curtains, not flames — slow fbm flow
     // hugging the borders, strongest at the rim, breathing with time.
     // Uniform-gated (glow fades 0..1 with Canvas mode); zero cost
@@ -404,8 +464,10 @@ void main() {
 ";
 
 /// Compile the background program: uniform locations for the wallpaper
-/// (res, t, zoom, dim, halo, depth_on, bgon) and the Super edge glow
-/// (glow fade, palette, intensity, width, own clock).
+/// (res, t, zoom, dim, halo, depth_on, bgon, pattern, scale, grain,
+/// vignette, tint), the procedural wave field (amplitude, shape,
+/// octaves, frequency, direction, sharpness, colour, own clock) and
+/// the Super edge glow (glow fade, palette, intensity, width, clock).
 #[cfg(feature = "compositor")]
 #[derive(Debug, Clone, Copy)]
 pub struct BgProg {
@@ -417,6 +479,19 @@ pub struct BgProg {
     pub u_halo: i32,
     pub u_depth_on: i32,
     pub u_bgon: i32,
+    pub u_bg_pattern: i32,
+    pub u_bg_scale: i32,
+    pub u_bg_grain: i32,
+    pub u_bg_vig: i32,
+    pub u_bg_tint: i32,
+    pub u_w_amp: i32,
+    pub u_w_shape: i32,
+    pub u_w_oct: i32,
+    pub u_w_freq: i32,
+    pub u_w_dir: i32,
+    pub u_w_crisp: i32,
+    pub u_w_col: i32,
+    pub u_wt: i32,
     pub u_glow: i32,
     pub u_gcol_a: i32,
     pub u_gcol_b: i32,
@@ -457,6 +532,19 @@ pub fn compile_bg(gl: &ffi::Gles2) -> Result<BgProg, String> {
             u_halo: u("halo"),
             u_depth_on: u("depth_on"),
             u_bgon: u("bgon"),
+            u_bg_pattern: u("bg_pattern"),
+            u_bg_scale: u("bg_scale"),
+            u_bg_grain: u("bg_grain"),
+            u_bg_vig: u("bg_vig"),
+            u_bg_tint: u("bg_tint"),
+            u_w_amp: u("w_amp"),
+            u_w_shape: u("w_shape"),
+            u_w_oct: u("w_oct"),
+            u_w_freq: u("w_freq"),
+            u_w_dir: u("w_dir"),
+            u_w_crisp: u("w_crisp"),
+            u_w_col: u("w_col"),
+            u_wt: u("wt"),
             u_glow: u("glow"),
             u_gcol_a: u("gcol_a"),
             u_gcol_b: u("gcol_b"),
@@ -471,9 +559,10 @@ pub fn compile_bg(gl: &ffi::Gles2) -> Result<BgProg, String> {
 /// Draw the ambient background over the whole viewport (clip-space quad,
 /// opaque). `t` is wallpaper seconds * speed (frozen in eco), `halo`
 /// the drift brightness, `depth_on` the zoom relief, `bgon` the
-/// wallpaper master (0 = flat slate, glow still works), `glow` the
-/// Super fade 0..1, `gcol` the palette, `g_int`/`g_width` the band, `gt`
-/// the glow clock (own speed, eco-frozen).
+/// wallpaper master (0 = flat slate, glow still works), then the motif
+/// block (pattern, scale, grain, vignette, tint), the wave block
+/// (amplitude gating the field, shape, octaves, frequency, direction,
+/// sharpness, colour, own clock `wt`), then the Super glow block.
 #[cfg(feature = "compositor")]
 pub unsafe fn draw_bg(
     gl: &ffi::Gles2,
@@ -486,6 +575,19 @@ pub unsafe fn draw_bg(
     halo: f32,
     depth_on: f32,
     bgon: f32,
+    bg_pattern: f32,
+    bg_scale: f32,
+    bg_grain: f32,
+    bg_vig: f32,
+    bg_tint: [f32; 3],
+    w_amp: f32,
+    w_shape: f32,
+    w_oct: f32,
+    w_freq: f32,
+    w_dir: f32,
+    w_crisp: f32,
+    w_col: [f32; 3],
+    wt: f32,
     glow: f32,
     gcol_a: [f32; 3],
     gcol_b: [f32; 3],
@@ -503,6 +605,19 @@ pub unsafe fn draw_bg(
     gl.Uniform1f(p.u_halo, halo);
     gl.Uniform1f(p.u_depth_on, depth_on);
     gl.Uniform1f(p.u_bgon, bgon);
+    gl.Uniform1f(p.u_bg_pattern, bg_pattern);
+    gl.Uniform1f(p.u_bg_scale, bg_scale);
+    gl.Uniform1f(p.u_bg_grain, bg_grain);
+    gl.Uniform1f(p.u_bg_vig, bg_vig);
+    gl.Uniform3f(p.u_bg_tint, bg_tint[0], bg_tint[1], bg_tint[2]);
+    gl.Uniform1f(p.u_w_amp, w_amp);
+    gl.Uniform1f(p.u_w_shape, w_shape);
+    gl.Uniform1f(p.u_w_oct, w_oct);
+    gl.Uniform1f(p.u_w_freq, w_freq);
+    gl.Uniform1f(p.u_w_dir, w_dir);
+    gl.Uniform1f(p.u_w_crisp, w_crisp);
+    gl.Uniform3f(p.u_w_col, w_col[0], w_col[1], w_col[2]);
+    gl.Uniform1f(p.u_wt, wt);
     gl.Uniform1f(p.u_glow, glow);
     gl.Uniform3f(p.u_gcol_a, gcol_a[0], gcol_a[1], gcol_a[2]);
     gl.Uniform3f(p.u_gcol_b, gcol_b[0], gcol_b[1], gcol_b[2]);
@@ -654,10 +769,19 @@ mod tests {
         assert_eq!(px[cell(ax + 2, ay)], 255);
         assert_eq!(px[cell(ax + 2, ay) + 3], 255);
         assert_eq!(px[cell(ax + 0, ay) + 3], 0);
-        // Space cell (col 0, row 2) is fully blank.
+        // Space cell (col 0, row 2) is fully blank: every texel.
         let sx = 0;
         let sy = 2 * 8;
-        assert!(px[cell(sx, sy)..cell(sx, sy) + 4].iter().all(|&v| v == 0));
+        let mut lit = Vec::new();
+        for yy in 0..8u32 {
+            for xx in 0..8u32 {
+                let o = cell(sx + xx, sy + yy);
+                if px[o] != 0 || px[o + 3] != 0 {
+                    lit.push((xx, yy, px[o], px[o + 3]));
+                }
+            }
+        }
+        assert!(lit.is_empty(), "space cell not blank: {:?}", lit);
         // UVs stay inside the atlas.
         let (u0, v0, u1, v1) = glyph_uv(b'A');
         assert!(0.0 <= u0 && u0 < u1 && u1 <= 1.0);
