@@ -182,13 +182,18 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut tex_prog: Option<(u32, i32, i32, i32, u32, u32)> = None;
     // Options menu + user settings (Options menu edits these live).
     let mut settings = crate::settings::Settings::default();
+    session.super_dolly = settings.dolly_factor();
     let mut menu = crate::menu::MenuState::default();
     // Ambient background: compiled program, animation clock (seconds at
     // current speed; frozen in eco), and last repaint for the slow-drift
     // throttle. Off = flat clear, zero shader cost.
-    let mut bg_prog: Option<(u32, i32, i32, i32, i32, u32)> = None;
+    let mut bg_prog: Option<crate::render3d::BgProg> = None;
     let mut bg_failed = false;
     let mut bg_time: f32 = 0.0;
+    // Super edge-glow clocks: own flow time (eco-frozen like the
+    // wallpaper) plus a fade gliding with Canvas mode.
+    let mut glow_time: f32 = 0.0;
+    let mut glow_f: f32 = 0.0;
     let mut last_bg_paint = std::time::Instant::now();
     // Glyph atlas texture for menu text (uploaded once, 128x64 RGBA).
     let mut atlas_tex: Option<
@@ -375,12 +380,29 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 need_render = true;
                                 return;
                             }
+                            crate::menu::KEY_LEFT => {
+                                if let Some(id) = menu.adjust(-1, &mut settings) {
+                                    log::info!("menu option {} changed", id);
+                                }
+                                session.super_dolly = settings.dolly_factor();
+                                need_render = true;
+                                return;
+                            }
+                            crate::menu::KEY_RIGHT => {
+                                if let Some(id) = menu.adjust(1, &mut settings) {
+                                    log::info!("menu option {} changed", id);
+                                }
+                                session.super_dolly = settings.dolly_factor();
+                                need_render = true;
+                                return;
+                            }
                             crate::menu::KEY_ENTER => {
                                 if let Some(id) =
                                     crate::menu::MenuState::activate_at(menu.selected, &mut settings)
                                 {
-                                    log::info!("menu option {} toggled", id);
+                                    log::info!("menu option {} changed", id);
                                 }
+                                session.super_dolly = settings.dolly_factor();
                                 need_render = true;
                                 return;
                             }
@@ -848,8 +870,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     menu.selected,
                                     &mut settings,
                                 ) {
-                                    log::info!("menu option {} toggled", id);
+                                    log::info!("menu option {} changed", id);
                                 }
+                                session.super_dolly = settings.dolly_factor();
                             }
                             None => {
                                 menu.open = false;
@@ -1173,10 +1196,43 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Ambient background drift: a slow repaint cadence while animated
-        // (never a hot loop); eco or off = frozen, zero extra frames.
-        if settings.bg_frame_interval().is_some()
-            && last_bg_paint.elapsed() >= settings.bg_frame_interval().unwrap()
+        // FX clocks: wallpaper drift and glow flow advance by real
+        // elapsed time through their own speeds (eco freezes both);
+        // re-anchored when frozen so unpausing never jumps. The glow
+        // fade glides toward Canvas mode (eco never blocks the
+        // transition, only the flow) and holds frames while moving.
+        let fx_now = std::time::Instant::now();
+        let fx_dt = fx_now.duration_since(last_bg_paint).as_secs_f32();
+        if settings.bg_speed() > 0.0 {
+            bg_time += fx_dt * settings.bg_speed();
+        }
+        if settings.glow_flow() > 0.0 {
+            glow_time += fx_dt * settings.glow_flow();
+        }
+        last_bg_paint = fx_now;
+        let glow_target =
+            if session.state == crate::session::SuperState::Canvas
+                && settings.glow_intensity() > 0.0
+            {
+                1.0
+            } else {
+                0.0
+            };
+        let glow_step = 2.5 * fx_dt;
+        glow_f += (glow_target - glow_f).clamp(-glow_step, glow_step);
+        if (glow_f - glow_target).abs() < 0.002 {
+            glow_f = glow_target;
+        }
+        if glow_f != glow_target {
+            need_render = true;
+        }
+        let glow_animating = glow_f > 0.0 && settings.glow_flow() > 0.0;
+
+        // Ambient background drift: a slow repaint cadence while anything
+        // moves (wallpaper or Super glow); eco or all-off = frozen, zero
+        // extra frames.
+        if settings.bg_frame_interval(glow_animating).is_some()
+            && last_bg_paint.elapsed() >= settings.bg_frame_interval(glow_animating).unwrap()
         {
             need_render = true;
         }
@@ -1184,17 +1240,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         if need_render || frames == 0 || max_frames.is_some() {
             let scale = graphics.window_size().scale_factor;
             let color = background_color(&session.camera);
-            // Advance the background clock by real elapsed time whenever we
-            // paint it; otherwise re-anchor so unpausing never jumps.
-            let bg_now = std::time::Instant::now();
-            let mut bg_dt = 0.0f32;
-            if settings.bg_anim && settings.bg_speed() > 0.0 {
-                bg_dt = bg_now.duration_since(last_bg_paint).as_secs_f32() * settings.bg_speed();
-            }
-            last_bg_paint = bg_now;
-            bg_time += bg_dt;
             graphics.render(|renderer, frame| {
-                if settings.bg_anim {
+                if settings.bg_anim || glow_f > 0.0 {
                     if bg_prog.is_none() && !bg_failed {
                         match renderer.with_context(|_, gl| {
                             crate::render3d::compile_bg(gl)
@@ -1215,6 +1262,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     }
                     if let Some(prog) = bg_prog {
                         let sc = scale as f32;
+                        let (gcol_a, gcol_b) = settings.glow_hue();
                         let _ = renderer.with_context(|_, gl| unsafe {
                             crate::render3d::draw_bg(
                                 gl,
@@ -1224,6 +1272,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 bg_time,
                                 session.view_camera().zoom as f32,
                                 settings.bg_dim(),
+                                settings.halo(),
+                                settings.depth_on(),
+                                if settings.bg_anim { 1.0 } else { 0.0 },
+                                glow_f,
+                                gcol_a,
+                                gcol_b,
+                                settings.glow_intensity(),
+                                settings.glow_width(),
+                                glow_time,
                             );
                         });
                     } else if let Err(err) = frame.clear(color) {
@@ -1685,17 +1742,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                                 (px0, rpy, pw, row_h),
                                             );
                                         }
-                                        let state = match it.kind {
-                                            crate::menu::MenuKind::Toggle { is_on, .. } => {
-                                                if is_on(&settings) {
-                                                    " : Activé"
-                                                } else {
-                                                    " : Désactivé"
-                                                }
-                                            }
-                                            crate::menu::MenuKind::Info => "",
-                                        };
-                                        let line = format!("{}{}", it.label, state);
+                                        let line = format!(
+                                            "{}{}",
+                                            it.label,
+                                            it.state_text(&settings)
+                                        );
                                         draw_menu_line(
                                             gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, u,
                                             &line,

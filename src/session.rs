@@ -146,6 +146,10 @@ pub struct Session {
     /// glides to 90%, every quit path glides back here — the view
     /// never moves position on enter/quit, only breathes in zoom.
     pub prev_zoom: Option<f64>,
+    /// Super dolly-back factor, synced from Settings by the backend
+    /// (default 0.90 = Normal 10%). Enter multiplies the settled zoom
+    /// by this; keeps the "Recul" option logic in core, GL-free.
+    pub super_dolly: f64,
 }
 
 impl Session {
@@ -158,6 +162,7 @@ impl Session {
             dwell: DwellTracker::default(),
             prev_offset: None,
             prev_zoom: None,
+            super_dolly: 0.90,
         }
     }
 
@@ -233,7 +238,7 @@ impl Session {
                 // for clean taps; mid-glide it makes enter/quit idempotent
                 // and the spring superimposes the U-turn for free.
                 self.prev_zoom = Some(self.camera.zoom_target);
-                self.camera.zoom_to(self.camera.zoom_target * 0.9);
+                self.camera.zoom_to(self.camera.zoom_target * self.super_dolly);
                 self.overview.enter();
                 self.state = SuperState::Canvas;
                 self.dwell = DwellTracker::default();

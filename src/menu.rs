@@ -1,14 +1,17 @@
 //! Data-driven Options menu.
 //!
 //! Adding an option = one [`MenuItem`] literal in [`items()`] plus the
-//! setting it flips in `settings.rs`. No layout, input, or rendering
+//! field it reads in `settings.rs`. No layout, input, or rendering
 //! code changes: rows lay out top to bottom, navigation wraps, toggles
-//! flip through function pointers, and the backend draws whatever rows
-//! exist. Headers and footers are display-only.
+//! flip and choices cycle through function pointers, and the backend
+//! draws whatever rows exist via [`MenuItem::state_text`]. Headers and
+//! footers are display-only.
 //!
 //! Opened with the OS-standard Settings shortcuts, positional (evdev)
 //! so they hold on any layout: Super + physical comma (macOS Cmd+,),
-//! Super + physical I (Windows Win+I).
+//! Super + physical I (Windows Win+I). Inside: Up/Down moves, Left/Right
+//! adjusts, Enter flips/toggles-or-advances, click activates, Esc or
+//! outside click closes.
 
 use crate::settings::Settings;
 
@@ -19,6 +22,8 @@ pub const KEY_I: u32 = 23;
 /// Menu navigation keys (evdev, layout-independent).
 pub const KEY_UP: u32 = 103;
 pub const KEY_DOWN: u32 = 108;
+pub const KEY_LEFT: u32 = 105;
+pub const KEY_RIGHT: u32 = 106;
 pub const KEY_ENTER: u32 = 28;
 pub const KEY_ESC: u32 = 1;
 
@@ -88,7 +93,8 @@ pub fn accent_pixels(accent: Accent) -> &'static [(i32, i32)] {
     }
 }
 
-/// A menu option. `Toggle` reads/flips live settings; `Info` is static.
+/// A menu option. `Toggle` reads/flips a bool; `Choice` cycles one of
+/// three labelled levels; `Info` is static.
 pub struct MenuItem {
     pub id: &'static str,
     pub label: &'static str,
@@ -96,13 +102,38 @@ pub struct MenuItem {
     pub kind: MenuKind,
 }
 
-/// Toggle behaviour as function pointers so items stay plain data.
+/// Toggle/choice behaviour as function pointers so items stay plain data.
 pub enum MenuKind {
     Toggle {
         is_on: fn(&Settings) -> bool,
         set: fn(&mut Settings, bool),
     },
+    Choice {
+        get: fn(&Settings) -> usize,
+        set: fn(&mut Settings, usize),
+        options: [&'static str; 3],
+    },
     Info,
+}
+
+impl MenuItem {
+    /// Displayed value suffix, e.g. "Vitesse : Normale".
+    /// The backend draws `label + state_text`, no per-kind code there.
+    pub fn state_text(&self, settings: &Settings) -> String {
+        match &self.kind {
+            MenuKind::Toggle { is_on, .. } => {
+                if is_on(settings) {
+                    " : Activé".to_string()
+                } else {
+                    " : Désactivé".to_string()
+                }
+            }
+            MenuKind::Choice { get, options, .. } => {
+                format!(" : {}", options[get(settings).min(2)])
+            }
+            MenuKind::Info => String::new(),
+        }
+    }
 }
 
 /// A display row: headers/feet are static, items are selectable.
@@ -112,48 +143,153 @@ pub enum Row {
     Foot(&'static str),
 }
 
-/// The whole menu, in order. Sections group toggles; feet document
-/// shortcuts. All labels stay ASCII + composed French accents.
+/// Shorthand for a bool row.
+fn tog(
+    id: &'static str,
+    label: &'static str,
+    help: &'static str,
+    is_on: fn(&Settings) -> bool,
+    set: fn(&mut Settings, bool),
+) -> Row {
+    Row::Item(MenuItem {
+        id,
+        label,
+        help,
+        kind: MenuKind::Toggle { is_on, set },
+    })
+}
+
+/// Shorthand for a 3-level choice row.
+fn choice(
+    id: &'static str,
+    label: &'static str,
+    help: &'static str,
+    get: fn(&Settings) -> usize,
+    set: fn(&mut Settings, usize),
+    options: [&'static str; 3],
+) -> Row {
+    Row::Item(MenuItem {
+        id,
+        label,
+        help,
+        kind: MenuKind::Choice { get, set, options },
+    })
+}
+
+/// The whole menu, in order. Groups nest parameters: Fond d'écran (the
+/// wallpaper), Lueurs Super (the Canvas-mode edge glow), Mode Super
+/// (the dolly), Énergie (global freeze). All labels stay ASCII +
+/// composed French accents (see the font-coverage test).
 pub fn items() -> Vec<Row> {
     vec![
-        Row::Header("Affichage"),
-        Row::Item(MenuItem {
-            id: "bg_anim",
-            label: "Fond d'écran animé",
-            help: "Shader d'ambiance lent",
-            kind: MenuKind::Toggle {
-                is_on: |s: &Settings| s.bg_anim,
-                set: |s: &mut Settings, v| s.bg_anim = v,
-            },
-        }),
-        Row::Item(MenuItem {
-            id: "bg_slow",
-            label: "Mouvement lent",
-            help: "Vitesse réduite",
-            kind: MenuKind::Toggle {
-                is_on: |s: &Settings| s.bg_slow,
-                set: |s: &mut Settings, v| s.bg_slow = v,
-            },
-        }),
+        Row::Header("Fond d'écran"),
+        tog(
+            "bg_anim",
+            "Fond animé",
+            "Shader d'ambiance",
+            |s: &Settings| s.bg_anim,
+            |s: &mut Settings, v| s.bg_anim = v,
+        ),
+        choice(
+            "bg_speed",
+            "Vitesse",
+            "Dérive du fond",
+            |s: &Settings| (s.bg_speed.min(2)) as usize,
+            |s: &mut Settings, v| s.bg_speed = (v.min(2)) as u8,
+            ["Lente", "Normale", "Vive"],
+        ),
+        choice(
+            "bg_halo",
+            "Halo",
+            "Nappes de lumière",
+            |s: &Settings| (s.bg_halo.min(2)) as usize,
+            |s: &mut Settings, v| s.bg_halo = (v.min(2)) as u8,
+            ["Doux", "Moyen", "Fort"],
+        ),
+        tog(
+            "bg_depth",
+            "Relief au zoom",
+            "S'assombrit en reculant",
+            |s: &Settings| s.bg_depth,
+            |s: &mut Settings, v| s.bg_depth = v,
+        ),
+        Row::Header("Lueurs Super"),
+        tog(
+            "glow_on",
+            "Lueurs de bord",
+            "Aurore en mode Super",
+            |s: &Settings| s.glow_on,
+            |s: &mut Settings, v| s.glow_on = v,
+        ),
+        choice(
+            "glow_intensity",
+            "Intensité",
+            "Éclat des lueurs",
+            |s: &Settings| (s.glow_intensity.min(2)) as usize,
+            |s: &mut Settings, v| s.glow_intensity = (v.min(2)) as u8,
+            ["Douces", "Moyennes", "Vives"],
+        ),
+        choice(
+            "glow_flow",
+            "Flux",
+            "Coulée des lueurs",
+            |s: &Settings| (s.glow_flow.min(2)) as usize,
+            |s: &mut Settings, v| s.glow_flow = (v.min(2)) as u8,
+            ["Lent", "Normal", "Vif"],
+        ),
+        choice(
+            "glow_width",
+            "Largeur",
+            "Bande lumineuse",
+            |s: &Settings| (s.glow_width.min(2)) as usize,
+            |s: &mut Settings, v| s.glow_width = (v.min(2)) as u8,
+            ["Fine", "Moyenne", "Large"],
+        ),
+        choice(
+            "glow_hue",
+            "Teinte",
+            "Palette des lueurs",
+            |s: &Settings| (s.glow_hue.min(2)) as usize,
+            |s: &mut Settings, v| s.glow_hue = (v.min(2)) as u8,
+            ["Mer", "Brume", "Mousse"],
+        ),
+        Row::Header("Mode Super"),
+        choice(
+            "dolly",
+            "Recul",
+            "Zoom arrière en Super",
+            |s: &Settings| (s.dolly.min(2)) as usize,
+            |s: &mut Settings, v| s.dolly = (v.min(2)) as u8,
+            ["Léger 5%", "Normal 10%", "Large 15%"],
+        ),
         Row::Header("Énergie"),
-        Row::Item(MenuItem {
-            id: "eco",
-            label: "Économie d'énergie",
-            help: "Fige le fond, assombrit",
-            kind: MenuKind::Toggle {
-                is_on: |s: &Settings| s.eco,
-                set: |s: &mut Settings, v| s.eco = v,
-            },
-        }),
+        tog(
+            "eco",
+            "Économie d'énergie",
+            "Fige tout, assombrit",
+            |s: &Settings| s.eco,
+            |s: &mut Settings, v| s.eco = v,
+        ),
         Row::Foot("canvas-wm 0.1.0"),
-        Row::Foot("Super+, / Super+I : menu"),
-        Row::Foot("Echap : fermer"),
+        Row::Foot("Haut/Bas : choisir, Gauche/Droite : régler"),
+        Row::Foot("Entrée : changer, Echap : fermer"),
     ]
 }
 
 /// Number of selectable items.
 pub fn item_count() -> usize {
     items().iter().filter(|r| matches!(r, Row::Item(_))).count()
+}
+
+/// The selectable items in order (index space for cursor/hit-test).
+fn item_list() -> Vec<MenuItem> {
+    items()
+        .into_iter()
+        .filter_map(|r| match r {
+            Row::Item(it) => Some(it),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Open/close + selection cursor. Navigation wraps around.
@@ -183,28 +319,44 @@ impl MenuState {
     /// The currently selected item, if any.
     pub fn selected_item(&self) -> Option<MenuItem> {
         // Index into the item subsequence, not the row list.
-        items()
-            .into_iter()
-            .filter_map(|r| match r {
-                Row::Item(it) => Some(it),
-                _ => None,
-            })
-            .nth(self.selected)
+        item_list().into_iter().nth(self.selected)
     }
 
-    /// Flip the selected toggle. Returns the item id for logging.
+    /// Nudge the selected row: choices cycle (wraps both ways),
+    /// toggles set explicitly (Right = on, Left = off). Returns the
+    /// item id for logging.
+    pub fn adjust(&mut self, dir: i8, settings: &mut Settings) -> Option<&'static str> {
+        let item = item_list().into_iter().nth(self.selected)?;
+        match item.kind {
+            MenuKind::Toggle { is_on, set } => {
+                let want = dir > 0;
+                if is_on(settings) != want {
+                    set(settings, want);
+                }
+                Some(item.id)
+            }
+            MenuKind::Choice { get, set, options } => {
+                let n = options.len() as i8;
+                let next = (((get(settings) as i8 + dir) % n) + n) % n;
+                set(settings, next as usize);
+                Some(item.id)
+            }
+            MenuKind::Info => Some(item.id),
+        }
+    }
+
+    /// Activate the selected row: toggles flip, choices advance (wrap).
+    /// Returns the item id for logging.
     pub fn activate_at(cursor: usize, settings: &mut Settings) -> Option<&'static str> {
-        let item = items()
-            .into_iter()
-            .filter_map(|r| match r {
-                Row::Item(it) => Some(it),
-                _ => None,
-            })
-            .nth(cursor)?;
+        let item = item_list().into_iter().nth(cursor)?;
         match item.kind {
             MenuKind::Toggle { is_on, set } => {
                 let on = is_on(settings);
                 set(settings, !on);
+                Some(item.id)
+            }
+            MenuKind::Choice { get, set, options } => {
+                set(settings, (get(settings) + 1) % options.len());
                 Some(item.id)
             }
             MenuKind::Info => Some(item.id),
@@ -225,7 +377,8 @@ pub struct Layout {
 
 /// Row height in canvas px (text drawn at 2x scale: 16px cells).
 pub const ROW_H: f64 = 30.0;
-pub const PANEL_W: f64 = 600.0;
+/// Panel width fits the longest footer (42 chars at 16px + padding).
+pub const PANEL_W: f64 = 740.0;
 pub const PANEL_PAD: f64 = 24.0;
 
 pub fn layout(_view_w: f64, _view_h: f64, center_x: f64, center_y: f64) -> Layout {
@@ -281,7 +434,7 @@ mod tests {
     #[test]
     fn nav_wraps_both_ways() {
         let n = item_count();
-        assert!(n >= 3);
+        assert_eq!(n, 11);
         let mut m = MenuState::default();
         m.up();
         assert_eq!(m.selected, n - 1);
@@ -290,16 +443,78 @@ mod tests {
     }
 
     #[test]
-    fn activate_flips_toggle_and_reports_id() {
+    fn activate_flips_toggle_and_advances_choice() {
         let mut s = Settings::default();
         assert!(s.bg_anim);
         let id = MenuState::activate_at(0, &mut s);
         assert_eq!(id, Some("bg_anim"));
         assert!(!s.bg_anim);
-        // Second item is bg_slow (off by default).
+        // Item 1 is the bg_speed choice (default Normale = 1).
         let id = MenuState::activate_at(1, &mut s);
-        assert_eq!(id, Some("bg_slow"));
-        assert!(s.bg_slow);
+        assert_eq!(id, Some("bg_speed"));
+        assert_eq!(s.bg_speed, 2);
+        let id = MenuState::activate_at(1, &mut s);
+        assert_eq!(id, Some("bg_speed"));
+        assert_eq!(s.bg_speed, 0);
+        // Item 1 now reads " : Lente".
+        let mut m = MenuState::default();
+        m.selected = 1;
+        assert_eq!(
+            m.selected_item().unwrap().state_text(&s),
+            " : Lente".to_string()
+        );
+    }
+
+    #[test]
+    fn adjust_cycles_choices_and_sets_toggles() {
+        let mut s = Settings::default();
+        let mut m = MenuState::default();
+        m.selected = 8; // glow_hue (default Mer = 0).
+        assert_eq!(m.adjust(-1, &mut s), Some("glow_hue"));
+        assert_eq!(s.glow_hue, 2); // wraps to Mousse.
+        assert_eq!(m.adjust(1, &mut s), Some("glow_hue"));
+        assert_eq!(s.glow_hue, 0);
+        m.selected = 0; // bg_anim toggle.
+        m.adjust(-1, &mut s);
+        assert!(!s.bg_anim);
+        m.adjust(1, &mut s);
+        assert!(s.bg_anim);
+    }
+
+    /// Every string the menu can draw must survive the 8x8 font: no
+    /// '?' fallbacks anywhere (labels, helps, options, headers, feet,
+    /// value suffixes). Accents compose; anything else is a bug.
+    #[test]
+    fn every_menu_string_survives_the_font() {
+        let s = Settings::default();
+        let mut strings: Vec<String> = Vec::new();
+        for r in items() {
+            match r {
+                Row::Header(t) | Row::Foot(t) => strings.push(t.to_string()),
+                Row::Item(it) => {
+                    strings.push(it.label.to_string());
+                    strings.push(it.help.to_string());
+                    strings.push(it.state_text(&s));
+                    if let MenuKind::Choice { options, .. } = it.kind {
+                        for o in options {
+                            strings.push(format!(" : {}", o));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!strings.is_empty());
+        for text in &strings {
+            for ch in text.chars() {
+                let cell = cell_for(ch);
+                assert!(
+                    cell.byte != b'?',
+                    "unrenderable char {:?} in {:?}",
+                    ch,
+                    text
+                );
+            }
+        }
     }
 
     #[test]
@@ -331,13 +546,16 @@ mod tests {
 
     #[test]
     fn hit_test_skips_headers_and_misses_outside() {
-        // Rows: 0 header, 1 item0, 2 item1, 3 header, 4 item2, 5-7 feet.
+        // Rows: 0 header, 1-4 items 0-3, 5 header, 6-10 items 4-8,
+        // 11 header, 12 item 9, 13 header, 14 item 10, 15-17 feet.
         let l = layout(1280.0, 800.0, 0.0, 0.0);
         let row_y = |r: usize| l.y + PANEL_PAD + r as f64 * ROW_H + 4.0;
         assert_eq!(item_at(&l, l.x + 10.0, row_y(0)), None);
         assert_eq!(item_at(&l, l.x + 10.0, row_y(1)), Some(0));
-        assert_eq!(item_at(&l, l.x + 10.0, row_y(4)), Some(2));
-        assert_eq!(item_at(&l, l.x + 10.0, row_y(6)), None);
+        assert_eq!(item_at(&l, l.x + 10.0, row_y(6)), Some(4));
+        assert_eq!(item_at(&l, l.x + 10.0, row_y(12)), Some(9));
+        assert_eq!(item_at(&l, l.x + 10.0, row_y(14)), Some(10));
+        assert_eq!(item_at(&l, l.x + 10.0, row_y(16)), None);
         assert_eq!(item_at(&l, l.x - 5.0, row_y(1)), None);
     }
 }

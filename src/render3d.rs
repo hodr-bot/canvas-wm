@@ -348,6 +348,15 @@ uniform vec2 res;
 uniform float t;
 uniform float zoom;
 uniform float dim;
+uniform float halo;
+uniform float depth_on;
+uniform float bgon;
+uniform float glow;
+uniform vec3 gcol_a;
+uniform vec3 gcol_b;
+uniform float g_int;
+uniform float g_width;
+uniform float gt;
 varying vec2 v_uv;
 // Precision-safe hash (no sin/fract-of-huge: mediump overflows the
 // classic sin(dot)*43758 past ~65504 and returns black). Hoskins
@@ -371,19 +380,54 @@ void main() {
     float slow = t * 0.03;
     float warp = fbm(p * 1.1 - slow * 0.3);
     float n = fbm(p * 1.6 + vec2(slow * 0.7, slow * 0.4) + warp * 0.6);
-    float depth = clamp(0.35 + zoom * 0.65, 0.35, 1.0);
+    float depth = mix(1.0, clamp(0.35 + zoom * 0.65, 0.35, 1.0), depth_on);
     vec3 base = vec3(0.060, 0.070, 0.100) * depth;
-    vec3 glow = vec3(0.070, 0.090, 0.140) * (n - 0.5) * 0.9;
+    vec3 drift = vec3(0.070, 0.090, 0.140) * (n - 0.5) * 0.9 * halo * bgon;
     vec2 c = v_uv - 0.5;
     float vig = 1.0 - smoothstep(0.25, 0.95, length(c * vec2(1.0, 0.85)));
-    vec3 col = (base + glow) * mix(0.45, 1.0, vig);
+    vec3 col = (base + drift) * mix(0.45, 1.0, vig);
+    // Super edge glow: aurora curtains, not flames — slow fbm flow
+    // hugging the borders, strongest at the rim, breathing with time.
+    // Uniform-gated (glow fades 0..1 with Canvas mode); zero cost
+    // concern when off: the band term is exactly 0 outside its width.
+    vec2 e = min(v_uv, 1.0 - v_uv);
+    float rim = min(e.x * aspect, e.y);
+    float band = 1.0 - smoothstep(0.0, g_width, rim);
+    float flow = gt * 0.05;
+    float curtain = fbm(vec2((v_uv.x + v_uv.y) * 2.0 + flow, flow * 0.6));
+    float curtain2 = fbm(vec2((v_uv.x - v_uv.y) * 3.0 - flow * 0.7, flow * 0.4 + 7.3));
+    float veil = band * (0.30 + 0.70 * curtain * curtain2 * 2.2);
+    vec3 gcol = mix(gcol_a, gcol_b, curtain);
+    col += gcol * veil * g_int * glow * 0.35;
     gl_FragColor = vec4(col * dim, 1.0);
 }
 ";
 
-/// Compile the background program: (program, u_res, u_t, u_zoom, u_dim, a_pos).
+/// Compile the background program: uniform locations for the wallpaper
+/// (res, t, zoom, dim, halo, depth_on, bgon) and the Super edge glow
+/// (glow fade, palette, intensity, width, own clock).
 #[cfg(feature = "compositor")]
-pub fn compile_bg(gl: &ffi::Gles2) -> Result<(u32, i32, i32, i32, i32, u32), String> {
+#[derive(Debug, Clone, Copy)]
+pub struct BgProg {
+    pub program: u32,
+    pub u_res: i32,
+    pub u_t: i32,
+    pub u_zoom: i32,
+    pub u_dim: i32,
+    pub u_halo: i32,
+    pub u_depth_on: i32,
+    pub u_bgon: i32,
+    pub u_glow: i32,
+    pub u_gcol_a: i32,
+    pub u_gcol_b: i32,
+    pub u_g_int: i32,
+    pub u_g_width: i32,
+    pub u_gt: i32,
+    pub a_pos: u32,
+}
+
+#[cfg(feature = "compositor")]
+pub fn compile_bg(gl: &ffi::Gles2) -> Result<BgProg, String> {
     let c = |s: &str| CString::new(s).unwrap();
     unsafe {
         let vert = compile(gl, ffi::VERTEX_SHADER, VERT_BG_SRC)?;
@@ -402,41 +446,75 @@ pub fn compile_bg(gl: &ffi::Gles2) -> Result<(u32, i32, i32, i32, i32, u32), Str
             gl.DeleteProgram(program);
             return Err("background program link failed".into());
         }
-        let res = gl.GetUniformLocation(program, c("res").as_ptr() as *const _);
-        let t = gl.GetUniformLocation(program, c("t").as_ptr() as *const _);
-        let zoom = gl.GetUniformLocation(program, c("zoom").as_ptr() as *const _);
-        let dim = gl.GetUniformLocation(program, c("dim").as_ptr() as *const _);
+        let u = |name: &str| gl.GetUniformLocation(program, c(name).as_ptr() as *const _);
         let pos = gl.GetAttribLocation(program, c("position").as_ptr() as *const _) as u32;
-        Ok((program, res, t, zoom, dim, pos))
+        Ok(BgProg {
+            program,
+            u_res: u("res"),
+            u_t: u("t"),
+            u_zoom: u("zoom"),
+            u_dim: u("dim"),
+            u_halo: u("halo"),
+            u_depth_on: u("depth_on"),
+            u_bgon: u("bgon"),
+            u_glow: u("glow"),
+            u_gcol_a: u("gcol_a"),
+            u_gcol_b: u("gcol_b"),
+            u_g_int: u("g_int"),
+            u_g_width: u("g_width"),
+            u_gt: u("gt"),
+            a_pos: pos,
+        })
     }
 }
 
 /// Draw the ambient background over the whole viewport (clip-space quad,
-/// opaque). `t` is seconds * speed (frozen in eco), `zoom` the camera
-/// zoom for depth, `dim` the eco dimmer.
+/// opaque). `t` is wallpaper seconds * speed (frozen in eco), `halo`
+/// the drift brightness, `depth_on` the zoom relief, `bgon` the
+/// wallpaper master (0 = flat slate, glow still works), `glow` the
+/// Super fade 0..1, `gcol` the palette, `g_int`/`g_width` the band, `gt`
+/// the glow clock (own speed, eco-frozen).
 #[cfg(feature = "compositor")]
 pub unsafe fn draw_bg(
     gl: &ffi::Gles2,
-    prog: (u32, i32, i32, i32, i32, u32),
+    prog: BgProg,
     w_px: f32,
     h_px: f32,
     t: f32,
     zoom: f32,
     dim: f32,
+    halo: f32,
+    depth_on: f32,
+    bgon: f32,
+    glow: f32,
+    gcol_a: [f32; 3],
+    gcol_b: [f32; 3],
+    g_int: f32,
+    g_width: f32,
+    gt: f32,
 ) {
-    let (program, u_res, u_t, u_zoom, u_dim, a_pos) = prog;
+    let p = prog;
     gl.Disable(ffi::SCISSOR_TEST);
-    gl.UseProgram(program);
-    gl.Uniform2f(u_res, w_px, h_px);
-    gl.Uniform1f(u_t, t);
-    gl.Uniform1f(u_zoom, zoom);
-    gl.Uniform1f(u_dim, dim);
+    gl.UseProgram(p.program);
+    gl.Uniform2f(p.u_res, w_px, h_px);
+    gl.Uniform1f(p.u_t, t);
+    gl.Uniform1f(p.u_zoom, zoom);
+    gl.Uniform1f(p.u_dim, dim);
+    gl.Uniform1f(p.u_halo, halo);
+    gl.Uniform1f(p.u_depth_on, depth_on);
+    gl.Uniform1f(p.u_bgon, bgon);
+    gl.Uniform1f(p.u_glow, glow);
+    gl.Uniform3f(p.u_gcol_a, gcol_a[0], gcol_a[1], gcol_a[2]);
+    gl.Uniform3f(p.u_gcol_b, gcol_b[0], gcol_b[1], gcol_b[2]);
+    gl.Uniform1f(p.u_g_int, g_int);
+    gl.Uniform1f(p.u_g_width, g_width);
+    gl.Uniform1f(p.u_gt, gt);
     // Fullscreen triangle strip in clip space.
     let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
-    gl.EnableVertexAttribArray(a_pos);
-    gl.VertexAttribPointer(a_pos, 2, ffi::FLOAT, ffi::FALSE as u8, 0, verts.as_ptr() as *const _);
+    gl.EnableVertexAttribArray(p.a_pos);
+    gl.VertexAttribPointer(p.a_pos, 2, ffi::FLOAT, ffi::FALSE as u8, 0, verts.as_ptr() as *const _);
     gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
-    gl.DisableVertexAttribArray(a_pos);
+    gl.DisableVertexAttribArray(p.a_pos);
     gl.UseProgram(0);
     gl.Enable(ffi::SCISSOR_TEST);
 }
