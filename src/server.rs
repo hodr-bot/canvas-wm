@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use smithay::backend::allocator::Format as DmaFormat;
 use smithay::backend::input::KeyState;
 use smithay::backend::renderer::gles2::Gles2Texture;
 use smithay::reexports::wayland_protocols::unstable::xdg_shell::v6::server::zxdg_shell_v6::ZxdgShellV6;
@@ -28,6 +29,7 @@ use smithay::reexports::wayland_server::{Display, Global};
 use slog::Drain as _;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::compositor_init;
+use smithay::wayland::dmabuf::init_dmabuf_global;
 use smithay::wayland::seat::{AxisFrame, KeyboardHandle, PointerHandle, Seat, XkbConfig};
 use smithay::wayland::shell::xdg::{xdg_shell_init, ShellState, XdgRequest};
 use smithay::wayland::shm::init_shm_global;
@@ -388,6 +390,11 @@ pub struct Server {
     _compositor: Global<WlCompositor>,
     _subcompositor: Global<WlSubcompositor>,
     _shm: Global<wl_shm::WlShm>,
+    /// GPU buffer sharing for GL clients (Kate, Alacritty). Without this
+    /// global they cannot present a single frame; keep it alive forever.
+    _dmabuf: Global<
+        smithay::reexports::wayland_protocols::unstable::linux_dmabuf::v1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    >,
     _shell_state: Arc<Mutex<ShellState>>,
     _xdg: Global<XdgWmBase>,
     _zxdg: Global<ZxdgShellV6>,
@@ -419,6 +426,8 @@ pub struct Server {
     /// Last pointer location + focus, for drag-grab start data.
     last_pointer: (f64, f64),
     last_focus: Option<(WlSurface, (i32, i32))>,
+    /// Last keyboard-focus surface id, to log real focus changes.
+    last_kbd: Option<u32>,
     _seat: Seat,
     _seat_global: Global<smithay::reexports::wayland_server::protocol::wl_seat::WlSeat>,
     /// Single wl_output v4 (Smithay's advertises v3, which mako refuses).
@@ -432,7 +441,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> io::Result<(Self, OsString)> {
+    /// Formats come from the real renderer (queried before this call so
+    /// the dmabuf global advertises exactly what the driver imports).
+    /// Pass an empty vec in tests: the global is still announced.
+    pub fn new(dmabuf_formats: Vec<DmaFormat>) -> io::Result<(Self, OsString)> {
         let display = Rc::new(RefCell::new(Display::new()));
         // Reserve serial 0: some toolkits (Qt) ignore a first configure
         // carrying serial 0 and wait forever for a real one.
@@ -451,6 +463,25 @@ impl Server {
         let shm = init_shm_global(
             &mut display.borrow_mut(),
             vec![wl_shm::Format::Argb8888, wl_shm::Format::Xrgb8888],
+            None,
+        );
+        // GPU buffers (dmabuf): GL toolkits need this to present. Accept
+        // any format the renderer listed; the real driver check happens
+        // at import time in the backend (clean warning, never a crash).
+        let known = dmabuf_formats.clone();
+        log::info!("dmabuf global: {} formats", known.len());
+        let dmabuf = init_dmabuf_global(
+            &mut display.borrow_mut(),
+            dmabuf_formats,
+            move |dmabuf, _| {
+                use smithay::backend::allocator::Buffer as _;
+                let code = smithay::backend::allocator::Buffer::format(dmabuf).code;
+                let ok = known.iter().any(|f| f.code == code);
+                if !ok {
+                    log::warn!("dmabuf format {:?} not advertised, refused", code);
+                }
+                ok
+            },
             None,
         );
         let (shell_state, xdg, zxdg) = xdg_shell_init(
@@ -506,6 +537,7 @@ impl Server {
                 _compositor: compositor,
                 _subcompositor: subcompositor,
                 _shm: shm,
+                _dmabuf: dmabuf,
                 _shell_state: shell_state,
                 _xdg: xdg,
                 _zxdg: zxdg,
@@ -521,6 +553,7 @@ impl Server {
                 last_press: None,
                 last_pointer: (0.0, 0.0),
                 last_focus: None,
+                last_kbd: None,
                 _seat: seat,
                 _seat_global: seat_global,
                 _output_global: output_global,
@@ -577,6 +610,11 @@ impl Server {
     /// window set changes, so late-bound clients also receive Enter.
     pub fn focus_keyboard(&mut self, surface: Option<&WlSurface>) {
         let serial = self.next_serial();
+        let new = surface.map(|s| s.as_ref().id());
+        if self.last_kbd != new {
+            log::info!("kbd focus {:?} -> {:?}", self.last_kbd, new);
+            self.last_kbd = new;
+        }
         self.keyboard.set_focus(surface, serial);
         // Selection offers must follow keyboard focus for copy/paste.
         self.focus_data_device(surface);
@@ -896,7 +934,7 @@ mod seat_tests {
     #[test]
     fn seat_forwards_key_and_pointer_to_focused_window() {
         std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir());
-        let (mut server, socket) = Server::new().expect("server");
+        let (mut server, socket) = Server::new(vec![]).expect("server");
         let socket_name = socket.to_str().expect("socket name").to_owned();
         let mut state = ServerState::default();
 

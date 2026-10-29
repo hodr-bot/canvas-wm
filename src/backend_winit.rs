@@ -17,10 +17,12 @@ use smithay::backend::{
         KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
         PointerMotionAbsoluteEvent,
     },
-    renderer::{buffer_type, BufferType, Frame, ImportShm, Texture, Transform},
+    renderer::{buffer_type, BufferType, Frame, ImportDma, ImportShm, Texture, Transform},
     winit::{self, WinitEvent, WinitInputError},
 };
+use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer as BufferDims};
 use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis as WlAxis, AxisSource};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size};
@@ -171,6 +173,23 @@ unsafe fn draw_menu_line(
     }
 }
 
+/// Buffer size whatever the sharing mode: shm via its contents, dmabuf
+/// via its handle. None for anything else (never imported, never drawn,
+/// so exotic buffers warn once instead of breaking the frame).
+fn client_buffer_size(buffer: &WlBuffer) -> Option<(i32, i32)> {
+    match buffer_type(buffer) {
+        Some(BufferType::Shm) => {
+            with_buffer_contents(buffer, |_, data| (data.width, data.height)).ok()
+        }
+        Some(BufferType::Dma) => buffer
+            .as_ref()
+            .user_data()
+            .get::<Dmabuf>()
+            .map(|d| (d.width() as i32, d.height() as i32)),
+        _ => None,
+    }
+}
+
 /// Open the dev window and run until closed or `max_frames` is reached.
 /// `max_frames` exists for headless smoke tests (e.g. under Xvfb).
 pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
@@ -182,7 +201,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut tap = TapTracker::default();
     // Client windows land here as xdg-toplevels connect.
     let mut server_state = ServerState::default();
-    let (mut server, socket) = Server::new().map_err(|e| format!("wayland bind: {}", e))?;
+    // GPU formats the GL driver can import: advertised on zwp_linux_dmabuf
+    // so GL toolkits (Kate, Alacritty) can present. Empty on drivers
+    // without dma-buf (llvmpipe headless): the global is still announced.
+    let dmabuf_formats: Vec<smithay::backend::allocator::Format> =
+        graphics.renderer().dmabuf_formats().cloned().collect();
+    log::info!("renderer offers {} dmabuf formats", dmabuf_formats.len());
+    let (mut server, socket) =
+        Server::new(dmabuf_formats).map_err(|e| format!("wayland bind: {}", e))?;
     log::info!("wayland socket ready on {:?}", socket);
     // Logical size of the winit window; refreshed every frame below
     // (fullscreen/resize changes it).
@@ -309,6 +335,24 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     } else {
         Vec::new()
     };
+    // Headless proof hook (screenshots): enter Canvas without a keyboard.
+    // Same path as a real Super tap (overview, dolly, dwell all armed).
+    if std::env::var("CANVAS_FORCE_CANVAS").is_ok() {
+        let action = session.on_event(
+            crate::session::SuperEvent::SuperTap,
+            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+            view,
+        );
+        log::info!("forced Canvas for proof: {:?}", action);
+    }
+    // Headless proof hook (frame-callback pacing): freeze FX like the
+    // Eco toggle does, so pending client callbacks are the ONLY thing
+    // that can force a frame. If the probe still paints fast, pacing
+    // works; if it stalls, paced clients (Kate) would freeze.
+    if std::env::var("CANVAS_FORCE_ECO").is_ok() {
+        settings.eco = true;
+        log::info!("forced eco for proof: FX frozen");
+    }
 
     loop {
         if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(0)), &mut ()) {
@@ -1569,6 +1613,27 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         {
             need_render = true;
         }
+        // Paced clients (Kate, Alacritty, Qt/GTK) repaint only after a
+        // frame callback: with FX frozen (eco/all-off) nothing renders,
+        // no callback ever goes out, and the client stalls forever after
+        // its first hover-driven repaint (opens, reacts once, then
+        // freezes; resizes stretch the stale buffer). Pending callbacks
+        // force a frame, restoring the request/render/done loop. Idle
+        // with no pending callback still renders zero frames.
+        if !need_render {
+            need_render = server_state.windows.values().any(|cw| {
+                cw.surface.as_ref().map_or(false, |surface| {
+                    with_states(surface, |states| {
+                        !states
+                            .cached_state
+                            .current::<SurfaceAttributes>()
+                            .frame_callbacks
+                            .is_empty()
+                    })
+                    .unwrap_or(false)
+                })
+            });
+        }
 
         if need_render || frames == 0 || max_frames.is_some() {
             let scale = graphics.window_size().scale_factor;
@@ -1636,6 +1701,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 settings.glow_intensity(),
                                 settings.glow_width(),
                                 glow_time,
+                                0.0,
                             );
                         });
                     } else if let Err(err) = frame.clear(color) {
@@ -1741,15 +1807,22 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         });
                         if let Some(buffer) = buffer.as_ref() {
                             cw.last_buffer = Some(buffer.clone());
-                            let dims = with_buffer_contents(buffer, |_, data| {
-                                (data.width, data.height)
-                            });
-                            if let Ok((w, h)) = dims {
+                            let dims = client_buffer_size(buffer);
+                            if let Some((w, h)) = dims {
                                 let damage = Rectangle::<i32, BufferCoord>::from_loc_and_size(
                                     (0, 0),
                                     (w, h),
                                 );
-                                match renderer.import_shm_buffer(&buffer, None, &[damage]) {
+                                // GL clients present dmabuf, not shm: import
+                                // through the matching path, same texture
+                                // slot either way.
+                                let imported = match buffer_type(&buffer) {
+                                    Some(BufferType::Dma) => {
+                                        renderer.import_dma_buffer(&buffer)
+                                    }
+                                    _ => renderer.import_shm_buffer(&buffer, None, &[damage]),
+                                };
+                                match imported {
                                     Ok(tex) => {
                                         // Follow the buffer only when the CLIENT
                                         // resizes (first map or configure):
@@ -1779,7 +1852,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         );
                                         cw.texture = Some(tex)
                                     }
-                                    Err(err) => log::warn!("shm import failed: {}", err),
+                                    Err(err) => log::warn!("buffer import failed: {}", err),
                                 }
                             }
                         }
@@ -1954,15 +2027,22 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                         });
                         if let Some(buffer) = buffer.as_ref() {
-                            let dims = with_buffer_contents(buffer, |_, data| {
-                                (data.width, data.height)
-                            });
-                            if let Ok((w, h)) = dims {
+                            let dims = client_buffer_size(buffer);
+                            if let Some((w, h)) = dims {
                                 let damage = Rectangle::<i32, BufferCoord>::from_loc_and_size(
                                     (0, 0),
                                     (w, h),
                                 );
-                                match renderer.import_shm_buffer(&buffer, None, &[damage]) {
+                                // GL clients present dmabuf, not shm: import
+                                // through the matching path, same texture
+                                // slot either way.
+                                let imported = match buffer_type(&buffer) {
+                                    Some(BufferType::Dma) => {
+                                        renderer.import_dma_buffer(&buffer)
+                                    }
+                                    _ => renderer.import_shm_buffer(&buffer, None, &[damage]),
+                                };
+                                match imported {
                                     Ok(tex) => {
                                         if let Some(pop) =
                                             server_state.popups.get_mut(&pid)
@@ -2107,6 +2187,55 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 }
                 // Options menu, always topmost: bordered panel, selection
                 // highlight, rows drawn from the data-driven item list.
+                // Super glow OVER the windows (additive light, no
+                // wallpaper): Canvas mode only, menu stays on top.
+                if session.state == crate::session::SuperState::Canvas
+                    && glow_f > 0.01
+                    && settings.glow_intensity() > 0.0
+                {
+                    if let Some(prog) = bg_prog {
+                        let sc = scale as f32;
+                        let (gcol_a, gcol_b) = settings.glow_hue();
+                        let dim = settings.bg_dim() * settings.super_dim();
+                        let _ = renderer.with_context(|_, gl| unsafe {
+                            use smithay::backend::renderer::gles2::ffi;
+                            gl.BlendFunc(ffi::ONE, ffi::ONE);
+                            crate::render3d::draw_bg(
+                                gl,
+                                prog,
+                                view.x as f32 * sc,
+                                view.y as f32 * sc,
+                                bg_time,
+                                session.view_camera().zoom as f32,
+                                dim,
+                                1.0,
+                                settings.depth_on(),
+                                if settings.bg_anim { 1.0 } else { 0.0 },
+                                settings.bg_pattern() as f32,
+                                settings.bg_scale(),
+                                settings.bg_grain(),
+                                settings.bg_vig(),
+                                settings.bg_tint(),
+                                settings.wave_amp(),
+                                settings.wave_shape() as f32,
+                                settings.wave_octaves() as f32,
+                                settings.wave_freq(),
+                                settings.wave_dir(),
+                                settings.wave_crisp(),
+                                settings.wave_col(),
+                                wave_time,
+                                glow_f,
+                                gcol_a,
+                                gcol_b,
+                                settings.glow_intensity(),
+                                settings.glow_width(),
+                                glow_time,
+                                1.0,
+                            );
+                            gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+                        });
+                    }
+                }
                 if menu.open {
                     // Atlas bytes for this frame (copied only when the
                     // cache packed new glyphs: rare after warmup).

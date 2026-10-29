@@ -463,6 +463,7 @@ uniform vec3 gcol_b;
 uniform float g_int;
 uniform float g_width;
 uniform float gt;
+uniform float overlay;
 varying vec2 v_uv;
 // Precision-safe hash (no sin/fract-of-huge: mediump overflows the
 // classic sin(dot)*43758 past ~65504 and returns black). Hoskins
@@ -551,7 +552,14 @@ void main() {
     float curtain2 = fbm(vec2((v_uv.x - v_uv.y) * 3.0 - flow * 0.7, flow * 0.4 + 7.3));
     float veil = band * (0.30 + 0.70 * curtain * curtain2 * 2.2);
     vec3 gcol = mix(gcol_a, gcol_b, curtain);
-    col += gcol * veil * g_int * glow * 0.35;
+    vec3 glow_col = gcol * veil * g_int * glow * 0.35;
+    // Overlay pass (Super glow over windows): additive light only, no
+    // wallpaper — the backend blends this ONTO the finished frame.
+    if (overlay > 0.5) {
+        gl_FragColor = vec4(glow_col * dim, 1.0);
+        return;
+    }
+    col += glow_col;
     gl_FragColor = vec4(col * dim, 1.0);
 }
 ";
@@ -591,6 +599,7 @@ pub struct BgProg {
     pub u_g_int: i32,
     pub u_g_width: i32,
     pub u_gt: i32,
+    pub u_overlay: i32,
     pub a_pos: u32,
 }
 
@@ -644,6 +653,7 @@ pub fn compile_bg(gl: &ffi::Gles2) -> Result<BgProg, String> {
             u_g_int: u("g_int"),
             u_g_width: u("g_width"),
             u_gt: u("gt"),
+            u_overlay: u("overlay"),
             a_pos: pos,
         })
     }
@@ -687,6 +697,7 @@ pub unsafe fn draw_bg(
     g_int: f32,
     g_width: f32,
     gt: f32,
+    overlay: f32,
 ) {
     let p = prog;
     gl.Disable(ffi::SCISSOR_TEST);
@@ -717,6 +728,7 @@ pub unsafe fn draw_bg(
     gl.Uniform1f(p.u_g_int, g_int);
     gl.Uniform1f(p.u_g_width, g_width);
     gl.Uniform1f(p.u_gt, gt);
+    gl.Uniform1f(p.u_overlay, overlay);
     // Fullscreen triangle strip in clip space.
     let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
     gl.EnableVertexAttribArray(p.a_pos);
