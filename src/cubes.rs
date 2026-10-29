@@ -17,7 +17,10 @@
 use crate::canvas::Vec2;
 
 /// Hard cap: the oldest cube leaves when a new one spawns past this.
-pub const MAX_CUBES: usize = 20;
+/// 200 cubes ≈ 1400 tiny tris/frame worst case — nothing for a real
+/// GPU, fine even for llvmpipe. Anti-spam is the fresh-press guard;
+/// this only bounds memory and visual chaos.
+pub const MAX_CUBES: usize = 200;
 /// How tall windows stand (canvas px): the cube / window hitbox height.
 pub const WALL_H: f64 = 150.0;
 /// Gravity, canvas px / s^2.
