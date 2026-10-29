@@ -338,6 +338,12 @@ impl Overview {
         }
     }
 
+    /// Ensure-selected: moving a window selects it without risking a
+    /// toggle-off when it was already selected.
+    pub fn select(&mut self, id: u64) {
+        self.selected.insert(id);
+    }
+
     pub fn quit(&mut self) -> Vec<u64> {
         self.active = false;
         let mut ids: Vec<u64> = self.selected.iter().copied().collect();

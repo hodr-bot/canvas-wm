@@ -618,8 +618,23 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 crate::chrome::HoverKey::Grab => {
                                     if pressed {
                                         e_grab = hover.map(|id| (id, cworld));
-                                        if e_grab.is_some() {
-                                            log::info!("hover key grab window {:?}", hover);
+                                        if let Some(id) = hover {
+                                            // Moving grabs the window: raise
+                                            // it so it never slides behind
+                                            // others mid-drag, and select it.
+                                            server_state.raise(id);
+                                            session.overview.select(id);
+                                            let z = server_state
+                                                .windows
+                                                .get(&id)
+                                                .map(|c| c.z)
+                                                .unwrap_or(0);
+                                            log::info!(
+                                                "hover key grab window {} raised z={} selected={}",
+                                                id,
+                                                z,
+                                                session.overview.selected.len()
+                                            );
                                         }
                                     } else {
                                         e_grab = None;
@@ -852,6 +867,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             Some(id) if session.dwell.armed == Some(id) => {
                                 grab = Some((id, cw, cw, true));
                                 server_state.raise(id);
+                                session.overview.select(id);
                                 log::info!("canvas armed move window {}", id);
                             }
                             Some(id) => {
