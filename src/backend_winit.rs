@@ -1352,8 +1352,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     // Windows render as textured perspective planes (3D).
-                    // shm buffers go through our own program (tilt in Canvas
-                    // mode, flat 1:1 in Idle); anything else keeps Smithay's
+                    // shm buffers go through our own program (zero tilt,
+                    // flat 1:1, in every mode); anything else keeps Smithay's
                     // flat path so exotic buffers never break the frame.
                     if let Some(tex) = cw.texture.as_ref() {
                         let is_shm = matches!(
@@ -1374,9 +1374,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                         if is_shm {
                             if let Some(prog) = tex_prog {
-                                let canvas_mode = session.state
-                                    == crate::session::SuperState::Canvas;
-                                let tilt = if canvas_mode { (0.14, 0.07) } else { (0.0, 0.0) };
+                                // Zero tilt, always, in every mode: windows
+                                // stay axis-aligned. (The old Canvas-mode
+                                // lean snapped on/off instantly while the
+                                // zoom glided underneath — that double
+                                // transform read as a dezoom-then-zoom
+                                // stutter and left everything leaning.)
+                                // The perspective MVP at zero tilt maps 1:1.
+                                let tilt = (0.0, 0.0);
                                 // Canvas-plane quad, y negated for clip space, with
                                 // upright UVs (buffer row 0 = top). The MVP
                                 // maps canvas -> screen; physical px = logical
