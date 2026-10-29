@@ -141,6 +141,99 @@ varying vec2 v_uv;
 void main() { vec4 t = texture2D(tex, v_uv); gl_FragColor = vec4(t.rgb, mix(t.a, 1.0, opaque)); }
 ";
 
+#[cfg(feature = "compositor")]
+const VERT_ROUND_SRC: &str = "#version 100
+attribute vec2 position;
+attribute vec2 uv;
+uniform mat4 mvp;
+varying vec2 v_uv;
+void main() { v_uv = uv; gl_Position = mvp * vec4(position, 0.0, 1.0); }
+";
+
+/// Rounded-rect fragment: SDF discards outside the radius (crisp
+/// 1px step, no blending dependency — matches the bitmap aesthetic).
+/// `size` is the rect in MVP units, `radius` in the same units.
+#[cfg(feature = "compositor")]
+const FRAG_ROUND_SRC: &str = "#version 100
+precision mediump float;
+uniform vec4 color;
+uniform vec2 size;
+uniform float radius;
+varying vec2 v_uv;
+void main() {
+    vec2 p = v_uv * size;
+    vec2 half_ = size * 0.5 - vec2(radius);
+    vec2 q = abs(p - size * 0.5) - half_;
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+    if (d > 0.0) { discard; }
+    gl_FragColor = color;
+}
+";
+
+/// Compile the rounded-rect program. Returns (program, u_mvp,
+/// u_color, u_size, u_radius, a_pos, a_uv).
+#[cfg(feature = "compositor")]
+pub fn compile_rounded(gl: &ffi::Gles2) -> Result<(u32, i32, i32, i32, i32, u32, u32), String> {
+    let c = |s: &str| CString::new(s).unwrap();
+    unsafe {
+        let vert = compile(gl, ffi::VERTEX_SHADER, VERT_ROUND_SRC)?;
+        let frag = compile(gl, ffi::FRAGMENT_SHADER, FRAG_ROUND_SRC)?;
+        let program = gl.CreateProgram();
+        gl.AttachShader(program, vert);
+        gl.AttachShader(program, frag);
+        gl.LinkProgram(program);
+        gl.DetachShader(program, vert);
+        gl.DetachShader(program, frag);
+        gl.DeleteShader(vert);
+        gl.DeleteShader(frag);
+        let mut status = ffi::FALSE as i32;
+        gl.GetProgramiv(program, ffi::LINK_STATUS, &mut status as *mut _);
+        if status == ffi::FALSE as i32 {
+            gl.DeleteProgram(program);
+            return Err("rounded program link failed".into());
+        }
+        let mvp = gl.GetUniformLocation(program, c("mvp").as_ptr() as *const _);
+        let color = gl.GetUniformLocation(program, c("color").as_ptr() as *const _);
+        let size = gl.GetUniformLocation(program, c("size").as_ptr() as *const _);
+        let radius = gl.GetUniformLocation(program, c("radius").as_ptr() as *const _);
+        let pos = gl.GetAttribLocation(program, c("position").as_ptr() as *const _) as u32;
+        let uv = gl.GetAttribLocation(program, c("uv").as_ptr() as *const _) as u32;
+        Ok((program, mvp, color, size, radius, pos, uv))
+    }
+}
+
+/// Draw one rounded rect (x, y, w, h in MVP units, radius in the same
+/// units) with an RGBA colour. Same GL-state hygiene as `draw_solid`.
+#[cfg(feature = "compositor")]
+pub unsafe fn draw_rounded(
+    gl: &ffi::Gles2,
+    prog: (u32, i32, i32, i32, i32, u32, u32),
+    mvp: &[f32; 16],
+    color: [f32; 4],
+    rect: (f32, f32, f32, f32),
+    radius: f32,
+) {
+    let (program, u_mvp, u_color, u_size, u_radius, a_pos, a_uv) = prog;
+    gl.Disable(ffi::SCISSOR_TEST);
+    gl.UseProgram(program);
+    gl.UniformMatrix4fv(u_mvp, 1, ffi::FALSE as u8, mvp.as_ptr());
+    gl.Uniform4f(u_color, color[0], color[1], color[2], color[3]);
+    let (x, y, w, h) = rect;
+    gl.Uniform2f(u_size, w, h);
+    gl.Uniform1f(u_radius, radius.min(w * 0.5).min(h * 0.5));
+    let verts: [f32; 8] = [x, y, x + w, y, x, y + h, x + w, y + h];
+    let uvs: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    gl.EnableVertexAttribArray(a_pos);
+    gl.VertexAttribPointer(a_pos, 2, ffi::FLOAT, ffi::FALSE as u8, 0, verts.as_ptr() as *const _);
+    gl.EnableVertexAttribArray(a_uv);
+    gl.VertexAttribPointer(a_uv, 2, ffi::FLOAT, ffi::FALSE as u8, 0, uvs.as_ptr() as *const _);
+    gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
+    gl.DisableVertexAttribArray(a_pos);
+    gl.DisableVertexAttribArray(a_uv);
+    gl.UseProgram(0);
+    gl.Enable(ffi::SCISSOR_TEST);
+}
+
 /// Compile the solid-colour program. Returns the program id plus the
 /// `mvp` / `color` uniform and `position` attribute locations.
 #[cfg(feature = "compositor")]

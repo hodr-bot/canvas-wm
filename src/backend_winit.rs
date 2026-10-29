@@ -206,6 +206,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         None;
     // Solid-colour GL program for window chrome (seed of the 3D engine).
     let mut solid_prog: Option<(u32, i32, i32, u32)> = None;
+    // Rounded-rect GL program for the Options panel (SDF corners).
+    let mut round_prog: Option<(u32, i32, i32, i32, i32, u32, u32)> = None;
     // Textured GL program: windows as perspective planes in 3D.
     let mut tex_prog: Option<(u32, i32, i32, i32, u32, u32)> = None;
     // Options menu + user settings (Options menu edits these live).
@@ -2057,8 +2059,20 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             Err(e) => log::warn!("chrome GL context: {:?}", e),
                         }
                     }
-                    if let (Some(sprog), Some(tprog), Some(atlas)) =
-                        (solid_prog, tex_prog, atlas_tex.as_ref())
+                    if round_prog.is_none() {
+                        match renderer.with_context(|_, gl| {
+                            crate::render3d::compile_rounded(gl)
+                        }) {
+                            Ok(Ok(p)) => {
+                                round_prog = Some(p);
+                                log::info!("rounded GL program ready");
+                            }
+                            Ok(Err(e)) => log::warn!("rounded GL program: {}", e),
+                            Err(e) => log::warn!("rounded GL context: {:?}", e),
+                        }
+                    }
+                    if let (Some(sprog), Some(tprog), Some(atlas), Some(rprog)) =
+                        (solid_prog, tex_prog, atlas_tex.as_ref(), round_prog)
                     {
                         let mvp = crate::render3d::ortho(view.x as f32, view.y as f32);
                         let sc = scale as f32;
@@ -2097,27 +2111,33 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         let rows = crate::menu::tab_items(menu.tab);
                         let feet = crate::menu::feet();
                         let _ = renderer.with_context(|_, gl| unsafe {
-                            // Drop shadow, then border, then panel.
-                            crate::render3d::draw_solid(
+                            // Drop shadow, then border, then panel — all
+                            // rounded (border = bigger rounded rect under
+                            // the panel one).
+                            let corner = 14.0 * sc;
+                            crate::render3d::draw_rounded(
                                 gl,
-                                sprog,
+                                rprog,
                                 &mvp,
                                 [0.01, 0.015, 0.03, 1.0],
                                 (px0 - 6.0 * sc, py0 - 2.0 * sc + 12.0 * sc, pw + 12.0 * sc, ph + 8.0 * sc),
+                                corner,
                             );
-                            crate::render3d::draw_solid(
+                            crate::render3d::draw_rounded(
                                 gl,
-                                sprog,
+                                rprog,
                                 &mvp,
                                 [0.16, 0.21, 0.33, 1.0],
                                 (px0 - 2.0 * sc, py0 - 2.0 * sc, pw + 4.0 * sc, ph + 4.0 * sc),
+                                corner,
                             );
-                            crate::render3d::draw_solid(
+                            crate::render3d::draw_rounded(
                                 gl,
-                                sprog,
+                                rprog,
                                 &mvp,
                                 [0.078, 0.094, 0.13, 1.0],
                                 (px0, py0, pw, ph),
+                                corner,
                             );
                             // Tab bar: active tab bracketed + underlined.
                             // Names are left-aligned in their cell (no
@@ -2166,19 +2186,20 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     continue;
                                 };
                                 if item_idx == menu.selected {
-                                    crate::render3d::draw_solid(
+                                    crate::render3d::draw_rounded(
                                         gl,
-                                        sprog,
+                                        rprog,
                                         &mvp,
                                         [0.13, 0.16, 0.26, 1.0],
-                                        (px0, rpy, pw, row_h),
+                                        (px0 + 8.0 * sc, rpy + 1.0 * sc, pw - 16.0 * sc, row_h - 2.0 * sc),
+                                        6.0 * sc,
                                     );
                                     crate::render3d::draw_solid(
                                         gl,
                                         sprog,
                                         &mvp,
                                         accent,
-                                        (px0, rpy, 4.0 * sc, row_h),
+                                        (px0 + 8.0 * sc, rpy + 4.0 * sc, 4.0 * sc, row_h - 8.0 * sc),
                                     );
                                 }
                                 let line = format!(
@@ -2196,19 +2217,52 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     let th = 5.0 * sc;
                                     let tx0 = px0 + pad;
                                     let ty0 = rpy + row_h - 9.0 * sc;
-                                    crate::render3d::draw_solid(
+                                    crate::render3d::draw_rounded(
                                         gl,
-                                        sprog,
+                                        rprog,
                                         &mvp,
                                         [0.17, 0.22, 0.33, 1.0],
                                         (tx0, ty0, tw, th),
+                                        2.5 * sc,
                                     );
-                                    crate::render3d::draw_solid(
+                                    crate::render3d::draw_rounded(
                                         gl,
-                                        sprog,
+                                        rprog,
                                         &mvp,
                                         accent,
                                         (tx0, ty0, tw * fill.clamp(0.0, 1.0), th),
+                                        2.5 * sc,
+                                    );
+                                }
+                                // Toggle pill, right-aligned: accent when
+                                // on, dark when off, knob rides the side.
+                                if let crate::menu::MenuKind::Toggle { is_on, .. } = &it.kind {
+                                    let on = is_on(&settings);
+                                    let plw = 46.0 * sc;
+                                    let plh = 20.0 * sc;
+                                    let plx = px0 + pw - pad - plw;
+                                    let ply = rpy + (row_h - plh) * 0.5;
+                                    let knob = 16.0 * sc;
+                                    crate::render3d::draw_rounded(
+                                        gl,
+                                        rprog,
+                                        &mvp,
+                                        if on { accent } else { [0.17, 0.22, 0.33, 1.0] },
+                                        (plx, ply, plw, plh),
+                                        10.0 * sc,
+                                    );
+                                    crate::render3d::draw_rounded(
+                                        gl,
+                                        rprog,
+                                        &mvp,
+                                        [0.92, 0.95, 1.0, 1.0],
+                                        (
+                                            if on { plx + plw - knob - 2.0 * sc } else { plx + 2.0 * sc },
+                                            ply + 2.0 * sc,
+                                            knob,
+                                            knob,
+                                        ),
+                                        8.0 * sc,
                                     );
                                 }
                                 // Live colour swatch, right-aligned.
@@ -2216,16 +2270,17 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     let sw = 20.0 * sc;
                                     let sx = px0 + pw - pad - sw;
                                     let sy = rpy + 5.0 * sc;
-                                    crate::render3d::draw_solid(
+                                    crate::render3d::draw_rounded(
                                         gl,
-                                        sprog,
+                                        rprog,
                                         &mvp,
                                         [0.16, 0.21, 0.33, 1.0],
                                         (sx - 2.0 * sc, sy - 2.0 * sc, sw + 4.0 * sc, sw + 4.0 * sc),
+                                        4.0 * sc,
                                     );
-                                    crate::render3d::draw_solid(
+                                    crate::render3d::draw_rounded(
                                         gl,
-                                        sprog,
+                                        rprog,
                                         &mvp,
                                         [
                                             rgb[0] as f32 / 255.0,
@@ -2234,6 +2289,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             1.0,
                                         ],
                                         (sx, sy, sw, sw),
+                                        4.0 * sc,
                                     );
                                 }
                                 item_idx += 1;

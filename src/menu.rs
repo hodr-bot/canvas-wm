@@ -140,7 +140,9 @@ pub enum MenuKind {
 }
 
 impl MenuItem {
-    /// Displayed value suffix, e.g. " : Normale" or " : 128".
+    /// Displayed value suffix, e.g. " : Normale", " : 128", or
+    /// " : 15 #0F121A" for the red channel of an RGB triplet (the
+    /// swatch row carries the hex preview of the whole colour).
     /// The backend draws `label + state_text`, no per-kind code there.
     pub fn state_text(&self, settings: &Settings) -> String {
         match &self.kind {
@@ -155,7 +157,16 @@ impl MenuItem {
                 format!(" : {}", options[get(settings).min(2)])
             }
             MenuKind::Slider { get, unit, .. } => {
-                format!(" : {}{}", get(settings), unit)
+                match self.swatch.map(|f| f(settings)) {
+                    Some(rgb) => format!(
+                        " : {} #{:02X}{:02X}{:02X}",
+                        get(settings),
+                        rgb[0],
+                        rgb[1],
+                        rgb[2]
+                    ),
+                    None => format!(" : {}{}", get(settings), unit),
+                }
             }
             MenuKind::Info => String::new(),
         }
@@ -947,6 +958,14 @@ mod tests {
         m.selected = 7; // bg_tint_r carries the swatch.
         let it = m.selected_item().unwrap();
         assert_eq!(it.swatch.unwrap()(&s), [15, 18, 26]);
+        // The swatch row carries the hex preview of the triplet.
+        assert_eq!(it.state_text(&s), " : 15 #0F121A".to_string());
+        // Plain channels show the bare value.
+        m.selected = 8; // bg_tint_g: no swatch, no hex.
+        assert_eq!(
+            m.selected_item().unwrap().state_text(&s),
+            " : 18".to_string()
+        );
         // A channel row is also a slider: fill tracks the value.
         let fill = it.slider_fill(&s).unwrap();
         assert!((fill - 15.0 / 255.0).abs() < 1e-6);
