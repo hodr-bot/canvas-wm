@@ -225,30 +225,38 @@ impl Session {
             - anchor.y;
     }
 
-    /// Wheel zoom: same anchor as [`zoom_at`], but the zoom GLIDES to
-    /// the goal instead of snapping (smooth fade, momentum kept), and
-    /// each notch composes onto the SETTLED target — never the live
-    /// mid-glide value, so fast scrolling never ratchets or kills a
-    /// glide-back in progress (quitting Super then touching the wheel
-    /// keeps the return trip, it just aims it a notch further).
-    /// The anchor itself is computed in target space (settled zoom and
-    /// settled position): consecutive notches share one stable base
-    /// instead of re-anchoring off a moving mid-glide frame, which was
-    /// the judder.
+    /// Wheel zoom: the zoom GLIDES to the goal (smooth fade, momentum
+    /// kept), and each notch composes onto the SETTLED target — never
+    /// the live mid-glide value, so fast scrolling never ratchets or
+    /// kills a glide-back in progress (quitting Super then touching
+    /// the wheel keeps the return trip, it just aims it a notch
+    /// further).
+    ///
+    /// The pinned anchor is the LIVE world point under the cursor
+    /// (`to_world` at the current zoom/position/offset): consecutive
+    /// notches re-pin (almost) the same point because the per-frame
+    /// tracking keeps it glued, so fast notches converge instead of
+    /// jumping. Anchoring in target space instead would mix the
+    /// settled zoom with the mid-glide offset and re-pin a different
+    /// world point per notch — the same judder one level down.
+    ///
+    /// This function NEVER writes `canvas.offset`: the offset for the
+    /// new target is only valid once the live zoom gets there, so an
+    /// immediate solve renders one jumped frame per notch (offset of
+    /// the future zoom at the current zoom) before the per-frame
+    /// tracking melts it back — that jump-then-melt IS the visible
+    /// "canvas repositions at every notch". The pinned (screen, world)
+    /// below is re-solved from the LIVE zoom every frame by
+    /// [`track_zoom_anchor`], so the content stays glued with zero
+    /// jump; at most one frame renders the pre-notch offset, which is
+    /// still correct for the ~unchanged live zoom.
     pub fn zoom_glide_at(&mut self, screen: Vec2, view: Vec2, factor: f64) {
-        let base_z = self.camera.zoom_target;
-        let base_p = self.camera.target;
-        let anchor =
-            Vec2::new((screen.x - view.x * 0.5) / base_z + base_p.x - self.canvas.offset.x,
-                      (screen.y - view.y * 0.5) / base_z + base_p.y - self.canvas.offset.y);
-        let zt = (base_z * factor).clamp(0.05, 4.0);
+        let anchor = self.to_world(screen, view);
+        let zt = (self.camera.zoom_target * factor).clamp(0.05, 4.0);
         self.camera.zoom_to(zt);
-        self.canvas.offset.x = (screen.x - view.x * 0.5) / zt + base_p.x - anchor.x;
-        self.canvas.offset.y = (screen.y - view.y * 0.5) / zt + base_p.y - anchor.y;
         // Pin (screen, world) for the fade: every frame re-solves the
         // offset at the LIVE zoom so the content stays glued under the
-        // cursor while the value melts (see track_zoom_anchor). The
-        // pinned world is the settled one, not the live mid-glide one.
+        // cursor while the value melts (see track_zoom_anchor).
         self.zoom_anchor = Some((screen, anchor));
     }
 
@@ -257,16 +265,20 @@ impl Session {
     /// fade. Drops the anchor on landing (exact by construction).
     /// Call every frame after `camera.step`.
     pub fn track_zoom_anchor(&mut self, view: Vec2) {
-        if self.camera.zoom == self.camera.zoom_target && self.camera.zoom_vel == 0.0 {
-            self.zoom_anchor = None;
-            return;
-        }
         if let Some((screen, world)) = self.zoom_anchor {
             let z = self.camera.zoom;
             self.canvas.offset.x =
                 (screen.x - view.x * 0.5) / z + self.camera.pos.x - world.x;
             self.canvas.offset.y =
                 (screen.y - view.y * 0.5) / z + self.camera.pos.y - world.y;
+            // Drop on landing — AFTER the final solve above, or the
+            // last step's snap residual (up to 1e-3 zoom) stays baked
+            // into the offset and the pinned point visibly shifts.
+            // (Only visible off-centre: at screen centre the residual
+            // scales by (screen - v/2) = 0 and hides.)
+            if self.camera.zoom == self.camera.zoom_target && self.camera.zoom_vel == 0.0 {
+                self.zoom_anchor = None;
+            }
         }
     }
 
@@ -460,12 +472,15 @@ mod tests {
         assert!(s.camera.zoom_target > 1.0);
         assert!((s.camera.zoom_vel - 0.0).abs() > 1e-9 || s.camera.zoom != s.camera.zoom_target);
         // Anchor: the world point under the cursor is identical before
-        // the glide and after landing (position never moved here).
+        // the glide and after landing (position never moved here) —
+        // stepping exactly like the backend loop (step then track).
         let mut s2 = Session::new();
         let before = s2.to_world(at, view);
         s2.zoom_glide_at(at, view, 1.5);
         for _ in 0..1200 {
-            if !s2.camera.step(1.0 / 120.0) {
+            s2.camera.step(1.0 / 120.0);
+            s2.track_zoom_anchor(view);
+            if !s2.camera.flying() && s2.zoom_anchor.is_none() {
                 break;
             }
         }
@@ -505,6 +520,42 @@ mod tests {
         assert_eq!(s.camera.zoom, s.camera.zoom_target);
         assert!(!s.camera.flying());
         assert!(s.zoom_anchor.is_none());
+    }
+
+    #[test]
+    fn wheel_notch_never_jumps_the_canvas() {
+        // Regression: the notch must not move the canvas by itself —
+        // solving the offset for the future zoom while the live zoom
+        // is still old renders one jumped frame per notch ("the canvas
+        // repositions at every notch"), melted back the frames after.
+        let mut s = Session::new();
+        let view = Vec2::new(1920.0, 1080.0);
+        let at = Vec2::new(1400.0, 800.0);
+        let off_before = s.canvas.offset;
+        s.zoom_glide_at(at, view, 1.3);
+        assert_eq!(s.canvas.offset.x, off_before.x);
+        assert_eq!(s.canvas.offset.y, off_before.y);
+        // ...nor any later notch mid-glide: only the target moves.
+        for _ in 0..30 {
+            s.camera.step(1.0 / 120.0);
+            s.track_zoom_anchor(view);
+        }
+        let off_mid = s.canvas.offset;
+        s.zoom_glide_at(at, view, 1.3);
+        assert_eq!(s.canvas.offset.x, off_mid.x);
+        assert_eq!(s.canvas.offset.y, off_mid.y);
+        // The pinned point still lands glued (backend loop stepping).
+        let (_, world) = s.zoom_anchor.unwrap();
+        for _ in 0..1200 {
+            s.camera.step(1.0 / 120.0);
+            s.track_zoom_anchor(view);
+            if !s.camera.flying() && s.zoom_anchor.is_none() {
+                break;
+            }
+        }
+        let after = s.to_world(at, view);
+        assert!((after.x - world.x).abs() < 1e-9);
+        assert!((after.y - world.y).abs() < 1e-9);
     }
 
     #[test]

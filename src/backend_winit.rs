@@ -56,18 +56,21 @@ fn button_code(button: MouseButton) -> u32 {
     }
 }
 
-/// Tell a client its canvas size so the buffer follows (real resize,
-/// never a stretch-zoom): X via ConfigureWindow, natives via configure.
-/// `fullscreen` carries the state flag for natives; X ignores it.
+/// Tell a client its size in SCREEN px so the buffer follows (real
+/// resize, never a stretch-zoom): X via ConfigureWindow, natives via
+/// configure. `fullscreen` carries the state flag for natives; X
+/// ignores it. The size is explicit (not read off the canvas rect)
+/// because canvas px != screen px off zoom 1: a fullscreen client
+/// owns exactly the view, whatever the live zoom.
 fn push_client_size(
     server: &crate::server::Server,
     xwm: Option<&Xwm>,
     id: u64,
     win: &crate::server::ClientWindow,
     fullscreen: bool,
+    px: (u32, u32),
 ) {
-    let w = win.canvas.size.x as i32;
-    let h = win.canvas.size.y as i32;
+    let (w, h) = (px.0 as i32, px.1 as i32);
     if let Some(xid) = win.x11 {
         if let Some(wm) = xwm {
             wm.configure(xid, w as u32, h as u32);
@@ -181,6 +184,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut known_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Focused canvas window.
     let mut focused_id: Option<u64> = None;
+    // Popup holding keyboard focus: (popup id, parent id). A press inside
+    // a menu/tooltip focuses its surface so menus take keys — but when the
+    // popup dies (tooltip timeout, menu dismiss) the seat would point at a
+    // dead surface and the app reads as frozen (no more keyboard until the
+    // next click). The per-frame check below folds focus back to the parent
+    // as soon as the popup is gone.
+    let mut popup_focus: Option<(u64, u64)> = None;
     // Live canvas gestures: left-drag on empty canvas space pans the canvas
     // (Canvas mode only); a dwell-armed window drag moves that window.
     // Press canvas coords + last canvas coords + whether past threshold.
@@ -198,6 +208,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut super_held = false;
     let mut f_held = false;
     let mut q_held = false;
+    let mut r_held = false;
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): window id + pinned centre +
     // size at grab + mouse canvas pos at grab + last pushed client
@@ -399,6 +410,33 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     ws.scale_factor
                 );
                 last_view = view;
+                need_render = true;
+            }
+        }
+        // Fullscreen windows cover the LIVE view every frame: the rect
+        // is a function of view + live zoom, never a toggle-time
+        // snapshot. F pressed in Super (dolly 0.9) or mid wheel-glide
+        // otherwise bakes a canvas rect that no longer fills the view
+        // once the zoom lands — the app then looks "zoomed into".
+        // Refit here keeps rect * zoom == view exactly at any zoom, so
+        // the client buffer (view px, pushed once at toggle) always
+        // displays 1:1. Idempotent at rest: no extra frames. The saved
+        // pre-fullscreen rect is untouched, toggle-off still restores.
+        {
+            let mut fs_moved = false;
+            for win in server_state.windows.values_mut() {
+                if win.fullscreen_prev.is_some() {
+                    let rect = crate::chrome::fullscreen_rect_for(view, &|s| {
+                        session.to_canvas(s, view)
+                    });
+                    if win.canvas.pos != rect.pos || win.canvas.size != rect.size {
+                        win.canvas.pos = rect.pos;
+                        win.canvas.size = rect.size;
+                        fs_moved = true;
+                    }
+                }
+            }
+            if fs_moved {
                 need_render = true;
             }
         }
@@ -729,13 +767,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                                 server_state.toggle_fullscreen(id, &rect);
                                             // True fullscreen: tell the client its
                                             // new size so the buffer follows (real
-                                            // resize, never a stretch-zoom).
+                                            // resize, never a stretch-zoom). The
+                                            // client owns exactly the view in
+                                            // screen px — independent of zoom.
                                             push_client_size(
                                                 &server,
                                                 xwm.as_ref(),
                                                 id,
                                                 &server_state.windows[&id],
                                                 on,
+                                                (view.x as u32, view.y as u32),
                                             );
                                             log::info!(
                                                 "hover key fullscreen window {} on={}",
@@ -793,10 +834,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     consumed = true;
                                 }
                                 crate::chrome::HoverKey::Scale => {
-                                    if pressed {
-                                        // Arm the centre-anchored scale on the
-                                        // hovered window: raise + select like
-                                        // the E-grab, pin the centre now.
+                                    if pressed && !r_held {
+                                        // Arm the radial scale ONCE on the
+                                        // hovered window (NOT on auto-repeat:
+                                        // re-arming would drag the grab point
+                                        // along with the mouse and collapse
+                                        // the factor every repeat — the scale
+                                        // would stutter instead of tracking).
+                                        // Raise + select like the E-grab, pin
+                                        // the centre now.
                                         if let Some(id) = hover {
                                             server_state.raise(id);
                                             session.overview.select(id);
@@ -823,9 +869,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         } else {
                                             log::info!("scale no window");
                                         }
-                                    } else {
+                                    } else if !pressed {
+                                        // Release drops the scale. (A repeat —
+                                        // pressed with r_held — must NOT land
+                                        // here: clearing on repeat disarms
+                                        // mid-gesture and the window stops
+                                        // tracking the mouse entirely.)
                                         r_scale = None;
                                     }
+                                    r_held = pressed;
                                     consumed = true;
                                 }
                             }
@@ -910,55 +962,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         None => e_grab = None,
                     }
                 }
-                // R-scale: while R is held, each axis follows the mouse
-                // away from the grab point around the pinned centre —
-                // no button needed, release drops it. The client is
-                // reconfigured live (integer changes only) so the app
-                // reflows instead of stretching.
-                if let Some((id, center, size0, mouse0, pushed)) = r_scale {
-                    let now = session.to_canvas(pointer, view);
-                    let delta = crate::canvas::Vec2::new(
-                        now.x - mouse0.x,
-                        now.y - mouse0.y,
-                    );
-                    let (pos, size) =
-                        crate::chrome::apply_scale(center, size0, delta);
-                    let mut gone = false;
-                    match server_state.windows.get_mut(&id) {
-                        Some(cw) => {
-                            cw.canvas.pos = pos;
-                            cw.canvas.size = size;
-                            need_render = true;
-                        }
-                        None => gone = true,
-                    }
-                    if gone {
-                        r_scale = None;
-                    } else {
-                        let want =
-                            (size.x.max(0.0) as u32, size.y.max(0.0) as u32);
-                        if want != pushed {
-                            if let Some(win) = server_state.windows.get(&id) {
-                                push_client_size(
-                                    &server,
-                                    xwm.as_ref(),
-                                    id,
-                                    win,
-                                    false,
-                                );
-                                log::debug!(
-                                    "scale window {} now {}x{}",
-                                    id,
-                                    want.0,
-                                    want.1
-                                );
-                            }
-                            r_scale = Some((id, center, size0, mouse0, want));
-                        } else {
-                            r_scale = Some((id, center, size0, mouse0, pushed));
-                        }
-                    }
-                }
+                // R-scale is applied once per FRAME (see the per-frame
+                // block below), never per motion event: a fast mouse
+                // delivers many motions per frame, and reconfiguring the
+                // client + rewriting the rect each time tears (artefacts).
+                // Capped at the screen FPS by construction.
                 let world = session.to_world(logical, view);
                 // Hover chrome reveals on proximity: repaint on motion so
                 // buttons appear/disappear with the pointer (Idle only;
@@ -1016,9 +1024,23 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         })
                     })
                     .or(focus);
-                server.input_motion((logical.x, logical.y), focus);
-                if let (Some(wm), Some((xid, lx, ly))) = (xwm.as_ref(), x_motion) {
-                    wm.xtest_motion(xid, lx, ly);
+                server.input_motion(
+                    (logical.x, logical.y),
+                    // Canvas mode freezes the apps: pointer motion never
+                    // reaches clients there (no hover-highlight, no menu
+                    // arming under a gesture like R-scale — the window you
+                    // fly over must not react). Idle keeps focus routing
+                    // for focus-follows-mouse.
+                    if session.state == crate::session::SuperState::Canvas {
+                        None
+                    } else {
+                        focus
+                    },
+                );
+                if session.state != crate::session::SuperState::Canvas {
+                    if let (Some(wm), Some((xid, lx, ly))) = (xwm.as_ref(), x_motion) {
+                        wm.xtest_motion(xid, lx, ly);
+                    }
                 }
                 // Focus follows the pointer (keeps last focus over empty
                 // canvas; never steals mid-drag).
@@ -1172,13 +1194,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             server_state.toggle_fullscreen(chrome_id, &rect);
                                         // True fullscreen: tell the client its
                                         // new size so the buffer follows (real
-                                        // resize, never a stretch-zoom).
+                                        // resize, never a stretch-zoom). The
+                                        // client owns exactly the view in
+                                        // screen px — independent of zoom.
                                         push_client_size(
                                             &server,
                                             xwm.as_ref(),
                                             chrome_id,
                                             &server_state.windows[&chrome_id],
                                             on,
+                                            (view.x as u32, view.y as u32),
                                         );
                                         log::info!(
                                             "chrome fullscreen window {} on={}",
@@ -1204,6 +1229,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 if let Some(ps) = pop.surface.clone() {
                                     server.focus_keyboard(Some(&ps));
                                 }
+                                popup_focus = Some((pid, parent));
                                 server_state.raise(parent);
                                 focused_id = Some(parent);
                                 known_ids.insert(parent);
@@ -1213,6 +1239,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             if let Some(c) = server_state.windows.get(&id) {
                                 server.focus_keyboard(c.surface.as_ref());
                             }
+                            popup_focus = None;
                             server_state.raise(id);
                             focused_id = Some(id);
                             known_ids.insert(id);
@@ -1317,6 +1344,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         super_held = false;
                         f_held = false;
                         q_held = false;
+                        r_held = false;
                         for h in wasd_held.iter_mut() {
                             *h = false;
                         }
@@ -1336,6 +1364,55 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
 
         // Dwell-to-arm runs every frame (a still pointer sends no motion
         // events): 1s inside one window arms it for moving, leaving resets.
+        // Popup focus fallback: the keyboard went to a popup surface on
+        // press — if that popup has since died, fold focus back to the
+        // parent window NOW (not at the next click), or the app reads as
+        // frozen. Runs every frame because dismiss arrives via dispatch.
+        if let Some((pid, parent)) = popup_focus {
+            if !server_state.popups.contains_key(&pid) {
+                if let Some(c) = server_state.windows.get(&parent) {
+                    server.focus_keyboard(c.surface.as_ref());
+                    log::info!("popup {} gone: focus back to window {}", pid, parent);
+                }
+                popup_focus = None;
+            }
+        }
+        // R-scale, once per FRAME (never per motion): while R is held the
+        // window grows/shrinks with the mouse DISTANCE from the pinned
+        // centre (radial — cursor at centre = tiny, further = bigger in
+        // every direction), no button needed, release drops it. Motions
+        // can outnumber frames many-to-one; applying per frame caps the
+        // client reconfigures at the screen FPS so nothing tears. The
+        // client is reconfigured live (integer changes only) so the app
+        // reflows instead of stretching.
+        if let Some((id, center, size0, mouse0, pushed)) = r_scale {
+            let now = session.to_canvas(pointer, view);
+            let (pos, size) =
+                crate::chrome::apply_radial_scale(center, size0, mouse0, now);
+            let mut gone = false;
+            match server_state.windows.get_mut(&id) {
+                Some(cw) => {
+                    cw.canvas.pos = pos;
+                    cw.canvas.size = size;
+                    need_render = true;
+                }
+                None => gone = true,
+            }
+            if gone {
+                r_scale = None;
+            } else {
+                let want = (size.x.max(0.0) as u32, size.y.max(0.0) as u32);
+                if want != pushed {
+                    if let Some(win) = server_state.windows.get(&id) {
+                        push_client_size(&server, xwm.as_ref(), id, win, false, want);
+                        log::debug!("scale window {} now {}x{}", id, want.0, want.1);
+                    }
+                    r_scale = Some((id, center, size0, mouse0, want));
+                } else {
+                    r_scale = Some((id, center, size0, mouse0, pushed));
+                }
+            }
+        }
         if session.state == crate::session::SuperState::Canvas {
             let now_ms = frame_clock.elapsed().as_millis() as u64;
             let cw = session.to_canvas(pointer, view);
@@ -2347,6 +2424,17 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     break;
                 }
             }
+        }
+        // Frame pump: winit run_return sleeps without OS events, so
+        // without this every glide/fade/flow advances only on incoming
+        // events — one spring step per event, i.e. visible notches
+        // (wheel zoom jumping per notch, dolly stuttering). While this
+        // iteration asked for a frame, queue a redraw: it wakes the
+        // next dispatch at once and chains until nothing moves, then
+        // stops by itself (a single spare frame at most). Zero frames
+        // at rest, always; spring feel untouched.
+        if need_render {
+            graphics.window().request_redraw();
         }
 
         std::thread::sleep(Duration::from_millis(8));

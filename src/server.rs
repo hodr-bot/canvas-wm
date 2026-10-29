@@ -227,8 +227,11 @@ impl ServerState {
     }
 
     /// Drop a popup overlay (unmapped/destroyed). Never touches windows.
-    pub fn remove_popup(&mut self, id: u64) {
-        self.popups.remove(&id);
+    /// Returns the parent id so the caller can fold keyboard focus back
+    /// to it — a seat left pointing at the dead popup surface reads as
+    /// a frozen app (no more keys until the next click).
+    pub fn remove_popup(&mut self, id: u64) -> Option<u64> {
+        self.popups.remove(&id).map(|p| p.parent)
     }
 
     /// Topmost popup containing a canvas-plane point (newest wins).
@@ -764,9 +767,11 @@ mod tests {
         let inside = Vec2::new(wpos.x + 50.0, wpos.y + 20.0);
         assert_eq!(s.popup_at(inside), Some(p));
         assert_eq!(s.topmost_at(inside), Some(w));
-        // Dismissed: gone from the seat.
-        s.remove_popup(p);
+        // Dismissed: gone from the seat, and the parent id comes back
+        // for the keyboard-focus fallback.
+        assert_eq!(s.remove_popup(p), Some(w));
         assert_eq!(s.popup_at(inside), None);
+        assert_eq!(s.remove_popup(p), None);
         // Parent closed: orphan popups die with it.
         let p2 = s.add_popup(w, None).expect("popup");
         s.popups.get_mut(&p2).unwrap().offset = Some(Vec2::new(0.0, 0.0));

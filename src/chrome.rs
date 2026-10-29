@@ -121,22 +121,36 @@ pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
     }
 }
 
-/// Centre-anchored scale (the R key): while R is held, the window centre
-/// stays pinned and each axis follows the mouse away from the grab point —
-/// move right to widen, down to heighten, both to grow. Minimum size
-/// clamps the rect, never the centre.
+/// Centre-anchored RADIAL scale (the R key): while R is held, the
+/// window centre stays pinned and the whole window grows/shrinks with
+/// the mouse DISTANCE from the centre — cursor at the centre = tiny,
+/// further = bigger, in EVERY direction (going top-left grows when
+/// moving away, unlike the old per-axis delta where it shrank).
+/// Aspect is preserved (one uniform factor), so the app reflows
+/// without stretching. Minimum/maximum clamp the size, never the
+/// centre.
 pub const SCALE_MIN_W: f64 = 120.0;
 pub const SCALE_MIN_H: f64 = 80.0;
+/// Upper clamp: a window never scales past this (canvas px).
+pub const SCALE_MAX_DIM: f64 = 4096.0;
 
-/// Scale step: centre stays, size tracks the mouse delta from the grab
-/// point, clamped to the minimum. Pure: unit-tested below.
-pub fn apply_scale(
+/// Radial scale step: factor = |mouse - center| / |grab - center|,
+/// size = size0 * factor, centre pinned. The grab distance is floored
+/// so grabbing near the centre never divides by ~zero (it just makes
+/// the factor eager). Pure: unit-tested below.
+pub fn apply_radial_scale(
     center: Vec2,
     size0: Vec2,
-    mouse_delta: Vec2,
+    grab: Vec2,
+    mouse: Vec2,
 ) -> (Vec2, Vec2) {
-    let w = (size0.x + mouse_delta.x).max(SCALE_MIN_W);
-    let h = (size0.y + mouse_delta.y).max(SCALE_MIN_H);
+    let d0 = ((grab.x - center.x).powi(2) + (grab.y - center.y).powi(2))
+        .sqrt()
+        .max(8.0);
+    let d = ((mouse.x - center.x).powi(2) + (mouse.y - center.y).powi(2)).sqrt();
+    let f = d / d0;
+    let w = (size0.x * f).clamp(SCALE_MIN_W, SCALE_MAX_DIM);
+    let h = (size0.y * f).clamp(SCALE_MIN_H, SCALE_MAX_DIM);
     (Vec2::new(center.x - w * 0.5, center.y - h * 0.5), Vec2::new(w, h))
 }
 
@@ -182,6 +196,23 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_rect_times_live_zoom_is_always_the_view() {
+        // The per-frame refit feeds to_canvas at the LIVE zoom: rect *
+        // zoom must equal the view at any zoom, or quitting Super (or a
+        // wheel glide) after F leaves the app looking "zoomed into".
+        let view = Vec2::new(1280.0, 800.0);
+        for zoom in [1.0, 0.9, 0.85, 1.3225, 0.5] {
+            let rect = fullscreen_rect_for(view, &|s| {
+                Vec2::new(s.x / zoom, s.y / zoom)
+            });
+            assert!((rect.size.x * zoom - view.x).abs() < 1e-9, "zoom {}", zoom);
+            assert!((rect.size.y * zoom - view.y).abs() < 1e-9, "zoom {}", zoom);
+            assert!((rect.pos.x * zoom).abs() < 1e-9, "zoom {}", zoom);
+            assert!((rect.pos.y * zoom).abs() < 1e-9, "zoom {}", zoom);
+        }
+    }
+
+    #[test]
     fn hover_keys_map_without_modifiers_only() {
         assert_eq!(hover_shortcut(KEY_F, false), Some(HoverKey::Fullscreen));
         assert_eq!(hover_shortcut(KEY_Q, false), Some(HoverKey::Close));
@@ -193,23 +224,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_scale_pins_center_and_clamps() {
+    fn apply_radial_scale_from_center_grows_everywhere() {
         let center = Vec2::new(300.0, 250.0);
         let size0 = Vec2::new(400.0, 300.0);
-        // +40/+20 from the grab point: grows, centre pinned.
-        let (pos, size) = apply_scale(center, size0, Vec2::new(40.0, 20.0));
-        assert_eq!((size.x, size.y), (440.0, 320.0));
-        assert_eq!((pos.x, pos.y), (300.0 - 220.0, 250.0 - 160.0));
-        // Shrink: centre still pinned.
-        let (pos, size) = apply_scale(center, size0, Vec2::new(-100.0, -50.0));
-        assert_eq!((size.x, size.y), (300.0, 250.0));
-        assert_eq!((pos.x, pos.y), (150.0, 125.0));
-        // Clamp: never below the minimum, centre still pinned.
-        let (pos, size) = apply_scale(center, size0, Vec2::new(-1000.0, -1000.0));
+        // Grab bottom-right of the centre: d0 = (40,30) -> 50.
+        let grab = Vec2::new(340.0, 280.0);
+        // Twice as far along the same ray: doubles, centre pinned.
+        let (pos, size) =
+            apply_radial_scale(center, size0, grab, Vec2::new(380.0, 310.0));
+        assert_eq!((size.x, size.y), (800.0, 600.0));
+        assert_eq!((pos.x, pos.y), (300.0 - 400.0, 250.0 - 300.0));
+        // Top-left ray, moving AWAY: grows too (the old delta shrank).
+        let (pos, size) =
+            apply_radial_scale(center, size0, Vec2::new(260.0, 220.0), Vec2::new(220.0, 190.0));
+        assert_eq!((size.x, size.y), (800.0, 600.0));
+        assert_eq!((pos.x, pos.y), (300.0 - 400.0, 250.0 - 300.0));
+        // Cursor at the centre: tiny (floored at the minimum).
+        let (pos, size) = apply_radial_scale(center, size0, grab, center);
         assert_eq!((size.x, size.y), (SCALE_MIN_W, SCALE_MIN_H));
         assert_eq!(
             (pos.x, pos.y),
             (300.0 - SCALE_MIN_W * 0.5, 250.0 - SCALE_MIN_H * 0.5)
         );
+        // Aspect preserved: uniform factor, no stretch.
+        let (_, size) =
+            apply_radial_scale(center, size0, grab, Vec2::new(360.0, 295.0));
+        assert!((size.x / size.y - 400.0 / 300.0).abs() < 1e-9);
     }
 }
