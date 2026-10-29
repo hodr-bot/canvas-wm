@@ -56,6 +56,34 @@ fn button_code(button: MouseButton) -> u32 {
     }
 }
 
+/// Pick the destination of a key release: the XTEST xid recorded at
+/// press time when there is one (a press in A, a click on B, then the
+/// release must still reach A or A's key sticks down), otherwise the
+/// xid under the current focus (press predates us). None both ways
+/// means the wl seat. Pure so the anti-stick rule stays test-locked.
+fn resolve_release(
+    routes: &std::collections::HashMap<u32, Option<u32>>,
+    evdev: u32,
+    focus_xid: Option<u32>,
+) -> Option<u32> {
+    match routes.get(&evdev) {
+        Some(recorded) => *recorded,
+        None => focus_xid,
+    }
+}
+
+/// Memorise a press destination, first press wins: auto-repeats
+/// re-fire pressed while the key is held and must NOT re-route after
+/// a focus change, or the release follows the repeat instead of the
+/// press and the first window sticks. Returns the recorded dest.
+fn note_press(
+    routes: &mut std::collections::HashMap<u32, Option<u32>>,
+    evdev: u32,
+    focus_xid: Option<u32>,
+) -> Option<u32> {
+    *routes.entry(evdev).or_insert(focus_xid)
+}
+
 /// Tell a client its size in SCREEN px so the buffer follows (real
 /// resize, never a stretch-zoom): X via ConfigureWindow, natives via
 /// configure. `fullscreen` carries the state flag for natives; X
@@ -167,6 +195,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut known_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Focused canvas window.
     let mut focused_id: Option<u64> = None;
+    // Press routing memory: evdev keycode -> XTEST xid at press time
+    // (None = the wl seat). A release follows its PRESS destination,
+    // never the current focus: press in A, click B, release must reach
+    // A or A's key sticks down forever (repeat). Releases with no
+    // recorded press (predates us) fall back to the current focus.
+    let mut key_routes: std::collections::HashMap<u32, Option<u32>> =
+        std::collections::HashMap::new();
     // Popup holding keyboard focus: (popup id, parent id). A press inside
     // a menu/tooltip focuses its surface so menus take keys — but when the
     // popup dies (tooltip timeout, menu dismiss) the seat would point at a
@@ -500,10 +535,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             _ => {}
                         }
                     } else {
-                        // Release while open: forward to the app (anti-stick).
-                        let xid = focused_id
+                        // Release while open: follow the press destination
+                        // (anti-stick), current focus only as fallback.
+                        let focus_xid = focused_id
                             .and_then(|id| server_state.windows.get(&id))
                             .and_then(|c| c.x11);
+                        let xid = resolve_release(&key_routes, evdev, focus_xid);
+                        key_routes.remove(&evdev);
                         match (xwm.as_ref(), xid) {
                             (Some(wm), Some(xid)) => wm.xtest_key(xid, evdev, false),
                             _ => server.input_key(evdev, false),
@@ -878,9 +916,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     // toggle never sticks down in the app.
                     if session.state == crate::session::SuperState::Canvas {
                         if !pressed {
-                            let xid = focused_id
+                            let focus_xid = focused_id
                                 .and_then(|id| server_state.windows.get(&id))
                                 .and_then(|c| c.x11);
+                            let xid =
+                                resolve_release(&key_routes, evdev, focus_xid);
+                            key_routes.remove(&evdev);
                             match (xwm.as_ref(), xid) {
                                 (Some(wm), Some(xid)) => {
                                     wm.xtest_key(xid, evdev, false)
@@ -891,9 +932,34 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         return;
                     }
                     // X-backed focus eats keys via XTEST, not the wl seat.
-                    let xid = focused_id
+                    // Presses memorise their destination; releases follow
+                    // it (anti-stick across focus changes).
+                    let focus_xid = focused_id
                         .and_then(|id| server_state.windows.get(&id))
                         .and_then(|c| c.x11);
+                    let xid = if pressed {
+                        // First press wins: auto-repeats re-fire pressed
+                        // while held, and must NOT re-route after a focus
+                        // change, or the release follows the repeat, not
+                        // the press, and the first window sticks.
+                        let dest = note_press(&mut key_routes, evdev, focus_xid);
+                        log::debug!(
+                            "key press evdev={} dest {:?} routes={}",
+                            evdev,
+                            dest,
+                            key_routes.len()
+                        );
+                        dest
+                    } else {
+                        let found = key_routes.get(&evdev).copied();
+                        let dest = resolve_release(&key_routes, evdev, focus_xid);
+                        key_routes.remove(&evdev);
+                        log::debug!(
+                            "key release evdev={} dest {:?} (focus now {:?}) found={:?}",
+                            evdev, dest, focus_xid, found
+                        );
+                        dest
+                    };
                     match (xwm.as_ref(), xid) {
                         (Some(wm), Some(xid)) => wm.xtest_key(xid, evdev, pressed),
                         _ => server.input_key(evdev, pressed),
@@ -1267,10 +1333,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             InputEvent::PointerAxis { event } => {
                 // Wheel: in Canvas mode it ALWAYS zooms at the pointer —
                 // apps are frozen, so scrolling a client would go nowhere
-                // (that dead wheel over windows was the bug). In Idle the
-                // old split stays: empty canvas zooms, a window under the
-                // cursor scrolls its client. Zoom glides (smooth fade,
-                // momentum kept), never snaps by notches.
+                // (that dead wheel over windows was the bug). Anywhere
+                // else (Idle) the wheel NEVER zooms: it always goes to
+                // the client as scroll, even over empty canvas. Zoom
+                // glides (smooth fade, momentum kept), never snaps by
+                // notches.
                 let vertical = event
                     .amount(Axis::Vertical)
                     .or_else(|| event.amount_discrete(Axis::Vertical).map(|s| s as f64))
@@ -1278,12 +1345,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 if vertical != 0.0 {
                     let canvas_mode =
                         session.state == crate::session::SuperState::Canvas;
-                    let cworld = session.to_canvas(pointer, view);
-                    let over_window = server_state
-                        .windows
-                        .iter()
-                        .any(|(_, c)| c.canvas.contains(cworld));
-                    if canvas_mode || !over_window {
+                    if canvas_mode {
                         let factor = if vertical > 0.0 { 1.15 } else { 1.0 / 1.15 };
                         session.zoom_glide_at(pointer, view, factor);
                         log::info!("wheel zoom->{:.2}", session.camera.zoom_target);
@@ -2246,7 +2308,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     + (cell_w - name_w) / 2.0;
                                 draw_menu_line(
                                     gl, tprog, &mvp, atlas_id, &mut font_cache, tx,
-                                    tab_top + 7.0 * sc, sc, name,
+                                    tab_top + crate::menu::TEXT_DY as f32 * sc, sc, name,
                                 );
                                 if active {
                                     crate::render3d::draw_solid(
@@ -2255,9 +2317,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         &mvp,
                                         accent,
                                         (
-                                            px0 + ti as f32 * cell_w + 8.0 * sc,
-                                            tab_top + row_h - 4.0 * sc,
-                                            cell_w - 16.0 * sc,
+                                            tx - 4.0 * sc,
+                                            tab_top + row_h - 5.0 * sc,
+                                            name_w + 8.0 * sc,
                                             3.0 * sc,
                                         ),
                                     );
@@ -2268,7 +2330,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             for (i, row) in rows.iter().enumerate() {
                                 let (_, rpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + (i + 1) as f64 * crate::menu::ROW_H);
                                 let rpy = rpy + slide_px;
-                                let ty = rpy + 7.0 * sc;
+                                let ty = rpy + crate::menu::TEXT_DY as f32 * sc;
                                 let crate::menu::Row::Item(it) = row else {
                                     continue;
                                 };
@@ -2301,16 +2363,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 // Slider track + fill under the text.
                                 if let Some(fill) = it.slider_fill(&settings) {
                                     let tw = 260.0 * sc;
-                                    let th = 5.0 * sc;
+                                    let th = crate::menu::TRACK_H as f32 * sc;
                                     let tx0 = px0 + pad;
-                                    let ty0 = rpy + row_h - 9.0 * sc;
+                                    let ty0 = rpy + row_h
+                                        - (crate::menu::TRACK_PAD_BOTTOM as f32
+                                            + crate::menu::TRACK_H as f32)
+                                            * sc;
                                     crate::render3d::draw_rounded(
                                         gl,
                                         rprog,
                                         &mvp,
                                         [0.17, 0.22, 0.33, 1.0],
                                         (tx0, ty0, tw, th),
-                                        2.5 * sc,
+                                        crate::menu::TRACK_H as f32 * sc / 2.0,
                                     );
                                     crate::render3d::draw_rounded(
                                         gl,
@@ -2318,7 +2383,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         &mvp,
                                         accent,
                                         (tx0, ty0, tw * fill.clamp(0.0, 1.0), th),
-                                        2.5 * sc,
+                                        crate::menu::TRACK_H as f32 * sc / 2.0,
                                     );
                                 }
                                 // Toggle pill, right-aligned: accent when
@@ -2386,7 +2451,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 let (_, fpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + (rows.len() + 1 + fi) as f64 * crate::menu::ROW_H);
                                 draw_menu_line(
                                     gl, tprog, &mvp, atlas_id, &mut font_cache, px0 + pad,
-                                    fpy + slide_px + 7.0 * sc, sc, foot,
+                                    fpy + slide_px + crate::menu::TEXT_DY as f32 * sc, sc, foot,
                                 );
                             }
                         });
@@ -2475,5 +2540,34 @@ mod tests {
             assert_eq!(c[3], 1.0);
             assert!(c[0] >= 0.0 && c[1] <= 0.2);
         }
+    }
+
+    #[test]
+    fn release_follows_press_not_focus() {
+        use std::collections::HashMap;
+        // Press in A (xid 11), focus moves to B (xid 22): the release
+        // still goes to A.
+        let mut routes: HashMap<u32, Option<u32>> = HashMap::new();
+        routes.insert(30, Some(11));
+        assert_eq!(resolve_release(&routes, 30, Some(22)), Some(11));
+        // Press on the seat (native focus), focus moves to X: release
+        // goes to the seat, never to X.
+        routes.insert(31, None);
+        assert_eq!(resolve_release(&routes, 31, Some(22)), None);
+        // No recorded press: current focus wins (predating press).
+        assert_eq!(resolve_release(&routes, 99, Some(22)), Some(22));
+        assert_eq!(resolve_release(&routes, 99, None), None);
+    }
+
+    #[test]
+    fn first_press_wins_over_repeats() {
+        use std::collections::HashMap;
+        let mut routes: HashMap<u32, Option<u32>> = HashMap::new();
+        // Initial press in A records A.
+        assert_eq!(note_press(&mut routes, 30, Some(11)), Some(11));
+        // Auto-repeat after a focus move to B must NOT re-route.
+        assert_eq!(note_press(&mut routes, 30, Some(22)), Some(11));
+        // The release then follows the press, not the focus.
+        assert_eq!(resolve_release(&routes, 30, Some(22)), Some(11));
     }
 }
