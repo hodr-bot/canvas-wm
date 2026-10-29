@@ -224,14 +224,20 @@ impl Session {
     /// mid-glide value, so fast scrolling never ratchets or kills a
     /// glide-back in progress (quitting Super then touching the wheel
     /// keeps the return trip, it just aims it a notch further).
+    /// The anchor itself is computed in target space (settled zoom and
+    /// settled position): consecutive notches share one stable base
+    /// instead of re-anchoring off a moving mid-glide frame, which was
+    /// the judder.
     pub fn zoom_glide_at(&mut self, screen: Vec2, view: Vec2, factor: f64) {
-        let anchor = self.to_world(screen, view);
-        let zt = (self.camera.zoom_target * factor).clamp(0.05, 4.0);
+        let base_z = self.camera.zoom_target;
+        let base_p = self.camera.target;
+        let anchor =
+            Vec2::new((screen.x - view.x * 0.5) / base_z + base_p.x - self.canvas.offset.x,
+                      (screen.y - view.y * 0.5) / base_z + base_p.y - self.canvas.offset.y);
+        let zt = (base_z * factor).clamp(0.05, 4.0);
         self.camera.zoom_to(zt);
-        self.canvas.offset.x =
-            (screen.x - view.x * 0.5) / zt + self.camera.pos.x - anchor.x;
-        self.canvas.offset.y =
-            (screen.y - view.y * 0.5) / zt + self.camera.pos.y - anchor.y;
+        self.canvas.offset.x = (screen.x - view.x * 0.5) / zt + base_p.x - anchor.x;
+        self.canvas.offset.y = (screen.y - view.y * 0.5) / zt + base_p.y - anchor.y;
     }
 
     pub fn on_event(

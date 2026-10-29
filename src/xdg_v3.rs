@@ -9,7 +9,9 @@
 //! Maximized/fullscreen states are accepted and ignored for now (a later
 //! pass wires them to the canvas fullscreen).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use smithay::reexports::wayland_protocols::xdg_shell::server::{
     xdg_popup, xdg_surface, xdg_toplevel, xdg_wm_base,
@@ -29,6 +31,58 @@ fn next_serial() -> Serial {
 struct SurfaceData {
     wl_surface: wl_surface::WlSurface,
     has_role: AtomicBool,
+}
+
+/// Live v3 toplevels by canvas window id: the only way to send a later
+/// configure (fullscreen resize) to a client bound here instead of the
+/// Smithay v1 global.
+struct SendPair(Main<xdg_toplevel::XdgToplevel>, Main<xdg_surface::XdgSurface>);
+// The compositor is single-threaded: every access runs on the main
+// thread, so holding Mains across calls is sound here.
+unsafe impl Send for SendPair {}
+static TOPLEVELS: OnceLock<Mutex<HashMap<u64, SendPair>>> = OnceLock::new();
+
+fn toplevels() -> &'static Mutex<HashMap<u64, SendPair>> {
+    TOPLEVELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_toplevel(
+    win: u64,
+    tl: Main<xdg_toplevel::XdgToplevel>,
+    surf: Main<xdg_surface::XdgSurface>,
+) {
+    toplevels().lock().unwrap().insert(win, SendPair(tl, surf));
+}
+
+fn unregister_toplevel(win: u64) {
+    toplevels().lock().unwrap().remove(&win);
+}
+
+/// Reconfigure a v3 client window: real resize (the client re-renders at
+/// the new size) plus the fullscreen flag. State words are u32 LE:
+/// Activated=4, Fullscreen=2. Returns false when the id is not a live v3
+/// toplevel (v1 clients go through Smithay's ShellState instead).
+pub fn configure_toplevel(win: u64, w: i32, h: i32, fullscreen: bool) -> bool {
+    let map = toplevels().lock().unwrap();
+    if let Some(pair) = map.get(&win) {
+        let states = if fullscreen {
+            vec![6, 0, 0, 0]
+        } else {
+            vec![4, 0, 0, 0]
+        };
+        pair.0.configure(w, h, states);
+        pair.1.configure(next_serial().into());
+        log::info!(
+            "xdg v3 configure window {} {}x{} fullscreen={}",
+            win,
+            w,
+            h,
+            fullscreen
+        );
+        true
+    } else {
+        false
+    }
 }
 
 /// Advertise `xdg_wm_base` version 3 alongside Smithay's version 1 global.
@@ -108,8 +162,12 @@ fn surface_implementation(
                         state.close_window(win_id);
                         log::info!("xdg v3 toplevel destroyed, window {}", win_id);
                     }
+                    unregister_toplevel(win_id);
                 }
             }));
+            if let Some(win_id) = win_id {
+                register_toplevel(win_id, id.clone(), xdg_surface.clone());
+            }
             id.as_ref().user_data().set(|| ToplevelData {
                 xdg_surface: xdg_surface.clone(),
                 win_id,

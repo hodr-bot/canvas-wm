@@ -98,20 +98,6 @@ impl Camera {
         let ay = STIFFNESS * (self.target.y - self.pos.y) - damping * self.vel.y;
         self.vel.x += ax * dt;
         self.vel.y += ay * dt;
-        // Cruise-speed clamp: an undamped spring peaks at ~3.5x the
-        // distance, so far windows (fullscreen worst case) fly past
-        // much faster than near ones — the "bigger window = faster"
-        // feel. Capping the speed keeps one feel everywhere: short
-        // hops never reach the cap (untouched), long hauls cruise at
-        // the cap then ease out on the spring. Arrival stays soft —
-        // the spring owns every landing below the cap.
-        const VMAX: f64 = 1500.0;
-        let sp2 = self.vel.x * self.vel.x + self.vel.y * self.vel.y;
-        if sp2 > VMAX * VMAX {
-            let k = VMAX / sp2.sqrt();
-            self.vel.x *= k;
-            self.vel.y *= k;
-        }
         self.pos.x += self.vel.x * dt;
         self.pos.y += self.vel.y * dt;
         let dx = self.target.x - self.pos.x;
@@ -511,34 +497,6 @@ mod tests {
         assert_eq!(hit, Some(1));
         let miss = focus_in_direction(from, Vec2::new(-1.0, -1.0), &[wins[0].clone()]);
         assert_eq!(miss, None);
-    }
-
-    #[test]
-    fn cruise_clamp_same_feel_near_and_far() {
-        // Peak speed over a whole flight. Far hauls must not outrun
-        // near hops: the cap binds long flights, short ones never
-        // reach it (spring untouched below the cap).
-        fn peak(dist: f64) -> f64 {
-            let mut cam = Camera::new();
-            cam.retarget(Vec2::new(dist, 0.0));
-            let mut peak = 0.0f64;
-            for _ in 0..1200 {
-                if !cam.step(1.0 / 120.0) {
-                    break;
-                }
-                peak = peak.max((cam.vel.x * cam.vel.x + cam.vel.y * cam.vel.y).sqrt());
-            }
-            assert!(!cam.flying());
-            assert_eq!(cam.pos.x, dist);
-            peak
-        }
-        let near = peak(200.0);
-        let far = peak(2000.0);
-        assert!(far <= 1500.0 + 1e-9, "far flight peaks at {:.0}", far);
-        // Near hop keeps its natural spring peak (~3.5x distance),
-        // far below the cap: the clamp never touched it.
-        assert!(near < 1000.0, "near flight peaks at {:.0}", near);
-        assert!(far < 2.5 * near, "far {:.0} vs near {:.0}", far, near);
     }
 
     #[test]

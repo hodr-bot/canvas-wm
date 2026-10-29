@@ -145,8 +145,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut server_state = ServerState::default();
     let (mut server, socket) = Server::new().map_err(|e| format!("wayland bind: {}", e))?;
     log::info!("wayland socket ready on {:?}", socket);
-    // Logical size of the winit window; replaced by real output sizes on udev.
-    let view = crate::canvas::Vec2::new(1280.0, 800.0);
+    // Logical size of the winit window; refreshed every frame below
+    // (fullscreen/resize changes it).
+    let mut view = crate::canvas::Vec2::new(1280.0, 800.0);
+    let mut last_view = view;
     let mut pointer = crate::canvas::Vec2::new(640.0, 400.0);
     let mut frames: u64 = 0;
     // Window ids the seat already knows about; a change re-asserts focus so
@@ -345,6 +347,28 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
         }
         let mut need_render = false;
+        // Output size, refreshed every frame BEFORE input: going
+        // fullscreen/resize changes the logical view, and every mapping
+        // hangs off it (ortho projection, pick centres, seat origins).
+        // A stale view scales all motion (2x on a 2K fullscreen) and
+        // offsets every native click.
+        {
+            let ws = graphics.window_size();
+            view = crate::canvas::Vec2::new(
+                ws.physical_size.w as f64 / ws.scale_factor,
+                ws.physical_size.h as f64 / ws.scale_factor,
+            );
+            if view != last_view {
+                log::info!(
+                    "view {:.0}x{:.0} scale={:.2}",
+                    view.x,
+                    view.y,
+                    ws.scale_factor
+                );
+                last_view = view;
+                need_render = true;
+            }
+        }
         match input.dispatch_new_events(|event| match event {
             InputEvent::Keyboard { event } => {
                 let pressed = matches!(event.state(), KeyState::Pressed);
@@ -655,17 +679,39 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             );
                                             let on =
                                                 server_state.toggle_fullscreen(id, &rect);
+                                            // True fullscreen: tell the client its
+                                            // new size so the buffer follows (real
+                                            // resize, never a stretch-zoom).
+                                            let r =
+                                                server_state.windows[&id].canvas;
                                             if let Some(xid) = server_state
                                                 .windows
                                                 .get(&id)
                                                 .and_then(|c| c.x11)
                                             {
-                                                let r = server_state.windows[&id].canvas;
                                                 if let Some(wm) = xwm.as_ref() {
                                                     wm.configure(
                                                         xid,
                                                         r.size.x as u32,
                                                         r.size.y as u32,
+                                                    );
+                                                }
+                                            } else if let Some(surf) = server_state
+                                                .windows
+                                                .get(&id)
+                                                .and_then(|c| c.surface.clone())
+                                            {
+                                                if !server.configure_native_stable(
+                                                    &surf,
+                                                    r.size.x as i32,
+                                                    r.size.y as i32,
+                                                    on,
+                                                ) {
+                                                    crate::xdg_v3::configure_toplevel(
+                                                        id,
+                                                        r.size.x as i32,
+                                                        r.size.y as i32,
+                                                        on,
                                                     );
                                                 }
                                             }
@@ -1025,20 +1071,39 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         });
                                         let on =
                                             server_state.toggle_fullscreen(chrome_id, &rect);
-                                        // True fullscreen: tell the X client its
-                                        // new size so the buffer follows.
+                                        // True fullscreen: tell the client its
+                                        // new size so the buffer follows (real
+                                        // resize, never a stretch-zoom).
+                                        let r =
+                                            server_state.windows[&chrome_id].canvas;
                                         if let Some(xid) = server_state
                                             .windows
                                             .get(&chrome_id)
                                             .and_then(|c| c.x11)
                                         {
-                                            let r =
-                                                server_state.windows[&chrome_id].canvas;
                                             if let Some(wm) = xwm.as_ref() {
                                                 wm.configure(
                                                     xid,
                                                     r.size.x as u32,
                                                     r.size.y as u32,
+                                                );
+                                            }
+                                        } else if let Some(surf) = server_state
+                                            .windows
+                                            .get(&chrome_id)
+                                            .and_then(|c| c.surface.clone())
+                                        {
+                                            if !server.configure_native_stable(
+                                                &surf,
+                                                r.size.x as i32,
+                                                r.size.y as i32,
+                                                on,
+                                            ) {
+                                                crate::xdg_v3::configure_toplevel(
+                                                    chrome_id,
+                                                    r.size.x as i32,
+                                                    r.size.y as i32,
+                                                    on,
                                                 );
                                             }
                                         }
@@ -1197,6 +1262,28 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 WinitEvent::Resized { .. } => need_render = true,
                 WinitEvent::Focus(focused) => {
                     log::info!("focus {}", focused);
+                    if !focused {
+                        // Keys released outside never arrive: drop every
+                        // held state or it wedges (E-grab stuck, Super
+                        // phantom-held, focus guard blind) until restart.
+                        e_grab = None;
+                        grab = None;
+                        panning = None;
+                        pan_start = None;
+                        r_resize = None;
+                        r_swallow_left = false;
+                        r_swallow_right = false;
+                        held_mods.clear();
+                        super_held = false;
+                        f_held = false;
+                        q_held = false;
+                        r_held = false;
+                        for h in wasd_held.iter_mut() {
+                            *h = false;
+                        }
+                        session.dwell.disarm();
+                        need_render = true;
+                    }
                 }
             },
             _ => {}

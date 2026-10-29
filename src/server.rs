@@ -594,6 +594,42 @@ impl Server {
     pub fn input_axis(&mut self, frame: AxisFrame) {
         self.pointer.axis(frame);
     }
+
+    /// Reconfigure a natively-fullscreened window on the Smithay v1 path:
+    /// real client resize + fullscreen state so the buffer follows instead
+    /// of stretching (the "F zooms the app" look). False when the surface
+    /// is not a tracked v1 toplevel (v3 clients use xdg_v3::configure).
+    pub fn configure_native_stable(
+        &self,
+        surface: &WlSurface,
+        w: i32,
+        h: i32,
+        fullscreen: bool,
+    ) -> bool {
+        use smithay::reexports::wayland_protocols::xdg_shell::server::xdg_toplevel::State;
+        let shell = self._shell_state.lock().unwrap();
+        for tl in shell.toplevel_surfaces() {
+            if tl.get_surface() == Some(surface) {
+                let _ = tl.with_pending_state(|s| {
+                    s.size = Some((w, h).into());
+                    if fullscreen {
+                        s.states.set(State::Fullscreen);
+                    } else {
+                        s.states.unset(State::Fullscreen);
+                    }
+                });
+                tl.send_configure();
+                log::info!(
+                    "xdg v1 configure {}x{} fullscreen={}",
+                    w,
+                    h,
+                    fullscreen
+                );
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Canvas position of the nth window, for tests and future tiling helpers.
@@ -783,10 +819,12 @@ mod seat_tests {
             _ => {}
         });
         let surface = compositor.create_surface();
+        let cfg_events = events.clone();
         let xdg_surface = wm_base.get_xdg_surface(&surface);
-        xdg_surface.quick_assign(|xdg_surface, event, mut data| match event {
+        xdg_surface.quick_assign(move |xdg_surface, event, mut data| match event {
             xdg_surface::Event::Configure { serial } => {
                 xdg_surface.ack_configure(serial);
+                cfg_events.borrow_mut().push("configure".into());
                 if let Some(done) = data.get::<bool>() {
                     *done = true;
                 }
@@ -805,7 +843,7 @@ mod seat_tests {
         server.input_key(16, true);
         server.input_key(16, false);
         let local = (10, 10);
-        server.input_motion((0.0, 0.0), Some((surf, local)));
+        server.input_motion((0.0, 0.0), Some((surf.clone(), local)));
         server.input_button(0x110, true);
         server.input_button(0x110, false);
         pump_both(&mut server, &mut state, &display, &mut queue, 40);
@@ -815,5 +853,25 @@ mod seat_tests {
         assert!(got.contains("key 16"), "key event:\n{}", got);
         assert!(got.contains("pt-enter"), "pointer enter:\n{}", got);
         assert!(got.contains("button 272"), "button event:\n{}", got);
+        // Fullscreen configure reaches the native client (real resize,
+        // not a stretch): the toplevel is tracked and a new configure
+        // lands after the call.
+        let cfgs = || {
+            events
+                .borrow()
+                .iter()
+                .filter(|e| e.as_str() == "configure")
+                .count()
+        };
+        let before = cfgs();
+        assert!(
+            server.configure_native_stable(&surf, 800, 600, true),
+            "v1 toplevel tracked"
+        );
+        pump_both(&mut server, &mut state, &display, &mut queue, 40);
+        assert!(
+            cfgs() > before,
+            "client received the fullscreen configure"
+        );
     }
 }
