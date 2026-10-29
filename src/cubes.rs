@@ -332,6 +332,69 @@ impl Cube {
     }
 }
 
+/// Overhead lamp swinging just off-screen, above the top edge, at
+/// canvas height. Shadows fall away from it (down-screen); the camera
+/// shoves it like a chandelier: pan right and the lamp lags left.
+/// Pure state — stepped by the backend, unit-tested here.
+pub struct Lamp {
+    /// Pendulum angle (rad). 0 = centred above the view.
+    pub theta: f64,
+    /// Angular velocity (rad/s).
+    pub omega: f64,
+}
+
+impl Lamp {
+    pub fn new() -> Self {
+        Lamp {
+            theta: 0.0,
+            omega: 0.0,
+        }
+    }
+
+    /// Step by `dt`: gentle self-sway so it lives in idle, pendulum
+    /// spring + damping, minus a push from the camera x velocity.
+    pub fn step(&mut self, dt: f64, cam_vel_x: f64, t: f64) {
+        const DRIVE: f64 = 0.35; // self-sway torque (rad/s^2)
+        const SWAY_W: f64 = 0.5; // sway frequency (rad/s, ~12.6 s period)
+        const STIFF: f64 = 2.2; // pendulum (g/L)
+        const DAMP: f64 = 0.6; // damping (/s)
+        const PUSH: f64 = 0.0011; // camera coupling
+        let acc = DRIVE * (t * SWAY_W).sin() - STIFF * self.theta.sin()
+            - DAMP * self.omega
+            - PUSH * cam_vel_x;
+        self.omega += acc * dt;
+        self.theta += self.omega * dt;
+        // Keep the lamp above the screen: clamp the swing.
+        if self.theta > 1.2 {
+            self.theta = 1.2;
+            self.omega = 0.0;
+        }
+        if self.theta < -1.2 {
+            self.theta = -1.2;
+            self.omega = 0.0;
+        }
+    }
+
+    /// World position of the source: above the top screen edge, swung
+    /// sideways by the pendulum. `mid` = world view centre, `half_w` /
+    /// `half_h` = world half-extents of the view.
+    pub fn source(&self, mid: Vec2, half_w: f64, half_h: f64) -> Vec2 {
+        Vec2::new(
+            mid.x + self.theta.sin() * half_w * 0.9,
+            mid.y - half_h * 1.15,
+        )
+    }
+
+    /// Shadow direction at a world point: from the source through the
+    /// point (unit 2D vector, pointing down-screen while the lamp is
+    /// above).
+    pub fn shadow_dir(&self, at: Vec2, src: Vec2) -> Vec2 {
+        let dx = at.x - src.x;
+        let dy = at.y - src.y;
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        Vec2::new(dx / len, dy / len)
+    }
+}
 /// Cube faces: (body axis, 4 corner indices). Corner order from
 /// [`Cube::corners`]: sz fastest, then sy, then sx — i = sz_bit +
 /// sy_bit*2 + sx_bit*4. -X face: {0,1,2,3}; +X: {4,5,6,7};
@@ -499,6 +562,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn lamp_sways_bounded_without_camera() {
+        let mut lamp = Lamp::new();
+        for i in 0..1200 {
+            lamp.step(1.0 / 60.0, 0.0, i as f64 / 60.0);
+        }
+        assert!(
+            lamp.theta.abs() < 0.6,
+            "self-sway stays bounded, theta={}",
+            lamp.theta
+        );
+        // It must actually move, not sit at zero.
+        let mut lamp = Lamp::new();
+        let mut peak: f64 = 0.0;
+        for i in 0..800 {
+            lamp.step(1.0 / 60.0, 0.0, i as f64 / 60.0);
+            peak = peak.max(lamp.theta.abs());
+        }
+        assert!(peak > 0.05, "lamp visibly sways, peak={}", peak);
+    }
+
+    #[test]
+    fn lamp_lags_against_camera_push() {
+        let mut lamp = Lamp::new();
+        // Camera rushing +x: the chandelier lags -x (negative theta).
+        for i in 0..120 {
+            lamp.step(1.0 / 60.0, 2000.0, i as f64 / 60.0);
+        }
+        assert!(lamp.theta < -0.1, "pushed left, theta={}", lamp.theta);
+    }
+
+    #[test]
+    fn lamp_source_stays_above_screen() {
+        let mid = Vec2::new(100.0, 200.0);
+        let lamp = Lamp::new();
+        let s = lamp.source(mid, 400.0, 300.0);
+        assert!(s.y < 200.0 - 300.0, "off-screen above, y={}", s.y);
+        assert!((s.x - 100.0).abs() < 1e-9, "centred at rest");
+    }
+
+    #[test]
+    fn lamp_shadow_falls_down_screen() {
+        let lamp = Lamp::new();
+        let src = Vec2::new(0.0, -500.0);
+        let d = lamp.shadow_dir(Vec2::new(60.0, 100.0), src);
+        assert!(d.y > 0.7, "mostly downward, dy={}", d.y);
+        let len = (d.x * d.x + d.y * d.y).sqrt();
+        assert!((len - 1.0).abs() < 1e-9, "unit vector");
     }
 
     #[test]

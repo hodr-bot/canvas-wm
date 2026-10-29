@@ -257,6 +257,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Toy cubes (K key, Canvas mode): canvas-anchored physics bodies.
     let mut cubes: Vec<crate::cubes::Cube> = Vec::new();
     let mut cube_seed: u64 = 0xC0BEu64;
+    // Overhead lamp (off-screen, above the top edge): pendulum state +
+    // clock. Shadows repaint at most 4 Hz from the lamp alone so idle
+    // stays cheap; camera pans repaint every frame anyway.
+    let mut lamp = crate::cubes::Lamp::new();
+    let mut lamp_t: f64 = 0.0;
+    let mut lamp_painted = 0.0f64;
+    let mut lamp_cooldown = 0.0f64;
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): window id + pinned centre +
     // size at grab + mouse canvas pos at grab + last pushed client
@@ -1615,6 +1622,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         need_render = true;
                     }
                 }
+                // Lamp pendulum: camera shoves it, self-sway keeps it
+                // alive in idle. Throttled repaints (see decl).
+                lamp_t += dt;
+                lamp.step(dt, cam_vel.x, lamp_t);
+                lamp_cooldown -= dt;
+                if (lamp.theta - lamp_painted).abs() > 0.004 && lamp_cooldown <= 0.0 {
+                    lamp_painted = lamp.theta;
+                    lamp_cooldown = 0.25;
+                    need_render = true;
+                }
             }
         }
 
@@ -2300,11 +2317,97 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 n.2,
                             )
                         };
-                        // Fixed key light (world, y-down canvas plane).
-                        let light = {
-                            let l: [f64; 3] = [-0.35, -0.5, 0.8];
-                            let m = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
-                            [l[0] / m, l[1] / m, l[2] / m]
+                        // Lamp source in world (canvas px): above the top
+                        // edge, swinging with the pendulum.
+                        let zoom = session.view_camera().zoom;
+                        let lamp_src = lamp.source(
+                            crate::canvas::Vec2::new(mid.x, mid.y),
+                            view.x / zoom / 2.0,
+                            view.y / zoom / 2.0,
+                        );
+                        let walls: Vec<(f64, f64, f64, f64)> = server_state
+                            .windows
+                            .values()
+                            .map(|c| {
+                                (
+                                    c.canvas.pos.x,
+                                    c.canvas.pos.y,
+                                    c.canvas.size.x,
+                                    c.canvas.size.y,
+                                )
+                            })
+                            .collect();
+                        // Window shadows: extruded silhouettes falling away
+                        // from the lamp (windows stand WALL_H tall, static).
+                        {
+                            let wlen = crate::cubes::WALL_H * 1.6;
+                            let mut tris: Vec<f32> = Vec::new();
+                            for (wx, wy, ww, wh) in walls.iter() {
+                                let sd = lamp.shadow_dir(
+                                    crate::canvas::Vec2::new(
+                                        wx + ww / 2.0,
+                                        wy + wh / 2.0,
+                                    ),
+                                    lamp_src,
+                                );
+                                if sd.y <= 0.05 {
+                                    continue;
+                                }
+                                let ex = sd.x * wlen;
+                                let ey = sd.y * wlen;
+                                let corners = [
+                                    (*wx, *wy),
+                                    (wx + ww, *wy),
+                                    (wx + ww, wy + wh),
+                                    (*wx, wy + wh),
+                                ];
+                                for e in 0..4 {
+                                    let (ax, ay) = corners[e];
+                                    let (bx, by) = corners[(e + 1) % 4];
+                                    let p = [
+                                        proj(ax, ay, 0.0),
+                                        proj(bx, by, 0.0),
+                                        proj(bx + ex, by + ey, 0.0),
+                                        proj(ax + ex, ay + ey, 0.0),
+                                    ];
+                                    tris.extend_from_slice(&[
+                                        p[0].0, p[0].1, p[1].0, p[1].1,
+                                        p[2].0, p[2].1, p[0].0, p[0].1,
+                                        p[2].0, p[2].1, p[3].0, p[3].1,
+                                    ]);
+                                }
+                                let q = [
+                                    proj(wx + ex, wy + ey, 0.0),
+                                    proj(wx + ww + ex, wy + ey, 0.0),
+                                    proj(wx + ww + ex, wy + wh + ey, 0.0),
+                                    proj(wx + ex, wy + wh + ey, 0.0),
+                                ];
+                                tris.extend_from_slice(&[
+                                    q[0].0, q[0].1, q[1].0, q[1].1,
+                                    q[2].0, q[2].1, q[0].0, q[0].1,
+                                    q[2].0, q[2].1, q[3].0, q[3].1,
+                                ]);
+                            }
+                            if !tris.is_empty() {
+                                renderer.with_context(|_, gl| unsafe {
+                                    crate::render3d::draw_tris(
+                                        gl,
+                                        prog,
+                                        &omvp,
+                                        [0.0, 0.0, 0.0, 0.18],
+                                        &tris,
+                                    )
+                                });
+                            }
+                        }
+                        // Per-cube key light = the lamp: azimuth follows the
+                        // swing, height keeps tops readable.
+                        let cube_light = |px: f64, py: f64| {
+                            let dx = lamp_src.x - px;
+                            let dy = lamp_src.y - py;
+                            let dz = (dx * dx + dy * dy).sqrt() * 0.6 + 200.0;
+                            let m = (dx * dx + dy * dy + dz * dz).sqrt();
+                            [dx / m, dy / m, dz / m]
                         };
                         let _ = renderer.with_context(|_, gl| unsafe {
                             // Shadows: one soft blob per cube on the surface
@@ -2312,10 +2415,20 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             // faded while airborne.
                             for c in cubes.iter() {
                                 let gh = crate::cubes::ground_height(
-                                    c.pos.x, c.pos.y, &[],
+                                    c.pos.x, c.pos.y, &walls,
                                 );
-                                let g =
-                                    proj(c.pos.x + c.z * 0.18, c.pos.y + c.z * 0.12, gh);
+                                // Thrown away from the lamp: longer and more
+                                // detached the higher the cube flies.
+                                let sdir = lamp.shadow_dir(
+                                    crate::canvas::Vec2::new(c.pos.x, c.pos.y),
+                                    lamp_src,
+                                );
+                                let sdist = c.z * 0.9 + c.half * 0.8;
+                                let g = proj(
+                                    c.pos.x + sdir.x * sdist,
+                                    c.pos.y + sdir.y * sdist,
+                                    gh,
+                                );
                                 let fade =
                                     (1.0 - c.z / 1400.0).clamp(0.3, 1.0) as f32;
                                 let r = c.half as f32 * 2.3 * fade + 2.0;
@@ -2340,6 +2453,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             let mut faces: Vec<(f32, [f32; 4], [f32; 8])> =
                                 Vec::new();
                             for c in cubes.iter() {
+                                let li = cube_light(c.pos.x, c.pos.y);
                                 let corners = c.corners();
                                 let mut proj_c = [(0.0f32, 0.0f32); 8];
                                 let mut depth = [0.0f32; 8];
@@ -2359,9 +2473,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     }
                                     let mut shade = 0.42
                                         + 0.58
-                                            * (n[0] * light[0]
-                                                + n[1] * light[1]
-                                                + n[2] * light[2])
+                                            * (n[0] * li[0]
+                                                + n[1] * li[1]
+                                                + n[2] * li[2])
                                                 .max(0.0);
                                     if n[2] > 0.5 {
                                         shade = (shade + 0.12).min(1.0);
