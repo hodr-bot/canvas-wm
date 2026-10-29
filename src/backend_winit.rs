@@ -208,6 +208,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // server-side after the client message arrives.
     let mut pending_x: Vec<(u32, u32)> = Vec::new();
     let frame_clock = std::time::Instant::now();
+    // Camera flight clock: last spring step (dt source for smooth moves).
+    let mut last_cam_step = std::time::Instant::now();
+    // WASD repeat guards (W/A/S/D order): held repeats re-hit the same
+    // target, so only fresh presses act — releases clear the guard.
+    let mut wasd_held = [false; 4];
 
     loop {
         if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(0)), &mut ()) {
@@ -436,6 +441,98 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     // typing never triggers an action.
                     let mut consumed = false;
                     if session.state == crate::session::SuperState::Canvas || super_held {
+                        // WASD spatial focus (positional codes = the physical
+                        // gamer cluster, ZQSD-labelled on azerty): D pulls
+                        // focus to the window on the right, A left, W up,
+                        // S down — strictly in that half-plane, or nothing.
+                        // Canvas-modal and consumed, so apps never see it.
+                        const WASD_KEYS: [u32; 4] = [17, 30, 31, 32];
+                        const WASD_DIRS: [(f64, f64, &str); 4] = [
+                            (0.0, -1.0, "north"), // W
+                            (-1.0, 0.0, "west"),  // A
+                            (0.0, 1.0, "south"),  // S
+                            (1.0, 0.0, "east"),   // D
+                        ];
+                        if let Some(wi) =
+                            WASD_KEYS.iter().position(|c| *c == evdev)
+                        {
+                            let (dx, dy, name) = WASD_DIRS[wi];
+                            if !pressed {
+                                wasd_held[wi] = false;
+                            } else if !wasd_held[wi] {
+                                wasd_held[wi] = true;
+                                let centre = crate::canvas::Vec2::new(
+                                    view.x / 2.0,
+                                    view.y / 2.0,
+                                );
+                                let from = focused_id
+                                    .and_then(|id| {
+                                        server_state.windows.get(&id)
+                                    })
+                                    .map(|c| c.canvas.center())
+                                    .unwrap_or_else(|| {
+                                        session.to_canvas(centre, view)
+                                    });
+                                let wins: Vec<crate::canvas::CanvasWindow> =
+                                    server_state
+                                        .windows
+                                        .values()
+                                        .map(|c| c.canvas)
+                                        .collect();
+                                match crate::canvas::focus_in_direction(
+                                    from,
+                                    crate::canvas::Vec2::new(dx, dy),
+                                    &wins,
+                                ) {
+                                    Some(id) => {
+                                        // Focus + raise, like click-focus:
+                                        // what you type stays visible. The
+                                        // camera flies to the window centre
+                                        // (view-centre world = pos - offset,
+                                        // so the goal is centre + offset).
+                                        if let Some(c) =
+                                            server_state.windows.get(&id)
+                                        {
+                                            server.focus_keyboard(
+                                                c.surface.as_ref(),
+                                            );
+                                            if let (Some(wm), Some(xid)) =
+                                                (xwm.as_ref(), c.x11)
+                                            {
+                                                wm.focus(xid);
+                                                server.focus_keyboard(None);
+                                            }
+                                            let ctr = c.canvas.center();
+                                            session.camera.retarget(
+                                                crate::canvas::Vec2::new(
+                                                    ctr.x + session.canvas.offset.x,
+                                                    ctr.y + session.canvas.offset.y,
+                                                ),
+                                            );
+                                        }
+                                        server_state.raise(id);
+                                        focused_id = Some(id);
+                                        known_ids.insert(id);
+                                        log::info!(
+                                            "wasd focus window {} {}",
+                                            id,
+                                            name
+                                        );
+                                        need_render = true;
+                                    }
+                                    None => {
+                                        log::info!(
+                                            "wasd no window {} from=({:.0},{:.0}) wins={}",
+                                            name,
+                                            from.x,
+                                            from.y,
+                                            wins.len()
+                                        )
+                                    }
+                                }
+                            }
+                            consumed = true;
+                        }
                         if let Some(action) =
                             crate::chrome::hover_shortcut(evdev, !held_mods.is_empty())
                         {
@@ -986,6 +1083,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             let inside = server_state.topmost_at(cw);
             if session.dwell.update(inside, now_ms).is_some() {
                 log::debug!("dwell armed {:?}", session.dwell.armed);
+            }
+        }
+
+        // Camera flight: spring toward target every frame; while flying,
+        // force frames so the motion renders. The spring settles to exact
+        // rest, so the repaint budget ends with the motion — physics is a
+        // few floats, repaints only last as long as the flight (~0.5s).
+        {
+            let now = std::time::Instant::now();
+            let dt = now.duration_since(last_cam_step).as_secs_f64();
+            last_cam_step = now;
+            if session.camera.step(dt) {
+                need_render = true;
             }
         }
 

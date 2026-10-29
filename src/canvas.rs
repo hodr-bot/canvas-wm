@@ -34,6 +34,13 @@ impl std::ops::Sub for Vec2 {
 pub struct Camera {
     pub pos: Vec2,
     pub zoom: f64,
+    /// Flight velocity (world units/s). Retargeting never zeroes it: a
+    /// goal change mid-flight keeps momentum and the spring just pulls
+    /// elsewhere — that is what makes redirections feel fluid instead
+    /// of snapping.
+    pub vel: Vec2,
+    /// Where `pos` is flying to. Equals `pos` at rest.
+    pub target: Vec2,
 }
 
 impl Camera {
@@ -41,6 +48,52 @@ impl Camera {
         Self {
             pos: Vec2::new(0.0, 0.0),
             zoom: 1.0,
+            vel: Vec2::new(0.0, 0.0),
+            target: Vec2::new(0.0, 0.0),
+        }
+    }
+
+    /// New goal, momentum kept (see `vel`).
+    pub fn retarget(&mut self, target: Vec2) {
+        self.target = target;
+    }
+
+    /// True while flying (position or velocity off rest).
+    pub fn flying(&self) -> bool {
+        self.pos != self.target || self.vel != Vec2::new(0.0, 0.0)
+    }
+
+    /// Advance the spring by `dt` seconds. Critically damped: fast,
+    /// no overshoot. Snaps to exact rest inside epsilon so frames stop
+    /// (the repaint budget ends with the motion). Returns true while
+    /// still flying — the backend forces frames on true.
+    pub fn step(&mut self, dt: f64) -> bool {
+        if !self.flying() {
+            return false;
+        }
+        // ~0.45s to cover 95% of the distance; damping is critical
+        // (2*sqrt(stiffness)) so it never oscillates past the target.
+        const STIFFNESS: f64 = 90.0;
+        let damping = 2.0 * STIFFNESS.sqrt();
+        // Clamp tab-switch spikes: physics stays stable, flight just
+        // resumes next frame.
+        let dt = dt.clamp(0.0, 0.05);
+        let ax = STIFFNESS * (self.target.x - self.pos.x) - damping * self.vel.x;
+        let ay = STIFFNESS * (self.target.y - self.pos.y) - damping * self.vel.y;
+        self.vel.x += ax * dt;
+        self.vel.y += ay * dt;
+        self.pos.x += self.vel.x * dt;
+        self.pos.y += self.vel.y * dt;
+        let dx = self.target.x - self.pos.x;
+        let dy = self.target.y - self.pos.y;
+        if dx * dx + dy * dy < 0.25
+            && self.vel.x * self.vel.x + self.vel.y * self.vel.y < 25.0
+        {
+            self.pos = self.target;
+            self.vel = Vec2::new(0.0, 0.0);
+            false
+        } else {
+            true
         }
     }
 
@@ -172,6 +225,7 @@ pub fn fit_view_for_selection(
     Some(Camera {
         pos: Vec2::new(approach_x, approach_y),
         zoom,
+        ..Camera::new()
     })
 }
 
@@ -227,6 +281,7 @@ mod tests {
         let cam = Camera {
             pos: Vec2::new(100.0, -50.0),
             zoom: 1.5,
+            ..Camera::new()
         };
         let view = Vec2::new(1920.0, 1080.0);
         let world = Vec2::new(123.0, 456.0);
@@ -268,6 +323,63 @@ mod tests {
         assert_eq!(hit, Some(1));
         let miss = focus_in_direction(from, Vec2::new(-1.0, -1.0), &[wins[0].clone()]);
         assert_eq!(miss, None);
+    }
+
+    #[test]
+    fn camera_flight_converges_and_stops() {
+        let mut cam = Camera::new();
+        assert!(!cam.flying());
+        cam.retarget(Vec2::new(640.0, 400.0));
+        assert!(cam.flying());
+        // 2s at 120Hz: settled long before the end.
+        let mut flying = true;
+        for _ in 0..240 {
+            flying = cam.step(1.0 / 120.0);
+            if !flying {
+                break;
+            }
+        }
+        assert!(!flying);
+        assert_eq!(cam.pos, Vec2::new(640.0, 400.0));
+        assert_eq!(cam.vel, Vec2::new(0.0, 0.0));
+        assert!(!cam.flying());
+    }
+
+    #[test]
+    fn camera_retarget_keeps_momentum() {
+        let mut cam = Camera::new();
+        cam.retarget(Vec2::new(1000.0, 0.0));
+        for _ in 0..30 {
+            cam.step(1.0 / 120.0);
+        }
+        assert!(cam.flying());
+        let vel = cam.vel;
+        assert!(vel.x > 1.0, "should be moving by now");
+        // New goal mid-flight: velocity untouched, goal updated.
+        cam.retarget(Vec2::new(-500.0, 0.0));
+        assert_eq!(cam.vel, vel);
+        assert_eq!(cam.target, Vec2::new(-500.0, 0.0));
+        // Still converges on the new goal.
+        for _ in 0..600 {
+            if !cam.step(1.0 / 120.0) {
+                break;
+            }
+        }
+        assert!(!cam.flying());
+        assert_eq!(cam.pos, Vec2::new(-500.0, 0.0));
+    }
+
+    #[test]
+    fn camera_never_overshoots_critically_damped() {
+        let mut cam = Camera::new();
+        cam.retarget(Vec2::new(500.0, 0.0));
+        for _ in 0..600 {
+            cam.step(1.0 / 120.0);
+            assert!(cam.pos.x <= 500.5, "overshoot at x={}", cam.pos.x);
+            if !cam.flying() {
+                break;
+            }
+        }
     }
 
     #[test]

@@ -164,6 +164,7 @@ impl Session {
                 self.camera.pos.y - self.canvas.offset.y,
             ),
             zoom: self.camera.zoom,
+            ..Camera::new()
         }
     }
 
