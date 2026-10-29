@@ -96,7 +96,146 @@ impl Camera {
             true
         }
     }
+}
 
+/// How a canvas prop follows the camera. The key rule: windows are
+/// always `Rigid` — they never subscribe to camera motion, so they
+/// never fly around, at zero cost (no state, no per-frame code).
+/// Decor and toys opt in per object with a gain.
+#[derive(Debug, Clone, Copy)]
+pub enum Follow {
+    /// Nailed to the canvas (windows). Identity: no state, no step.
+    Rigid,
+    /// Stateless depth: 1 = canvas-rigid, 0 = screen-locked, between =
+    /// slow drift (distant layers). Pure projection math, no
+    /// integration, no settle — costs one multiply at draw time.
+    /// Anchors are canvas coords; far roaming drifts decor offscreen
+    /// (recycle later — extension point, not built here).
+    Parallax(f64),
+    /// Inverse inertia: a per-object trail chases the camera on a soft
+    /// spring; the render point is anchor + (trail - camera) * gain, so
+    /// the box swings against the flight, then settles exactly home.
+    /// Different stiffness per box = varied wobble. Settles to sleep
+    /// (no per-frame cost at rest).
+    Laggy { gain: f64, stiff: f64 },
+}
+
+/// A lightweight canvas object: decor, toys, future 3D boxes. Windows
+/// are NOT props (they stay rigid by construction, see `Follow`).
+#[derive(Debug, Clone, Copy)]
+pub struct Prop {
+    /// Home on the canvas. Rigid and laggy objects always come back.
+    pub anchor: Vec2,
+    /// Trail point chasing the camera (Laggy only).
+    pub trail: Vec2,
+    pub trail_vel: Vec2,
+    pub follow: Follow,
+    /// Base size in canvas px (depth-scaled at draw).
+    pub size: f64,
+    /// Flat tint [r, g, b, a].
+    pub shade: [f32; 4],
+}
+
+impl Prop {
+    pub fn rigid(anchor: Vec2, size: f64, shade: [f32; 4]) -> Self {
+        Self {
+            anchor,
+            trail: anchor,
+            trail_vel: Vec2::new(0.0, 0.0),
+            follow: Follow::Rigid,
+            size,
+            shade,
+        }
+    }
+
+    pub fn parallax(anchor: Vec2, k: f64, size: f64, shade: [f32; 4]) -> Self {
+        Self {
+            anchor,
+            trail: anchor,
+            trail_vel: Vec2::new(0.0, 0.0),
+            follow: Follow::Parallax(k.clamp(0.0, 1.0)),
+            size,
+            shade,
+        }
+    }
+
+    pub fn laggy(
+        anchor: Vec2,
+        gain: f64,
+        stiff: f64,
+        cam: Vec2,
+        size: f64,
+        shade: [f32; 4],
+    ) -> Self {
+        Self {
+            anchor,
+            trail: cam,
+            trail_vel: Vec2::new(0.0, 0.0),
+            follow: Follow::Laggy { gain, stiff },
+            size,
+            shade,
+        }
+    }
+
+    /// Advance one frame against the current camera position. Returns
+    /// true while still moving (drives repaint demand). Rigid and
+    /// parallax props never integrate: always false, always free.
+    pub fn step(&mut self, dt: f64, cam: Vec2) -> bool {
+        let stiff = match self.follow {
+            Follow::Laggy { stiff, .. } => stiff,
+            _ => return false,
+        };
+        let damp = 2.0 * stiff.sqrt();
+        let dt = dt.clamp(0.0, 0.05);
+        let ax = stiff * (cam.x - self.trail.x) - damp * self.trail_vel.x;
+        let ay = stiff * (cam.y - self.trail.y) - damp * self.trail_vel.y;
+        self.trail_vel.x += ax * dt;
+        self.trail_vel.y += ay * dt;
+        self.trail.x += self.trail_vel.x * dt;
+        self.trail.y += self.trail_vel.y * dt;
+        let dx = cam.x - self.trail.x;
+        let dy = cam.y - self.trail.y;
+        if dx * dx + dy * dy < 0.25
+            && self.trail_vel.x * self.trail_vel.x + self.trail_vel.y * self.trail_vel.y < 25.0
+        {
+            self.trail = cam;
+            self.trail_vel = Vec2::new(0.0, 0.0);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Canvas-space render point: anchor plus the lag offset
+    /// (trail - camera) * gain. At rest the trail sits on the camera,
+    /// so laggy objects render exactly on their anchor.
+    pub fn point(&self, cam: Vec2) -> Vec2 {
+        match self.follow {
+            Follow::Laggy { gain, .. } => Vec2::new(
+                self.anchor.x + (self.trail.x - cam.x) * gain,
+                self.anchor.y + (self.trail.y - cam.y) * gain,
+            ),
+            _ => self.anchor,
+        }
+    }
+
+    /// Screen rect (logical px) through `cam` for a `view` viewport.
+    /// Parallax factor applies at projection: k = 1 renders like a
+    /// window, k = 0 stays screen-locked. Size gets a mild depth cue.
+    pub fn screen_rect(&self, cam: &Camera, view: Vec2) -> (f64, f64, f64, f64) {
+        let k = match self.follow {
+            Follow::Parallax(k) => k,
+            _ => 1.0,
+        };
+        let p = self.point(cam.pos);
+        let x = (p.x - cam.pos.x * k) * cam.zoom + view.x * 0.5;
+        let y = (p.y - cam.pos.y * k) * cam.zoom + view.y * 0.5;
+        let s = self.size * cam.zoom * (0.4 + 0.6 * k);
+        (x - s * 0.5, y - s * 0.5, s, s)
+    }
+}
+
+impl Camera {
     /// World -> screen for a viewport of `view` logical pixels.
     pub fn world_to_screen(&self, world: Vec2, view: Vec2) -> Vec2 {
         Vec2::new(
@@ -380,6 +519,72 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn rigid_prop_is_identity_and_free() {
+        let mut p = Prop::rigid(Vec2::new(100.0, 50.0), 40.0, [1.0, 1.0, 1.0, 1.0]);
+        let cam = Vec2::new(999.0, -300.0);
+        assert!(!p.step(0.016, cam));
+        assert_eq!(p.point(cam), Vec2::new(100.0, 50.0));
+        // Renders exactly like a window through the same camera.
+        let view = Vec2::new(1280.0, 800.0);
+        let c = Camera::new();
+        let (x, y, _, _) = p.screen_rect(&c, view);
+        let s = c.world_to_screen(Vec2::new(100.0, 50.0), view);
+        assert!((x + 20.0 - s.x).abs() < 1e-9);
+        assert!((y + 20.0 - s.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parallax_zero_is_screen_locked() {
+        let view = Vec2::new(1280.0, 800.0);
+        let p = Prop::parallax(Vec2::new(100.0, 50.0), 0.0, 40.0, [1.0, 1.0, 1.0, 1.0]);
+        let mut c = Camera::new();
+        let before = p.screen_rect(&c, view);
+        c.pos = Vec2::new(2000.0, -1500.0);
+        let after = p.screen_rect(&c, view);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn laggy_swings_against_flight_then_comes_home() {
+        let anchor = Vec2::new(100.0, 50.0);
+        let cam0 = Vec2::new(0.0, 0.0);
+        let mut p = Prop::laggy(anchor, 1.0, 30.0, cam0, 40.0, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(p.point(cam0), anchor);
+        // Teleport the camera: the trail lags, so the render point
+        // offsets against the motion...
+        let cam1 = Vec2::new(400.0, 0.0);
+        assert!(p.step(1.0 / 120.0, cam1));
+        let displaced = p.point(cam1);
+        assert!(
+            displaced.x < anchor.x,
+            "should swing against +x flight, got {}",
+            displaced.x
+        );
+        // ...then the trail catches up and the box lands exactly home.
+        for _ in 0..600 {
+            if !p.step(1.0 / 120.0, cam1) {
+                break;
+            }
+        }
+        assert_eq!(p.point(cam1), anchor);
+        assert!(!p.step(1.0 / 120.0, cam1));
+    }
+
+    #[test]
+    fn laggy_gain_scales_the_swing() {
+        let anchor = Vec2::new(0.0, 0.0);
+        let cam0 = Vec2::new(0.0, 0.0);
+        let cam1 = Vec2::new(400.0, 0.0);
+        let mut soft = Prop::laggy(anchor, 0.25, 30.0, cam0, 40.0, [1.0, 1.0, 1.0, 1.0]);
+        let mut hard = Prop::laggy(anchor, 1.0, 30.0, cam0, 40.0, [1.0, 1.0, 1.0, 1.0]);
+        soft.step(1.0 / 120.0, cam1);
+        hard.step(1.0 / 120.0, cam1);
+        let ds = (soft.point(cam1).x - anchor.x).abs();
+        let dh = (hard.point(cam1).x - anchor.x).abs();
+        assert!(dh > ds * 3.0, "gain should scale swing: {} vs {}", dh, ds);
     }
 
     #[test]

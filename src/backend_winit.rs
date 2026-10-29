@@ -56,6 +56,21 @@ fn button_code(button: MouseButton) -> u32 {
     }
 }
 
+/// Demo props (CANVAS_DEMO_PROPS=1): boxes and dust around the origin
+/// showing parallax + inverse inertia. Off by default: zero props,
+/// zero cost, zero clutter. Windows are never props (always rigid).
+fn demo_props() -> Vec<crate::canvas::Prop> {
+    use crate::canvas::{Prop, Vec2};
+    let cam = Vec2::new(0.0, 0.0);
+    vec![
+        Prop::parallax(Vec2::new(-320.0, -200.0), 0.25, 26.0, [0.35, 0.45, 0.75, 1.0]),
+        Prop::parallax(Vec2::new(300.0, 180.0), 0.5, 18.0, [0.35, 0.45, 0.75, 1.0]),
+        Prop::laggy(Vec2::new(-160.0, 120.0), 0.8, 22.0, cam, 54.0, [0.85, 0.55, 0.25, 1.0]),
+        Prop::laggy(Vec2::new(160.0, -140.0), 0.5, 40.0, cam, 44.0, [0.45, 0.75, 0.55, 1.0]),
+        Prop::laggy(Vec2::new(0.0, 220.0), 1.0, 14.0, cam, 64.0, [0.75, 0.35, 0.45, 1.0]),
+        Prop::rigid(Vec2::new(0.0, -220.0), 36.0, [0.55, 0.55, 0.60, 1.0]),
+    ]
+}
 /// Background color of the canvas, derived from the camera.
 /// Dark slate that deepens as you zoom out, so overview reads as a void.
 pub fn background_color(camera: &Camera) -> [f32; 4] {
@@ -213,6 +228,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // WASD repeat guards (W/A/S/D order): held repeats re-hit the same
     // target, so only fresh presses act — releases clear the guard.
     let mut wasd_held = [false; 4];
+    // Canvas props (decor layer): empty unless CANVAS_DEMO_PROPS=1.
+    // Windows are never props — always rigid, never listening.
+    let mut props: Vec<crate::canvas::Prop> = if std::env::var("CANVAS_DEMO_PROPS").is_ok() {
+        let demo = demo_props();
+        log::info!("demo props: {}", demo.len());
+        demo
+    } else {
+        Vec::new()
+    };
 
     loop {
         if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(0)), &mut ()) {
@@ -1090,12 +1114,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         // force frames so the motion renders. The spring settles to exact
         // rest, so the repaint budget ends with the motion — physics is a
         // few floats, repaints only last as long as the flight (~0.5s).
+        // Props chase the same clock against the view camera (offset
+        // included, so trail and projection never disagree); any moving
+        // prop also holds frames until it sleeps.
         {
             let now = std::time::Instant::now();
             let dt = now.duration_since(last_cam_step).as_secs_f64();
             last_cam_step = now;
             if session.camera.step(dt) {
                 need_render = true;
+            }
+            let vcam = session.view_camera().pos;
+            for p in props.iter_mut() {
+                if p.step(dt, vcam) {
+                    need_render = true;
+                }
             }
         }
 
@@ -1177,6 +1210,45 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     }
                 } else if let Err(err) = frame.clear(color) {
                     log::error!("clear failed: {}", err);
+                }
+                // Canvas props (decor layer, behind windows): parallax dust
+                // and laggy boxes through the solid program. Empty by
+                // default — this whole block is skipped when no demo.
+                if !props.is_empty() {
+                    if solid_prog.is_none() {
+                        match renderer.with_context(|_, gl| {
+                            crate::render3d::compile_solid(gl)
+                        }) {
+                            Ok(Ok(p)) => {
+                                solid_prog = Some(p);
+                                log::info!("chrome GL program ready");
+                            }
+                            Ok(Err(e)) => log::warn!("chrome GL program: {}", e),
+                            Err(e) => log::warn!("chrome GL context: {:?}", e),
+                        }
+                    }
+                    if let Some(prog) = solid_prog {
+                        let mvp = crate::render3d::ortho(view.x as f32, view.y as f32);
+                        let sc = scale as f32;
+                        let cam = session.view_camera();
+                        let _ = renderer.with_context(|_, gl| unsafe {
+                            for p in &props {
+                                let (x, y, w, h) = p.screen_rect(&cam, view);
+                                crate::render3d::draw_solid(
+                                    gl,
+                                    prog,
+                                    &mvp,
+                                    p.shade,
+                                    (
+                                        x as f32 * sc,
+                                        y as f32 * sc,
+                                        w as f32 * sc,
+                                        h as f32 * sc,
+                                    ),
+                                );
+                            }
+                        });
+                    }
                 }
                 // Painter's algorithm: lowest z first, so the visual top
                 // always matches the pick top (topmost_at). HashMap
