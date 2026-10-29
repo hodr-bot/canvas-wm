@@ -16,7 +16,8 @@ pub struct Settings {
     // -- Fond d'écran (procedural wallpaper) --
     /// Animated ambient wallpaper (procedural shader). Off = flat clear.
     pub bg_anim: bool,
-    /// Wallpaper motif: 0 Calme, 1 Dérive, 2 Nébuleuse.
+    /// Wallpaper motif: 0 Calme, 1 Dérive, 2 Nébuleuse, 3 Topographie,
+    /// 4 Mosaïque, 5 Plasma, 6 Kaléidoscope, 7 Grille.
     pub bg_pattern: u8,
     /// Motif scale percent (0 = tight, 100 = wide).
     pub bg_scale: u8,
@@ -35,7 +36,8 @@ pub struct Settings {
     // -- Vagues (procedural wave field over the wallpaper) --
     /// Master switch for the wave field.
     pub wave_on: bool,
-    /// Waveform: 0 Sinus, 1 Triangle, 2 Bruit.
+    /// Waveform: 0 Sinus, 1 Triangle, 2 Bruit, 3 Carrée, 4 Scie,
+    /// 5 Impulsion.
     pub wave_shape: u8,
     /// Octave count percent mapped to 1-4.
     pub wave_octaves: u8,
@@ -126,9 +128,9 @@ impl Settings {
         }
     }
 
-    /// Wallpaper motif selector (0 Calme, 1 Dérive, 2 Nébuleuse).
+    /// Wallpaper motif selector (0 Calme .. 7 Grille).
     pub fn bg_pattern(&self) -> usize {
-        lvl(self.bg_pattern, 3)
+        lvl(self.bg_pattern, 8)
     }
 
     /// Motif scale (0.5 tight .. 2.0 wide).
@@ -188,9 +190,10 @@ impl Settings {
         1.0 - pct(self.super_dim) * 0.5
     }
 
-    /// Waveform selector (0 Sinus, 1 Triangle, 2 Bruit).
+    /// Waveform selector (0 Sinus, 1 Triangle, 2 Bruit, 3 Carrée,
+    /// 4 Scie, 5 Impulsion). Also steers the Super glow behaviour.
     pub fn wave_shape(&self) -> usize {
-        lvl(self.wave_shape, 3)
+        lvl(self.wave_shape, 6)
     }
 
     /// Wave octave count (1-4).
@@ -353,6 +356,8 @@ mod tests {
         s.dolly_pct = 200;
         assert_eq!(s.dolly_factor(), 1.0);
         s.wave_shape = 77;
-        assert_eq!(s.wave_shape(), 2);
+        assert_eq!(s.wave_shape(), 5);
+        s.bg_pattern = 200;
+        assert_eq!(s.bg_pattern(), 7);
     }
 }

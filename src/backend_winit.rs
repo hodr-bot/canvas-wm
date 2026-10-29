@@ -364,6 +364,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         settings.eco = true;
         log::info!("forced eco for proof: FX frozen");
     }
+    // Headless proof hooks (screenshots): pin motif / waveform by index
+    // so new shader branches are visible without a harness keyboard.
+    if let Ok(n) = std::env::var("CANVAS_FORCE_PATTERN") {
+        settings.bg_pattern = n.parse().unwrap_or(1).min(7);
+        log::info!("forced bg_pattern for proof: {}", settings.bg_pattern);
+    }
+    if let Ok(n) = std::env::var("CANVAS_FORCE_WSHAPE") {
+        settings.wave_shape = n.parse().unwrap_or(0).min(5);
+        log::info!("forced wave_shape for proof: {}", settings.wave_shape);
+    }
     // Headless proof hook (screenshots): pre-drop cubes across the
     // opening view so the fall/tumble/rest cycle is visible without a
     // working harness keyboard.

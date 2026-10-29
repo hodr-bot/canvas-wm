@@ -235,9 +235,18 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
                 "bg_pattern",
                 "Motif",
                 "Style du fond",
-                |s: &Settings| s.bg_pattern.min(2) as usize,
-                |s: &mut Settings, v| s.bg_pattern = (v.min(2)) as u8,
-                &["Calme", "Dérive", "Nébuleuse"],
+                |s: &Settings| s.bg_pattern.min(7) as usize,
+                |s: &mut Settings, v| s.bg_pattern = (v.min(7)) as u8,
+                &[
+                    "Calme",
+                    "Dérive",
+                    "Nébuleuse",
+                    "Topographie",
+                    "Mosaïque",
+                    "Plasma",
+                    "Kaléidoscope",
+                    "Grille",
+                ],
             ),
             slider(
                 "bg_scale",
@@ -337,9 +346,16 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
                 "wave_shape",
                 "Forme",
                 "Forme d'onde",
-                |s: &Settings| s.wave_shape.min(2) as usize,
-                |s: &mut Settings, v| s.wave_shape = (v.min(2)) as u8,
-                &["Sinus", "Triangle", "Bruit"],
+                |s: &Settings| s.wave_shape.min(5) as usize,
+                |s: &mut Settings, v| s.wave_shape = (v.min(5)) as u8,
+                &[
+                    "Sinus",
+                    "Triangle",
+                    "Bruit",
+                    "Carrée",
+                    "Scie",
+                    "Impulsion",
+                ],
             ),
             slider(
                 "wave_octaves",
@@ -873,8 +889,11 @@ mod tests {
         let id = MenuState::activate_at(TAB_FOND, 1, &mut s);
         assert_eq!(id, Some("bg_pattern"));
         assert_eq!(s.bg_pattern, 2);
-        let id = MenuState::activate_at(TAB_FOND, 1, &mut s);
-        assert_eq!(id, Some("bg_pattern"));
+        // Full cycle through the 8 motifs wraps back to Calme = 0.
+        for _ in 0..6 {
+            let id = MenuState::activate_at(TAB_FOND, 1, &mut s);
+            assert_eq!(id, Some("bg_pattern"));
+        }
         assert_eq!(s.bg_pattern, 0);
         // Item 1 now reads " : Calme".
         let mut m = MenuState::default();
@@ -890,12 +909,14 @@ mod tests {
     fn adjust_cycles_choices_and_steps_sliders() {
         let mut s = Settings::default();
         let mut m = MenuState::default();
-        // bg_pattern choice cycles through its 3 motifs.
+        // bg_pattern choice cycles through its 8 motifs.
         m.set_tab(TAB_FOND);
         m.selected = 1;
         assert_eq!(m.adjust(1, &mut s), Some("bg_pattern"));
         assert_eq!(s.bg_pattern, 2);
-        assert_eq!(m.adjust(1, &mut s), Some("bg_pattern"));
+        for _ in 0..6 {
+            assert_eq!(m.adjust(1, &mut s), Some("bg_pattern"));
+        }
         assert_eq!(s.bg_pattern, 0);
         // glow sliders step freely 0-100 now (no fixed levels).
         m.set_tab(TAB_VAGUES);

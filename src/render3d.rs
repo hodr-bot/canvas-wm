@@ -529,17 +529,49 @@ void main() {
     vec2 q = p * bg_scale;
     float slow = t * 0.03;
     // Motif: 0 Calme (flat + faint gradient), 1 Dérive (slow warp),
-    // 2 Nébuleuse (two-scale clouds). Branching on a uniform is fine.
+    // 2 Nébuleuse (two-scale clouds), 3 Topographie (contour bands),
+    // 4 Mosaïque (truchet tiles), 5 Plasma (interfering sines),
+    // 6 Kaléidoscope (polar mirror), 7 Grille (breathing neon grid).
+    // Branching on a uniform is fine.
     float drift_n;
     if (bg_pattern < 0.5) {
         drift_n = (0.5 - v_uv.y) * 0.18 + (fbm(q * 0.8 + slow * 0.2) - 0.5) * 0.30;
     } else if (bg_pattern < 1.5) {
         float warp = fbm(q * 1.1 - slow * 0.3);
         drift_n = fbm(q * 1.6 + vec2(slow * 0.7, slow * 0.4) + warp * 0.6) - 0.5;
-    } else {
+    } else if (bg_pattern < 2.5) {
         float neb = fbm(q * 0.9 + vec2(-slow * 0.4, slow * 0.2));
         float neb2 = fbm(q * 2.3 + vec2(slow * 0.5, -slow * 0.3) + neb);
         drift_n = (neb * 0.6 + neb2 * 0.4 - 0.5) * 1.6;
+    } else if (bg_pattern < 3.5) {
+        float topo = fbm(q * 1.3 + vec2(slow * 0.25, -slow * 0.15));
+        float c = fract(topo * 7.0);
+        float line = 1.0 - smoothstep(0.0, 0.14, min(c, 1.0 - c));
+        drift_n = (topo - 0.5) * 0.9 + line * 0.38;
+    } else if (bg_pattern < 4.5) {
+        vec2 cell = floor(q * 2.2 + vec2(slow * 0.5, 0.0));
+        vec2 f = fract(q * 2.2 + vec2(slow * 0.5, 0.0)) - 0.5;
+        float hh = hash(cell);
+        float d = (hh < 0.5) ? (f.x + f.y) : (f.x - f.y);
+        float tile = smoothstep(0.08, -0.08, d) * 2.0 - 1.0;
+        drift_n = tile * 0.42 + (hh - 0.5) * 0.45;
+    } else if (bg_pattern < 5.5) {
+        float plas = sin(q.x * 1.7 + slow * 0.9)
+                   + sin(q.y * 1.3 - slow * 0.7)
+                   + sin((q.x + q.y) * 1.1 + slow * 0.5)
+                   + sin(length(q) * 2.0 - slow * 0.8);
+        drift_n = plas * 0.24;
+    } else if (bg_pattern < 6.5) {
+        vec2 kc = p - vec2(aspect * 0.5, 0.5);
+        float kr = length(kc);
+        float ka = atan(kc.y, kc.x);
+        float k = fbm(vec2(ka * 2.2 + slow * 0.3, kr * 3.2 - slow * 0.6));
+        drift_n = (k - 0.5) * 1.5 * smoothstep(0.95, 0.15, kr);
+    } else {
+        vec2 g = abs(fract(q * 2.0 + slow * 0.1) - 0.5);
+        float line = 1.0 - smoothstep(0.0, 0.055, min(g.x, g.y));
+        float pulse = 0.5 + 0.5 * sin(t * 0.8 + (q.x + q.y) * 2.0);
+        drift_n = line * (0.25 + 0.75 * pulse) * 0.95 - 0.30;
     }
     float depth = mix(1.0, clamp(0.35 + zoom * 0.65, 0.35, 1.0), depth_on);
     vec3 base = bg_tint * depth;
@@ -562,8 +594,21 @@ void main() {
                     o = sin(ph);
                 } else if (w_shape < 1.5) {
                     o = asin(sin(ph)) * 0.6366;
-                } else {
+                } else if (w_shape < 2.5) {
                     o = vnoise(vec2(ph * 0.5, wt * 0.25 + float(i) * 7.3)) * 2.0 - 1.0;
+                } else if (w_shape < 3.5) {
+                    // Carrée adoucie: soft-clipped sine, flat tops.
+                    float ss = sin(ph);
+                    o = smoothstep(-0.45, 0.45, ss) * 2.0 - 1.0;
+                } else if (w_shape < 4.5) {
+                    // Scie: rising ramp with a softened drop.
+                    float fr2 = fract(ph * 0.15915);
+                    o = fr2 * 2.0 - 1.0;
+                    o = o * 0.85 + sin(ph) * 0.15;
+                } else {
+                    // Impulsion: narrow bright crests, wide dark troughs.
+                    float ss = sin(ph);
+                    o = pow(0.5 + 0.5 * ss, 3.0) * 2.0 - 1.0;
                 }
                 acc += o * amp;
                 norm += amp;
@@ -593,8 +638,21 @@ void main() {
     float curtain = fbm(vec2((v_uv.x + v_uv.y) * 2.0 + flow, flow * 0.6));
     float curtain2 = fbm(vec2((v_uv.x - v_uv.y) * 3.0 - flow * 0.7, flow * 0.4 + 7.3));
     float veil = band * (0.30 + 0.70 * curtain * curtain2 * 2.2);
+    // Waveform steers the Super glow: Carrée snaps the curtains into
+    // hard shelves, Scie sweeps them sideways, Impulsion breathes the
+    // whole veil. Sinus/Triangle/Bruit keep the classic aurora.
+    float gmod = 1.0;
+    if (w_shape > 2.5 && w_shape < 3.5) {
+        float shelf = floor(curtain * 3.0 + 0.5) / 3.0;
+        veil = band * (0.30 + 0.70 * shelf * curtain2 * 2.2);
+    } else if (w_shape > 3.5 && w_shape < 4.5) {
+        float sweep = fract((v_uv.x + v_uv.y) * 1.5 - gt * 0.12);
+        veil *= 0.65 + 0.7 * sweep;
+    } else if (w_shape > 4.5) {
+        gmod = 0.55 + 0.9 * pow(0.5 + 0.5 * sin(gt * 1.2), 2.0);
+    }
     vec3 gcol = mix(gcol_a, gcol_b, curtain);
-    vec3 glow_col = gcol * veil * g_int * glow * 0.35;
+    vec3 glow_col = gcol * veil * g_int * glow * 0.35 * gmod;
     // Overlay pass (Super glow over windows): additive light only, no
     // wallpaper — the backend blends this ONTO the finished frame.
     if (overlay > 0.5) {
