@@ -20,6 +20,7 @@ log = "0.4"
 env_logger = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+fontdue = "0.9.5"
 
 [features]
 default = []

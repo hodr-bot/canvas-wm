@@ -727,54 +727,6 @@ pub unsafe fn draw_bg(
     gl.Enable(ffi::SCISSOR_TEST);
 }
 
-/// Glyph atlas: 16x8 cells of 8x8 px (128x64 RGBA, white premultiplied).
-/// One upload, then every menu char is a UV sub-rect through the normal
-/// textured program.
-#[cfg(feature = "compositor")]
-pub const ATLAS_W: u32 = 128;
-#[cfg(feature = "compositor")]
-pub const ATLAS_H: u32 = 64;
-
-/// Build atlas bytes (row-major RGBA) from the vendored 8x8 font.
-#[cfg(feature = "compositor")]
-pub fn build_glyph_atlas() -> Vec<u8> {
-    let mut px = vec![0u8; (ATLAS_W * ATLAS_H * 4) as usize];
-    for byte in 0..128u8 {
-        let rows = crate::font8x8::glyph(byte);
-        let col = (byte % 16) as u32;
-        let row = (byte / 16) as u32;
-        for (ry, bits) in rows.iter().enumerate() {
-            for rx in 0..8u32 {
-                if bits & (1 << rx) != 0 {
-                    let x = col * 8 + rx;
-                    let y = row * 8 + ry as u32;
-                    let o = ((y * ATLAS_W + x) * 4) as usize;
-                    px[o] = 255;
-                    px[o + 1] = 255;
-                    px[o + 2] = 255;
-                    px[o + 3] = 255;
-                }
-            }
-        }
-    }
-    px
-}
-
-/// UV sub-rect (u0, v0, u1, v1) of one atlas cell. V points down the
-/// uploaded rows; the backend flips to upright UVs when drawing.
-#[cfg(feature = "compositor")]
-pub fn glyph_uv(byte: u8) -> (f32, f32, f32, f32) {
-    let b = (byte & 0x7F) as f32;
-    let col = b % 16.0;
-    let row = (b / 16.0).floor();
-    (
-        col * 8.0 / ATLAS_W as f32,
-        row * 8.0 / ATLAS_H as f32,
-        (col * 8.0 + 8.0) / ATLAS_W as f32,
-        (row * 8.0 + 8.0) / ATLAS_H as f32,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,32 +804,33 @@ mod tests {
 
     #[cfg(feature = "compositor")]
     #[test]
-    fn atlas_holds_lit_a_and_blank_space() {
-        let px = build_glyph_atlas();
-        assert_eq!(px.len(), (ATLAS_W * ATLAS_H * 4) as usize);
-        // 'A' cell (col 1, row 4): first row 0x0C has bits 2,3 lit.
-        let cell = |bx: u32, by: u32| ((by * ATLAS_W + bx) * 4) as usize;
-        let ax = 1 * 8;
-        let ay = 4 * 8;
-        assert_eq!(px[cell(ax + 2, ay)], 255);
-        assert_eq!(px[cell(ax + 2, ay) + 3], 255);
-        assert_eq!(px[cell(ax + 0, ay) + 3], 0);
-        // Space cell (col 0, row 2) is fully blank: every texel.
-        let sx = 0;
-        let sy = 2 * 8;
-        let mut lit = Vec::new();
-        for yy in 0..8u32 {
-            for xx in 0..8u32 {
-                let o = cell(sx + xx, sy + yy);
-                if px[o] != 0 || px[o + 3] != 0 {
-                    lit.push((xx, yy, px[o], px[o + 3]));
-                }
+    fn vector_atlas_holds_smooth_coverage() {
+        use crate::fontvec::{FontCache, ATLAS_SIDE, MENU_PX};
+        let mut cache = FontCache::new();
+        assert_eq!(
+            cache.atlas().len(),
+            (ATLAS_SIDE * ATLAS_SIDE * 4) as usize
+        );
+        let (_, glyphs) = cache.layout_line("Échelle : 90%");
+        assert!(!glyphs.is_empty());
+        // Slots stay inside the atlas and carry graduated alpha
+        // (real antialiasing, not on/off bitmap cells).
+        let mut graduated = false;
+        for g in &glyphs {
+            let s = cache.slot(g.ch).unwrap();
+            if s.w == 0 {
+                continue;
+            }
+            assert!(0.0 <= s.u0 && s.u0 < s.u1 && s.u1 <= 1.0);
+            assert!(0.0 <= s.v0 && s.v0 < s.v1 && s.v1 <= 1.0);
+        }
+        for a in cache.atlas().iter().skip(3).step_by(4) {
+            if *a > 0 && *a < 255 {
+                graduated = true;
+                break;
             }
         }
-        assert!(lit.is_empty(), "space cell not blank: {:?}", lit);
-        // UVs stay inside the atlas.
-        let (u0, v0, u1, v1) = glyph_uv(b'A');
-        assert!(0.0 <= u0 && u0 < u1 && u1 <= 1.0);
-        assert!(0.0 <= v0 && v0 < v1 && v1 <= 1.0);
+        assert!(graduated, "atlas has no antialiased texels");
+        let _ = MENU_PX;
     }
 }

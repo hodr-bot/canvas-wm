@@ -107,56 +107,39 @@ pub fn background_color(camera: &Camera) -> [f32; 4] {
     [base * 0.9, base, base * 1.3, 1.0]
 }
 
-/// Draw one menu text line: atlas quads per char (upright UVs, real
-/// alpha) plus solid overlay pixels for French accents. Screen space,
-/// y down; `u` is the canvas-to-physical scale (zoom x output scale),
-/// cells are 16 logical px at 2x.
+/// Draw one menu text line: smooth vector glyphs from the fontdue
+/// atlas (coverage alpha, kerning included). Screen space, y down;
+/// `u` is the output scale, the face is laid out at MENU_PX and the
+/// quads are scaled to physical px (linear filtering smooths them).
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_menu_line(
     gl: &smithay::backend::renderer::gles2::ffi::Gles2,
     tprog: (u32, i32, i32, i32, u32, u32),
-    sprog: (u32, i32, i32, u32),
     mvp: &[f32; 16],
     atlas: u32,
+    cache: &mut crate::fontvec::FontCache,
     x: f32,
     y: f32,
     u: f32,
     text: &str,
 ) {
-    let cell = 16.0 * u;
-    let dot = 2.0 * u;
-    let mut cx = x;
-    for ch in text.chars() {
-        let mapped = crate::menu::cell_for(ch);
-        let (u0, v0, u1, v1) = crate::render3d::glyph_uv(mapped.byte);
-        let w = 8.0 * 2.0 * u;
+    let (_, glyphs) = cache.layout_line(text);
+    for g in glyphs {
+        let slot = match cache.slot(g.ch) {
+            Some(s) if s.w > 0 => *s,
+            _ => continue,
+        };
+        let x0 = x + g.x * u;
+        let y0 = y + g.y * u;
+        let x1 = x0 + g.w * u;
+        let y1 = y0 + g.h * u;
         let verts: [f32; 16] = [
-            cx, y, u0, v0, //
-            cx + w, y, u1, v0, //
-            cx, y + w, u0, v1, //
-            cx + w, y + w, u1, v1,
+            x0, y0, slot.u0, slot.v0, //
+            x1, y0, slot.u1, slot.v0, //
+            x0, y1, slot.u0, slot.v1, //
+            x1, y1, slot.u1, slot.v1,
         ];
         crate::render3d::draw_textured(gl, tprog, mvp, atlas, &verts, false);
-        if let Some(accent) = mapped.accent {
-            // Capitals use row 0 for the body, so their accents lift one
-            // row to stay clear of the glyph (lowercase rows 0-1 are free).
-            let lift = if mapped.byte.is_ascii_uppercase() { -1 } else { 0 };
-            for (px, py) in crate::menu::accent_pixels(accent) {
-                crate::render3d::draw_solid(
-                    gl,
-                    sprog,
-                    mvp,
-                    [1.0, 1.0, 1.0, 1.0],
-                    (
-                        cx + *px as f32 * 2.0 * u,
-                        y + (*py + lift) as f32 * 2.0 * u,
-                        dot,
-                        dot,
-                    ),
-                );
-            }
-        }
-        cx += cell;
     }
 }
 
@@ -241,7 +224,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Wave field clock: own travel time (eco-frozen with the rest).
     let mut wave_time: f32 = 0.0;
     let mut last_bg_paint = std::time::Instant::now();
-    // Glyph atlas texture for menu text (uploaded once, 128x64 RGBA).
+    // Vector menu face (DejaVu via fontdue) with its self-packing
+    // coverage atlas; upload happens below, re-upload on dirty.
+    let mut font_cache = crate::fontvec::FontCache::new();
+    // Glyph atlas texture for menu text (uploaded once, 512x512 RGBA).
     let mut atlas_tex: Option<
         smithay::backend::renderer::gles2::Gles2Texture,
     > = None;
@@ -2060,8 +2046,18 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 // Options menu, always topmost: bordered panel, selection
                 // highlight, rows drawn from the data-driven item list.
                 if menu.open {
+                    // Atlas bytes for this frame (copied only when the
+                    // cache packed new glyphs: rare after warmup).
+                    let atlas_dirty = font_cache.take_dirty();
+                    let atlas_bytes = if atlas_dirty || atlas_tex.is_none() {
+                        Some(font_cache.atlas().to_vec())
+                    } else {
+                        None
+                    };
                     if atlas_tex.is_none() {
-                        let px = crate::render3d::build_glyph_atlas();
+                        let px: &[u8] = atlas_bytes
+                            .as_deref()
+                            .unwrap_or_else(|| font_cache.atlas());
                         let up = renderer.with_context(|r, gl| unsafe {
                             use smithay::backend::renderer::gles2::ffi;
                             let mut tex = 0;
@@ -2071,8 +2067,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 ffi::TEXTURE_2D,
                                 0,
                                 ffi::RGBA as i32,
-                                crate::render3d::ATLAS_W as i32,
-                                crate::render3d::ATLAS_H as i32,
+                                crate::fontvec::ATLAS_SIDE as i32,
+                                crate::fontvec::ATLAS_SIDE as i32,
                                 0,
                                 ffi::RGBA,
                                 ffi::UNSIGNED_BYTE as u32,
@@ -2101,15 +2097,37 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             smithay::backend::renderer::gles2::Gles2Texture::from_raw(
                                 r,
                                 tex,
-                                Size::<i32, BufferCoord>::from((128, 64)),
+                                Size::<i32, BufferCoord>::from((512, 512)),
                             )
                         });
                         match up {
                             Ok(t) => {
                                 atlas_tex = Some(t);
-                                log::info!("menu glyph atlas ready");
+                                log::info!("menu vector atlas ready");
                             }
                             Err(e) => log::warn!("menu atlas upload: {:?}", e),
+                        }
+                    }
+                    // New glyphs packed this frame: refresh the texture.
+                    if atlas_dirty {
+                        if let Some(bytes) = atlas_bytes {
+                            let _ = renderer.with_context(|_, gl| unsafe {
+                                use smithay::backend::renderer::gles2::ffi;
+                                if let Some(atlas) = atlas_tex.as_ref() {
+                                    gl.BindTexture(ffi::TEXTURE_2D, atlas.tex_id());
+                                    gl.TexSubImage2D(
+                                        ffi::TEXTURE_2D,
+                                        0,
+                                        0,
+                                        0,
+                                        crate::fontvec::ATLAS_SIDE as i32,
+                                        crate::fontvec::ATLAS_SIDE as i32,
+                                        ffi::RGBA,
+                                        ffi::UNSIGNED_BYTE as u32,
+                                        bytes.as_ptr() as *const _,
+                                    );
+                                }
+                            });
                         }
                     }
                     if tex_prog.is_none() {
@@ -2216,27 +2234,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 (px0, py0, pw, ph),
                                 corner,
                             );
-                            // Tab bar: active tab bracketed + underlined.
-                            // Names are left-aligned in their cell (no
-                            // centering pads: every pad char is a glyph
-                            // the atlas must survive).
+                            // Tab bar: names centred in their cell, the active
+                            // one underlined in the house accent.
                             let tab_top = py0 + pad;
                             let cell_w = pw / crate::menu::TABS.len() as f32;
                             for (ti, name) in crate::menu::TABS.iter().enumerate() {
                                 let active = ti == menu.tab;
-                                let cell_text = if active {
-                                    format!("[{}]", name)
-                                } else {
-                                    format!(" {}", name)
-                                };
-                                let (tx, _) = to_px(
-                                    lay.x + crate::menu::PANEL_PAD
-                                        + ti as f64 * (lay.w / crate::menu::TABS.len() as f64),
-                                    0.0,
-                                );
+                                let name_w =
+                                    font_cache.measure(name) * sc;
+                                let tx = px0 + ti as f32 * cell_w
+                                    + (cell_w - name_w) / 2.0;
                                 draw_menu_line(
-                                    gl, tprog, sprog, &mvp, atlas_id, tx,
-                                    tab_top + 7.0 * sc, sc, &cell_text,
+                                    gl, tprog, &mvp, atlas_id, &mut font_cache, tx,
+                                    tab_top + 7.0 * sc, sc, name,
                                 );
                                 if active {
                                     crate::render3d::draw_solid(
@@ -2285,7 +2295,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     it.state_text(&settings)
                                 );
                                 draw_menu_line(
-                                    gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, sc,
+                                    gl, tprog, &mvp, atlas_id, &mut font_cache, px0 + pad, ty, sc,
                                     &line,
                                 );
                                 // Slider track + fill under the text.
@@ -2375,7 +2385,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             for (fi, foot) in feet.iter().enumerate() {
                                 let (_, fpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + (rows.len() + 1 + fi) as f64 * crate::menu::ROW_H);
                                 draw_menu_line(
-                                    gl, tprog, sprog, &mvp, atlas_id, px0 + pad,
+                                    gl, tprog, &mvp, atlas_id, &mut font_cache, px0 + pad,
                                     fpy + slide_px + 7.0 * sc, sc, foot,
                                 );
                             }

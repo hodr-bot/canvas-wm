@@ -2,12 +2,13 @@
 //!
 //! The menu owns the UI; this struct owns the values. Every frame the
 //! backend reads them (wallpaper, waves, Super edge glow, dolly).
-//! Parameters nest in per-tab groups (Fond / Vagues / Lueurs / Super):
+//! Parameters nest in per-tab groups (Fond / Vagues / Super):
 //! each tab is a section in `menu.rs`, each parameter one line of data
 //! there. Adding a parameter = a field + default + accessor here, one
 //! `MenuItem` literal there. Continuous knobs are `u8` percents
 //! (0-100, RGB channels 0-255) mapped to shader ranges by accessors;
-//! small fixed sets stay 3-level `Choice`s with numeric tables below.
+//! genuinely categorical knobs (motif, waveform) stay `Choice`s with
+//! an arbitrary option count.
 
 /// Live user settings (Options menu).
 #[derive(Debug, Clone)]
@@ -53,19 +54,20 @@ pub struct Settings {
     // -- Lueurs Super (edge glow in Canvas mode) --
     /// Master switch for the Super edge glow.
     pub glow_on: bool,
-    /// Glow brightness level: 0 Douces, 1 Moyennes, 2 Vives.
+    /// Glow brightness percent (0 = faint, 100 = blazing).
     pub glow_intensity: u8,
-    /// Flow speed level: 0 Lent, 1 Normal, 2 Vif.
+    /// Flow speed percent (0 = frozen).
     pub glow_flow: u8,
-    /// Band width level: 0 Fines, 1 Moyennes, 2 Larges.
+    /// Band width percent (0 = hairline, 100 = wide wash).
     pub glow_width: u8,
     /// Deep glow colour, exact RGB channels.
     pub glow_deep: [u8; 3],
     /// Light glow colour, exact RGB channels.
     pub glow_light: [u8; 3],
     // -- Mode Super --
-    /// Dolly-back depth level: 0 Léger (5%), 1 Normal (10%), 2 Large (15%).
-    pub dolly: u8,
+    /// Dolly-back depth percent: zoom kept on Super enter
+    /// (50 = half zoom, 100 = no dolly).
+    pub dolly_pct: u8,
     /// Wallpaper dimming in Super mode, percent.
     pub super_dim: u8,
 }
@@ -75,18 +77,10 @@ fn pct(v: u8) -> f32 {
     (v.min(100) as f32) / 100.0
 }
 
-/// Numeric meaning of the 3 glow-brightness levels.
-pub const GLOW_INTENSITY_VALUES: [f32; 3] = [0.35, 0.7, 1.2];
-/// Glow flow speed per level (own time multiplier).
-pub const GLOW_FLOW_VALUES: [f32; 3] = [0.4, 1.0, 2.2];
-/// Glow band width per level (fraction of the half-view).
-pub const GLOW_WIDTH_VALUES: [f32; 3] = [0.06, 0.12, 0.20];
-/// Dolly-back factor per level (zoom multiplier on Super enter).
-pub const DOLLY_VALUES: [f64; 3] = [0.95, 0.90, 0.85];
-
-/// Clamp a level to its 3 options (corrupt values can't escape).
-fn level(v: u8) -> usize {
-    (v.min(2)) as usize
+/// Clamp a categorical level to its option count (corrupt values
+/// can't escape).
+fn lvl(v: u8, n: usize) -> usize {
+    (v as usize).min(n.saturating_sub(1))
 }
 
 impl Default for Settings {
@@ -111,12 +105,12 @@ impl Default for Settings {
             wave_crisp: 35,
             wave_col: [32, 120, 112],
             glow_on: true,
-            glow_intensity: 1,
-            glow_flow: 1,
-            glow_width: 1,
+            glow_intensity: 60,
+            glow_flow: 50,
+            glow_width: 50,
             glow_deep: [13, 89, 97],
             glow_light: [51, 191, 179],
-            dolly: 1,
+            dolly_pct: 90,
             super_dim: 25,
         }
     }
@@ -134,7 +128,7 @@ impl Settings {
 
     /// Wallpaper motif selector (0 Calme, 1 Dérive, 2 Nébuleuse).
     pub fn bg_pattern(&self) -> usize {
-        level(self.bg_pattern)
+        lvl(self.bg_pattern, 3)
     }
 
     /// Motif scale (0.5 tight .. 2.0 wide).
@@ -196,7 +190,7 @@ impl Settings {
 
     /// Waveform selector (0 Sinus, 1 Triangle, 2 Bruit).
     pub fn wave_shape(&self) -> usize {
-        level(self.wave_shape)
+        lvl(self.wave_shape, 3)
     }
 
     /// Wave octave count (1-4).
@@ -248,7 +242,7 @@ impl Settings {
         if !self.glow_on {
             0.0
         } else {
-            GLOW_INTENSITY_VALUES[level(self.glow_intensity)]
+            pct(self.glow_intensity) * 1.2
         }
     }
 
@@ -257,13 +251,13 @@ impl Settings {
         if self.eco {
             0.0
         } else {
-            GLOW_FLOW_VALUES[level(self.glow_flow)]
+            pct(self.glow_flow) * 2.2
         }
     }
 
     /// Glow band width (view fraction).
     pub fn glow_width(&self) -> f32 {
-        GLOW_WIDTH_VALUES[level(self.glow_width)]
+        0.03 + pct(self.glow_width) * 0.19
     }
 
     /// Glow palette (deep, light) from the exact RGB channels.
@@ -276,9 +270,9 @@ impl Settings {
         )
     }
 
-    /// Super dolly-back factor.
+    /// Super dolly-back factor (zoom kept on enter).
     pub fn dolly_factor(&self) -> f64 {
-        DOLLY_VALUES[level(self.dolly)]
+        (self.dolly_pct.clamp(50, 100) as f64) / 100.0
     }
 }
 
@@ -354,8 +348,10 @@ mod tests {
         // Corrupt values can't escape.
         s.bg_drift = 255;
         assert!((s.bg_speed() - 2.0).abs() < 1e-6);
-        s.dolly = 9;
-        assert_eq!(s.dolly_factor(), 0.85);
+        s.dolly_pct = 9;
+        assert_eq!(s.dolly_factor(), 0.50);
+        s.dolly_pct = 200;
+        assert_eq!(s.dolly_factor(), 1.0);
         s.wave_shape = 77;
         assert_eq!(s.wave_shape(), 2);
     }

@@ -25,7 +25,7 @@ mod keys;
 #[cfg(feature = "compositor")]
 mod server;
 #[cfg(feature = "compositor")]
-mod font8x8;
+mod fontvec;
 #[cfg(feature = "compositor")]
 mod settings;
 #[cfg(feature = "compositor")]

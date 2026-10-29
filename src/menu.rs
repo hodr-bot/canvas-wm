@@ -32,77 +32,10 @@ pub const KEY_ESC: u32 = 1;
 pub const KEY_TAB: u32 = 15;
 
 /// Option tabs, in bar order.
-pub const TABS: [&str; 4] = ["Fond", "Vagues", "Lueurs", "Super"];
+pub const TABS: [&str; 3] = ["Fond", "Vagues", "Super"];
 pub const TAB_FOND: usize = 0;
 pub const TAB_VAGUES: usize = 1;
-pub const TAB_LUEURS: usize = 2;
-pub const TAB_SUPER: usize = 3;
-
-/// French accent overlay on a base glyph cell.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Accent {
-    Acute,
-    Grave,
-    Circumflex,
-    Umlaut,
-    Cedilla,
-}
-
-/// One printable cell: ASCII base byte plus an optional accent overlay
-/// (drawn as solid pixels above/below the base glyph).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Cell {
-    pub byte: u8,
-    pub accent: Option<Accent>,
-}
-
-/// Map a char to its base cell. French accents compose onto ASCII;
-/// anything outside latin-1 printables becomes '?'.
-pub fn cell_for(ch: char) -> Cell {
-    use Accent::*;
-    let (base, accent) = match ch {
-        'é' => ('e', Some(Acute)),
-        'è' => ('e', Some(Grave)),
-        'ê' => ('e', Some(Circumflex)),
-        'ë' => ('e', Some(Umlaut)),
-        'à' => ('a', Some(Grave)),
-        'â' => ('a', Some(Circumflex)),
-        'ç' => ('c', Some(Cedilla)),
-        'î' => ('i', Some(Circumflex)),
-        'ï' => ('i', Some(Umlaut)),
-        'ô' => ('o', Some(Circumflex)),
-        'û' => ('u', Some(Circumflex)),
-        'ù' => ('u', Some(Grave)),
-        'É' => ('E', Some(Acute)),
-        'È' => ('E', Some(Grave)),
-        'Ê' => ('E', Some(Circumflex)),
-        'À' => ('A', Some(Grave)),
-        'Â' => ('A', Some(Circumflex)),
-        'Ç' => ('C', Some(Cedilla)),
-        'Î' => ('I', Some(Circumflex)),
-        'Ô' => ('O', Some(Circumflex)),
-        'Û' => ('U', Some(Circumflex)),
-        c if (c as u32) < 128 => (c, None),
-        _ => ('?', None),
-    };
-    Cell {
-        byte: base as u8,
-        accent,
-    }
-}
-
-/// Accent overlay pixels in cell coordinates (8x8, y down). Lowercase
-/// bodies leave rows 0-1 free; capitals use row 0, so their accents sit
-/// one row tighter but stay legible at menu scale.
-pub fn accent_pixels(accent: Accent) -> &'static [(i32, i32)] {
-    match accent {
-        Accent::Acute => &[(4, 1), (5, 0)],
-        Accent::Grave => &[(4, 0), (5, 1)],
-        Accent::Circumflex => &[(3, 1), (4, 0), (5, 1)],
-        Accent::Umlaut => &[(2, 0), (5, 0)],
-        Accent::Cedilla => &[(4, 7), (5, 7)],
-    }
-}
+pub const TAB_SUPER: usize = 2;
 
 /// A menu option. `Toggle` reads/flips a bool; `Choice` cycles one of
 /// three labelled levels; `Slider` steps a u8 in [min, max]; `Info`
@@ -126,7 +59,7 @@ pub enum MenuKind {
     Choice {
         get: fn(&Settings) -> usize,
         set: fn(&mut Settings, usize),
-        options: [&'static str; 3],
+        options: &'static [&'static str],
     },
     Slider {
         get: fn(&Settings) -> u8,
@@ -154,7 +87,8 @@ impl MenuItem {
                 }
             }
             MenuKind::Choice { get, options, .. } => {
-                format!(" : {}", options[get(settings).min(2)])
+                let last = options.len().saturating_sub(1);
+                format!(" : {}", options[get(settings).min(last)])
             }
             MenuKind::Slider { get, unit, .. } => {
                 match self.swatch.map(|f| f(settings)) {
@@ -211,14 +145,15 @@ fn tog(
     })
 }
 
-/// Shorthand for a 3-level choice row.
+/// Shorthand for a categorical row (motif, waveform): any number of
+/// named options, cycled by the Left/Right keys.
 fn choice(
     id: &'static str,
     label: &'static str,
     help: &'static str,
     get: fn(&Settings) -> usize,
     set: fn(&mut Settings, usize),
-    options: [&'static str; 3],
+    options: &'static [&'static str],
 ) -> Row {
     Row::Item(MenuItem {
         id,
@@ -284,8 +219,8 @@ fn chan(
     })
 }
 
-/// Rows of one tab, in order. All labels stay ASCII + composed French
-/// accents (see the font-coverage test).
+/// Rows of one tab, in order. Labels are plain UTF-8 French; the
+/// embedded DejaVu face covers them all (see the font-coverage test).
 pub fn tab_items(tab: usize) -> Vec<Row> {
     match tab {
         TAB_FOND => vec![
@@ -302,7 +237,7 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
                 "Style du fond",
                 |s: &Settings| s.bg_pattern.min(2) as usize,
                 |s: &mut Settings, v| s.bg_pattern = (v.min(2)) as u8,
-                ["Calme", "Dérive", "Nébuleuse"],
+                &["Calme", "Dérive", "Nébuleuse"],
             ),
             slider(
                 "bg_scale",
@@ -404,7 +339,7 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
                 "Forme d'onde",
                 |s: &Settings| s.wave_shape.min(2) as usize,
                 |s: &mut Settings, v| s.wave_shape = (v.min(2)) as u8,
-                ["Sinus", "Triangle", "Bruit"],
+                &["Sinus", "Triangle", "Bruit"],
             ),
             slider(
                 "wave_octaves",
@@ -499,8 +434,6 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
                 None,
                 false,
             ),
-        ],
-        TAB_LUEURS => vec![
             tog(
                 "glow_on",
                 "Lueurs de bord",
@@ -508,29 +441,38 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
                 |s: &Settings| s.glow_on,
                 |s: &mut Settings, v| s.glow_on = v,
             ),
-            choice(
+            slider(
                 "glow_intensity",
-                "Intensité",
+                "Éclat",
                 "Éclat des lueurs",
-                |s: &Settings| (s.glow_intensity.min(2)) as usize,
-                |s: &mut Settings, v| s.glow_intensity = (v.min(2)) as u8,
-                ["Douces", "Moyennes", "Vives"],
+                |s: &Settings| s.glow_intensity.min(100),
+                |s: &mut Settings, v| s.glow_intensity = v.min(100),
+                0,
+                100,
+                5,
+                "%",
             ),
-            choice(
+            slider(
                 "glow_flow",
-                "Flux",
-                "Coulée des lueurs",
-                |s: &Settings| (s.glow_flow.min(2)) as usize,
-                |s: &mut Settings, v| s.glow_flow = (v.min(2)) as u8,
-                ["Lent", "Normal", "Vif"],
+                "Coulée",
+                "Vitesse des lueurs",
+                |s: &Settings| s.glow_flow.min(100),
+                |s: &mut Settings, v| s.glow_flow = v.min(100),
+                0,
+                100,
+                5,
+                "%",
             ),
-            choice(
+            slider(
                 "glow_width",
                 "Largeur",
                 "Bande lumineuse",
-                |s: &Settings| (s.glow_width.min(2)) as usize,
-                |s: &mut Settings, v| s.glow_width = (v.min(2)) as u8,
-                ["Fine", "Moyenne", "Large"],
+                |s: &Settings| s.glow_width.min(100),
+                |s: &mut Settings, v| s.glow_width = v.min(100),
+                0,
+                100,
+                5,
+                "%",
             ),
             chan(
                 "glow_deep_r",
@@ -588,13 +530,16 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
             ),
         ],
         TAB_SUPER => vec![
-            choice(
-                "dolly",
+            slider(
+                "dolly_pct",
                 "Recul",
-                "Zoom arrière en Super",
-                |s: &Settings| (s.dolly.min(2)) as usize,
-                |s: &mut Settings, v| s.dolly = (v.min(2)) as u8,
-                ["Léger 5%", "Normal 10%", "Large 15%"],
+                "Zoom gardé en Super",
+                |s: &Settings| s.dolly_pct.clamp(50, 100),
+                |s: &mut Settings, v| s.dolly_pct = v.clamp(50, 100),
+                50,
+                100,
+                1,
+                "%",
             ),
             slider(
                 "super_dim",
@@ -841,10 +786,11 @@ mod tests {
 
     #[test]
     fn tabs_hold_34_options() {
-        assert_eq!(TABS.len(), 4);
+        assert_eq!(TABS.len(), 3);
         assert_eq!(tab_item_count(TAB_FOND), 11);
-        assert_eq!(tab_item_count(TAB_VAGUES), 11);
-        assert_eq!(tab_item_count(TAB_LUEURS), 10);
+        // Waves absorb the old Lueurs rows (toggle + 3 sliders + 6
+        // channels on top of the 11 wave rows).
+        assert_eq!(tab_item_count(TAB_VAGUES), 21);
         assert_eq!(tab_item_count(TAB_SUPER), 2);
         let total: usize = (0..TABS.len()).map(tab_item_count).sum();
         assert_eq!(total, 34);
@@ -933,15 +879,29 @@ mod tests {
     }
 
     #[test]
-    fn adjust_cycles_choices_and_sets_toggles() {
+    fn adjust_cycles_choices_and_steps_sliders() {
         let mut s = Settings::default();
         let mut m = MenuState::default();
-        m.set_tab(TAB_LUEURS);
-        m.selected = 1; // glow_intensity (default Moyennes = 1).
-        assert_eq!(m.adjust(-1, &mut s), Some("glow_intensity"));
-        assert_eq!(s.glow_intensity, 0);
+        // bg_pattern choice cycles through its 3 motifs.
+        m.set_tab(TAB_FOND);
+        m.selected = 1;
+        assert_eq!(m.adjust(1, &mut s), Some("bg_pattern"));
+        assert_eq!(s.bg_pattern, 2);
+        assert_eq!(m.adjust(1, &mut s), Some("bg_pattern"));
+        assert_eq!(s.bg_pattern, 0);
+        // glow sliders step freely 0-100 now (no fixed levels).
+        m.set_tab(TAB_VAGUES);
+        m.selected = 12; // glow_intensity (default 60, step 5).
         assert_eq!(m.adjust(1, &mut s), Some("glow_intensity"));
-        assert_eq!(s.glow_intensity, 1);
+        assert_eq!(s.glow_intensity, 65);
+        // dolly slider spans 50-100 with step 1.
+        m.set_tab(TAB_SUPER);
+        m.selected = 0; // dolly_pct (default 90).
+        assert_eq!(m.adjust(-1, &mut s), Some("dolly_pct"));
+        assert_eq!(s.dolly_pct, 89);
+        s.dolly_pct = 50;
+        m.adjust(-1, &mut s);
+        assert_eq!(s.dolly_pct, 50);
         m.set_tab(TAB_FOND);
         m.selected = 0; // bg_anim toggle.
         m.adjust(-1, &mut s);
@@ -974,12 +934,13 @@ mod tests {
         assert_eq!(m.selected_item().unwrap().slider_fill(&s), None);
     }
 
-    /// Every string the menu can draw must survive the 8x8 font: no
-    /// '?' fallbacks anywhere (tabs, labels, helps, options, feet,
-    /// value suffixes). Accents compose; anything else is a bug.
+    /// Every string the menu can draw must rasterize in the vector
+    /// face: no tofu anywhere (tabs, labels, helps, options, feet,
+    /// value suffixes). Covered by fontdue, not by cell fallbacks.
     #[test]
     fn every_menu_string_survives_the_font() {
         let s = Settings::default();
+        let probe = crate::fontvec::FontCache::new();
         let mut strings: Vec<String> = Vec::new();
         for t in TABS {
             strings.push(t.to_string());
@@ -1010,9 +971,13 @@ mod tests {
         assert!(!strings.is_empty());
         for text in &strings {
             for ch in text.chars() {
-                let cell = cell_for(ch);
+                if ch.is_whitespace() {
+                    continue;
+                }
+                let (m, px) =
+                    probe.font_rasterize(ch, crate::fontvec::MENU_PX);
                 assert!(
-                    cell.byte != b'?',
+                    m.width > 0 && px.iter().any(|a| *a > 0),
                     "unrenderable char {:?} in {:?}",
                     ch,
                     text
@@ -1022,43 +987,16 @@ mod tests {
     }
 
     #[test]
-    fn french_accents_compose_onto_ascii() {
-        assert_eq!(
-            cell_for('é'),
-            Cell {
-                byte: b'e',
-                accent: Some(Accent::Acute)
-            }
-        );
-        assert_eq!(
-            cell_for('É'),
-            Cell {
-                byte: b'E',
-                accent: Some(Accent::Acute)
-            }
-        );
-        assert_eq!(
-            cell_for('ç'),
-            Cell {
-                byte: b'c',
-                accent: Some(Accent::Cedilla)
-            }
-        );
-        assert_eq!(cell_for('z'), Cell { byte: b'z', accent: None });
-        assert_eq!(cell_for('€'), Cell { byte: b'?', accent: None });
-    }
-
-    #[test]
     fn hit_test_skips_tab_bar_and_misses_outside() {
         // Fond tab rows: 0 = tab bar, 1-11 items 0-10, then feet.
         let l = layout(TAB_FOND, 0.0, 0.0);
         let row_y = |r: usize| l.y + PANEL_PAD + r as f64 * ROW_H + 4.0;
         assert_eq!(tab_at(&l, l.x + 10.0, row_y(0)), Some(0));
         assert_eq!(
-            tab_at(&l, l.x + l.w * 0.3, row_y(0)),
+            tab_at(&l, l.x + l.w * 0.4, row_y(0)),
             Some(1)
         );
-        assert_eq!(tab_at(&l, l.x + l.w * 0.8, row_y(0)), Some(3));
+        assert_eq!(tab_at(&l, l.x + l.w * 0.8, row_y(0)), Some(2));
         assert_eq!(tab_at(&l, l.x + 10.0, row_y(1)), None);
         assert_eq!(item_at(&l, l.x + 10.0, row_y(0)), None);
         assert_eq!(item_at(&l, l.x + 10.0, row_y(1)), Some(0));
