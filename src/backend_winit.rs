@@ -471,12 +471,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     // Options menu toggle: Super + physical comma (macOS
-                    // Cmd+,) or Super + physical I (Windows Win+I).
-                    // Positional codes, so it holds on any layout, and
-                    // Super-gated, so app keys (Ctrl+,) are never stolen.
+                    // Cmd+,) or Super + physical I (Windows Win+I) — or
+                    // the bare key in Canvas mode, where apps are frozen
+                    // and no Super hold is needed. Positional codes, so it
+                    // holds on any layout, and Super-gated in Idle, so app
+                    // keys (Ctrl+,) are never stolen.
                     // Consumed — never reaches the app.
                     if pressed
-                        && super_held
+                        && (super_held
+                            || session.state == crate::session::SuperState::Canvas)
                         && (evdev == crate::menu::KEY_COMMA || evdev == crate::menu::KEY_I)
                     {
                         menu.open = !menu.open;
@@ -497,6 +500,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         // focus to the window on the right, A left, W up,
                         // S down — strictly in that half-plane, or nothing.
                         // Canvas-modal and consumed, so apps never see it.
+                        // Keyboard window move: Shift + WASD shoves the
+                        // focused window (else the hovered one) by a fixed
+                        // canvas step — every press AND auto-repeat, so
+                        // holding the key glides it. Deliberately outside
+                        // the `wasd_held` guard below: repeats ARE the
+                        // motion here. Size-independent by construction:
+                        // the step never depends on the window, so big and
+                        // small windows travel at the same speed.
+                        // Raise + select, like the E-grab.
+                        // Canvas-modal (or Super held) and consumed.
                         const WASD_KEYS: [u32; 4] = [17, 30, 31, 32];
                         const WASD_DIRS: [(f64, f64, &str); 4] = [
                             (0.0, -1.0, "north"), // W
@@ -504,13 +517,56 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             (0.0, 1.0, "south"),  // S
                             (1.0, 0.0, "east"),   // D
                         ];
+                        /// Keyboard shove per press/repeat, canvas px.
+                        const KBD_MOVE_STEP: f64 = 32.0;
+                        let shift_down =
+                            held_mods.contains(&42) || held_mods.contains(&54);
+                        if pressed && shift_down {
+                            if let Some(wi) =
+                                WASD_KEYS.iter().position(|c| *c == evdev)
+                            {
+                                // Swallow the focus guard too: a held D must
+                                // not refocus when Shift is released first.
+                                wasd_held[wi] = true;
+                                let (dx, dy, name) = WASD_DIRS[wi];
+                                let cworld = session.to_canvas(pointer, view);
+                                let target = focused_id
+                                    .or_else(|| server_state.topmost_at(cworld));
+                                match target {
+                                    Some(id) => {
+                                        match server_state.windows.get_mut(&id) {
+                                            Some(cw) => {
+                                                cw.canvas.pos.x += dx * KBD_MOVE_STEP;
+                                                cw.canvas.pos.y += dy * KBD_MOVE_STEP;
+                                                need_render = true;
+                                            }
+                                            None => {}
+                                        }
+                                        server_state.raise(id);
+                                        session.overview.select(id);
+                                        focused_id = Some(id);
+                                        known_ids.insert(id);
+                                        log::info!(
+                                            "kbd move window {} {} +{:.0}",
+                                            id,
+                                            name,
+                                            KBD_MOVE_STEP
+                                        );
+                                    }
+                                    None => {
+                                        log::info!("kbd move no window {}", name);
+                                    }
+                                }
+                                consumed = true;
+                            }
+                        }
                         if let Some(wi) =
                             WASD_KEYS.iter().position(|c| *c == evdev)
                         {
                             let (dx, dy, name) = WASD_DIRS[wi];
                             if !pressed {
                                 wasd_held[wi] = false;
-                            } else if !wasd_held[wi] {
+                            } else if !wasd_held[wi] && !shift_down {
                                 wasd_held[wi] = true;
                                 let centre = crate::canvas::Vec2::new(
                                     view.x / 2.0,
@@ -857,13 +913,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 // left press outside closes; nothing reaches the canvas.
                 if menu.open {
                     if pressed && left {
-                        let cw = session.to_canvas(pointer, view);
-                        let center = session.to_canvas(
-                            crate::canvas::Vec2::new(view.x / 2.0, view.y / 2.0),
-                            view,
+                        // Fixed screen-space popup: layout around the view
+                        // centre in SCREEN px (never canvas), hit-tested
+                        // with the raw pointer — pan/zoom proof.
+                        let lay = crate::menu::layout(
+                            view.x,
+                            view.y,
+                            view.x / 2.0,
+                            view.y / 2.0,
                         );
-                        let lay = crate::menu::layout(view.x, view.y, center.x, center.y);
-                        match crate::menu::item_at(&lay, cw.x, cw.y) {
+                        match crate::menu::item_at(&lay, pointer.x, pointer.y) {
                             Some(i) => {
                                 menu.selected = i;
                                 if let Some(id) = crate::menu::MenuState::activate_at(
@@ -1686,22 +1745,24 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     {
                         let mvp = crate::render3d::ortho(view.x as f32, view.y as f32);
                         let sc = scale as f32;
-                        let zoom = session.view_camera().zoom as f32;
-                        let u = zoom * sc;
-                        let center = session.to_canvas(
-                            crate::canvas::Vec2::new(view.x / 2.0, view.y / 2.0),
-                            view,
+                        // Fixed screen-space popup: centred on the view in
+                        // SCREEN px, drawn 1:1 — Super dolly and pans never
+                        // resize or move it.
+                        let lay = crate::menu::layout(
+                            view.x,
+                            view.y,
+                            view.x / 2.0,
+                            view.y / 2.0,
                         );
-                        let lay = crate::menu::layout(view.x, view.y, center.x, center.y);
-                        let to_px = |wx: f64, wy: f64| {
-                            let s = session.to_screen(crate::canvas::Vec2::new(wx, wy), view);
-                            ((s.x as f32) * sc, (s.y as f32) * sc)
-                        };
+                        let to_px =
+                            |wx: f64, wy: f64| ((wx as f32) * sc, (wy as f32) * sc);
                         let (px0, py0) = to_px(lay.x, lay.y);
-                        let pw = lay.w as f32 * u;
-                        let ph = lay.h as f32 * u;
-                        let pad = crate::menu::PANEL_PAD as f32 * u;
-                        let row_h = crate::menu::ROW_H as f32 * u;
+                        // Popup scale is the output scale ONLY — never the
+                        // canvas zoom (impossible to resize by zooming).
+                        let pw = lay.w as f32 * sc;
+                        let ph = lay.h as f32 * sc;
+                        let pad = crate::menu::PANEL_PAD as f32 * sc;
+                        let row_h = crate::menu::ROW_H as f32 * sc;
                         let atlas_id = atlas.tex_id();
                         let rows = crate::menu::items();
                         let _ = renderer.with_context(|_, gl| unsafe {
@@ -1723,12 +1784,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             let mut item_idx = 0usize;
                             for (i, row) in rows.iter().enumerate() {
                                 let (_, rpy) = to_px(lay.x, lay.y + crate::menu::PANEL_PAD + i as f64 * crate::menu::ROW_H);
-                                let ty = rpy + 7.0 * u;
+                                let ty = rpy + 7.0 * sc;
                                 match row {
                                     crate::menu::Row::Header(label)
                                     | crate::menu::Row::Foot(label) => {
                                         draw_menu_line(
-                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, u,
+                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, sc,
                                             label,
                                         );
                                     }
@@ -1748,7 +1809,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             it.state_text(&settings)
                                         );
                                         draw_menu_line(
-                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, u,
+                                            gl, tprog, sprog, &mvp, atlas_id, px0 + pad, ty, sc,
                                             &line,
                                         );
                                         item_idx += 1;
