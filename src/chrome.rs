@@ -96,6 +96,7 @@ pub const KEY_Q: u32 = 16;
 pub const KEY_E: u32 = 18;
 pub const KEY_R: u32 = 19;
 pub const KEY_F: u32 = 33;
+pub const KEY_K: u32 = 37;
 
 /// Modifier evdev codes that cancel hover shortcuts (typing stays typing).
 pub const MOD_CODES: [u32; 6] = [42, 54, 29, 97, 56, 100];
@@ -106,6 +107,7 @@ pub enum HoverKey {
     Close,
     Grab,
     Scale,
+    Cube,
 }
 
 pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
@@ -117,6 +119,7 @@ pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
         KEY_Q => Some(HoverKey::Close),
         KEY_E => Some(HoverKey::Grab),
         KEY_R => Some(HoverKey::Scale),
+        KEY_K => Some(HoverKey::Cube),
         _ => None,
     }
 }
@@ -218,6 +221,8 @@ mod tests {
         assert_eq!(hover_shortcut(KEY_Q, false), Some(HoverKey::Close));
         assert_eq!(hover_shortcut(KEY_E, false), Some(HoverKey::Grab));
         assert_eq!(hover_shortcut(KEY_R, false), Some(HoverKey::Scale));
+        assert_eq!(hover_shortcut(KEY_K, false), Some(HoverKey::Cube));
+        assert_eq!(hover_shortcut(KEY_K, true), None); // modifiers: typing
         assert_eq!(hover_shortcut(KEY_F, true), None);
         assert_eq!(hover_shortcut(30, false), None); // A is for typing
         assert!(MOD_CODES.contains(&42) && MOD_CODES.contains(&29));

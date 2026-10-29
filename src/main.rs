@@ -30,6 +30,8 @@ mod fontvec;
 mod settings;
 #[cfg(feature = "compositor")]
 mod menu;
+#[cfg(feature = "compositor")]
+mod cubes;
 
 use std::collections::HashMap;
 

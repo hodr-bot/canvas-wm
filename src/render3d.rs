@@ -282,6 +282,48 @@ unsafe fn compile(gl: &ffi::Gles2, variant: u32, src: &'static str) -> Result<u3
     Ok(shader)
 }
 
+/// Draw solid triangles in screen space: `verts` are flat (x, y) pairs,
+/// 3 per triangle, drawn with the solid program + ortho MVP. Used for
+/// cube faces and blob shadows (CPU-projected, so no new shader).
+/// Same hygiene as `draw_solid`. Colours follow the premultiplied
+/// contract: rgb already multiplied by a (opaque faces pass a = 1).
+#[cfg(feature = "compositor")]
+pub unsafe fn draw_tris(
+    gl: &ffi::Gles2,
+    prog: (u32, i32, i32, u32),
+    mvp: &[f32; 16],
+    color: [f32; 4],
+    verts: &[f32],
+) {
+    debug_assert!(verts.len() % 6 == 0, "draw_tris needs 3 (x,y) per tri");
+    let (program, u_mvp, u_color, a_pos) = prog;
+    gl.Disable(ffi::SCISSOR_TEST);
+    gl.UseProgram(program);
+    gl.UniformMatrix4fv(u_mvp, 1, ffi::FALSE as u8, mvp.as_ptr());
+    gl.Uniform4f(u_color, color[0], color[1], color[2], color[3]);
+    gl.EnableVertexAttribArray(a_pos);
+    gl.VertexAttribPointer(a_pos, 2, ffi::FLOAT, ffi::FALSE as u8, 0, verts.as_ptr() as *const _);
+    gl.DrawArrays(ffi::TRIANGLES, 0, (verts.len() / 2) as i32);
+    gl.DisableVertexAttribArray(a_pos);
+    gl.UseProgram(0);
+    gl.Enable(ffi::SCISSOR_TEST);
+}
+
+/// CPU-side projection through a column-major MVP (as built by
+/// [`canvas_mvp`]): world (x, y, z) in MVP units (caller negates canvas
+/// y, like the window draws) -> (ndc_x, ndc_y, ndc_z). The backend maps
+/// NDC to screen px itself, so cubes land exactly where windows do.
+#[cfg(feature = "compositor")]
+pub fn project(mvp: &[f32; 16], x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+    // Column-major: out[i] = m[i]*x + m[4+i]*y + m[8+i]*z + m[12+i].
+    let cx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
+    let cy = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
+    let cz = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
+    let cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+    let w = if cw.abs() < 1e-9 { 1e-9 * cw.signum() } else { cw };
+    (cx / w, cy / w, cz / w)
+}
+
 /// Draw one solid rect (x, y, w, h in MVP units) with an RGBA colour.
 /// Leaves the GL state as Smithay's frame engine expects it: its program
 /// rebound by its own draws, our attribs disabled, scissor restored.

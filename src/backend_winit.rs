@@ -253,6 +253,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut f_held = false;
     let mut q_held = false;
     let mut r_held = false;
+    let mut k_held = false;
+    // Toy cubes (K key, Canvas mode): canvas-anchored physics bodies.
+    let mut cubes: Vec<crate::cubes::Cube> = Vec::new();
+    let mut cube_seed: u64 = 0xC0BEu64;
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): window id + pinned centre +
     // size at grab + mouse canvas pos at grab + last pushed client
@@ -352,6 +356,28 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     if std::env::var("CANVAS_FORCE_ECO").is_ok() {
         settings.eco = true;
         log::info!("forced eco for proof: FX frozen");
+    }
+    // Headless proof hook (screenshots): pre-drop cubes across the
+    // opening view so the fall/tumble/rest cycle is visible without a
+    // working harness keyboard.
+    if let Ok(n) = std::env::var("CANVAS_SPAWN_CUBES") {
+        let count: usize = n.parse().unwrap_or(3).min(8);
+        for i in 0..count {
+            let fx = 0.3 + 0.2 * (i as f64 % 3.0);
+            let fy = 0.35 + 0.15 * ((i / 3) as f64 % 3.0);
+            let at = session.to_canvas(
+                crate::canvas::Vec2::new(view.x * fx, view.y * fy),
+                view,
+            );
+            cube_seed = cube_seed
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add(0xC0BE + i as u64);
+            crate::cubes::add_cube(
+                &mut cubes,
+                crate::cubes::spawn(at.x, at.y, cube_seed),
+            );
+        }
+        log::info!("proof cubes spawned: {}", cubes.len());
     }
 
     loop {
@@ -948,6 +974,36 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     r_held = pressed;
                                     consumed = true;
                                 }
+                                crate::chrome::HoverKey::Cube => {
+                                    // Toy cube drop: fresh K press (no
+                                    // auto-repeat spam) spawns one 3D box
+                                    // above the cursor; it falls, tumbles,
+                                    // lands on canvas or window tops, rolls
+                                    // with slides, and rides camera pans.
+                                    // Canvas-modal like F/Q/E/R — Idle typing
+                                    // never spawns.
+                                    if pressed && !k_held {
+                                        cube_seed = cube_seed
+                                            .wrapping_mul(0x9E3779B97F4A7C15)
+                                            .wrapping_add(0xC0BE);
+                                        let at = session.to_canvas(pointer, view);
+                                        crate::cubes::add_cube(
+                                            &mut cubes,
+                                            crate::cubes::spawn(
+                                                at.x, at.y, cube_seed,
+                                            ),
+                                        );
+                                        log::info!(
+                                            "cube drop at ({:.0},{:.0}) n={}",
+                                            at.x,
+                                            at.y,
+                                            cubes.len()
+                                        );
+                                        need_render = true;
+                                    }
+                                    k_held = pressed;
+                                    consumed = true;
+                                }
                             }
                         }
                     }
@@ -1538,6 +1594,26 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             for p in props.iter_mut() {
                 if p.step(dt, vcam) {
                     need_render = true;
+                }
+            }
+            // Toy cubes: same clock; windows are static hitboxes (they
+            // never move for cubes — a grabbed window shoves through,
+            // the push-out ejects the cube). Camera velocity couples
+            // through canvas grip so pans drag resting cubes and hard
+            // stops fling them further.
+            {
+                let walls: Vec<(f64, f64, f64, f64)> = server_state
+                    .windows
+                    .values()
+                    .map(|c| {
+                        (c.canvas.pos.x, c.canvas.pos.y, c.canvas.size.x, c.canvas.size.y)
+                    })
+                    .collect();
+                let cam_vel = session.camera.vel;
+                for c in cubes.iter_mut() {
+                    if c.step(dt, cam_vel, &walls) {
+                        need_render = true;
+                    }
                 }
             }
         }
@@ -2139,19 +2215,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                if let Some((_, layout)) = chrome_now {
-                    if solid_prog.is_none() {
-                        match renderer.with_context(|_, gl| {
-                            crate::render3d::compile_solid(gl)
-                        }) {
-                            Ok(Ok(p)) => {
-                                solid_prog = Some(p);
-                                log::info!("chrome GL program ready");
-                            }
-                            Ok(Err(e)) => log::warn!("chrome GL program: {}", e),
-                            Err(e) => log::warn!("chrome GL context: {:?}", e),
+                if solid_prog.is_none() {
+                    match renderer.with_context(|_, gl| {
+                        crate::render3d::compile_solid(gl)
+                    }) {
+                        Ok(Ok(p)) => {
+                            solid_prog = Some(p);
+                            log::info!("chrome GL program ready");
                         }
+                        Ok(Err(e)) => log::warn!("chrome GL program: {}", e),
+                        Err(e) => log::warn!("chrome GL context: {:?}", e),
                     }
+                }
+                if let Some((_, layout)) = chrome_now {
                     if let Some(prog) = solid_prog {
                         let mvp =
                             crate::render3d::ortho(view.x as f32, view.y as f32);
@@ -2182,6 +2258,149 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     b,
                                 ),
                             );
+                        });
+                    }
+                }
+                // Toy cubes (K key): canvas-anchored 3D bodies through the
+                // SAME perspective MVP as windows — corners CPU-projected,
+                // faces drawn as screen-space tris with the solid program
+                // (no new shader, no depth buffer: painter's algorithm).
+                // Blob shadows on the canvas plane first (fading with
+                // height), then all faces back-to-front by projected depth.
+                // Before glow/menu so both wash over the toys.
+                if !cubes.is_empty() {
+                    if let Some(prog) = solid_prog {
+                        let sc = scale as f32;
+                        let vw = view.x as f32 * sc;
+                        let vh = view.y as f32 * sc;
+                        let mid = session.to_world(
+                            crate::canvas::Vec2::new(view.x / 2.0, view.y / 2.0),
+                            view,
+                        );
+                        let mvp = crate::render3d::canvas_mvp(
+                            (vw, vh),
+                            (mid.x as f32 * sc, mid.y as f32 * sc),
+                            session.view_camera().zoom as f32,
+                            (0.0, 0.0),
+                        );
+                        let omvp =
+                            crate::render3d::ortho(view.x as f32, view.y as f32);
+                        // World (canvas px, z up) -> screen px + NDC depth.
+                        // Mirrors the window draws: x*sc, -(y)*sc, z*sc.
+                        let proj = |wx: f64, wy: f64, wz: f64| {
+                            let n = crate::render3d::project(
+                                &mvp,
+                                wx as f32 * sc,
+                                -(wy as f32) * sc,
+                                wz as f32 * sc,
+                            );
+                            (
+                                (n.0 * 0.5 + 0.5) * view.x as f32,
+                                (1.0 - (n.1 * 0.5 + 0.5)) * view.y as f32,
+                                n.2,
+                            )
+                        };
+                        // Fixed key light (world, y-down canvas plane).
+                        let light = {
+                            let l: [f64; 3] = [-0.35, -0.5, 0.8];
+                            let m = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+                            [l[0] / m, l[1] / m, l[2] / m]
+                        };
+                        let _ = renderer.with_context(|_, gl| unsafe {
+                            // Shadows: one soft blob per cube on the surface
+                            // below (canvas or window top), detached and
+                            // faded while airborne.
+                            for c in cubes.iter() {
+                                let gh = crate::cubes::ground_height(
+                                    c.pos.x, c.pos.y, &[],
+                                );
+                                let g =
+                                    proj(c.pos.x + c.z * 0.18, c.pos.y + c.z * 0.12, gh);
+                                let fade =
+                                    (1.0 - c.z / 1400.0).clamp(0.3, 1.0) as f32;
+                                let r = c.half as f32 * 2.3 * fade + 2.0;
+                                for (grow, a) in [(1.0, 0.16), (0.68, 0.20)] {
+                                    let rr = r * grow;
+                                    let al = a * fade;
+                                    let (gx, gy) = (g.0 as f32, g.1 as f32);
+                                    let verts: [f32; 12] = [
+                                        gx - rr, gy - rr, gx + rr, gy - rr,
+                                        gx - rr, gy + rr, gx - rr, gy + rr,
+                                        gx + rr, gy - rr, gx + rr, gy + rr,
+                                    ];
+                                    crate::render3d::draw_tris(
+                                        gl, prog, &omvp, [0.0, 0.0, 0.0, al],
+                                        &verts,
+                                    );
+                                }
+                            }
+                            // Faces: collect (depth, colour, quad), paint far
+                            // first. Visible = normal towards the viewer
+                            // (+z); shade follows the key light.
+                            let mut faces: Vec<(f32, [f32; 4], [f32; 8])> =
+                                Vec::new();
+                            for c in cubes.iter() {
+                                let corners = c.corners();
+                                let mut proj_c = [(0.0f32, 0.0f32); 8];
+                                let mut depth = [0.0f32; 8];
+                                for (i, k) in corners.iter().enumerate() {
+                                    let p = proj(k[0], k[1], k[2]);
+                                    proj_c[i] = (p.0 as f32, p.1 as f32);
+                                    depth[i] = p.2 as f32;
+                                }
+                                for (axis, quad) in
+                                    crate::cubes::FACES.iter()
+                                {
+                                    let n = crate::cubes::face_normal(
+                                        c.rot, *axis,
+                                    );
+                                    if n[2] <= 0.02 {
+                                        continue;
+                                    }
+                                    let mut shade = 0.42
+                                        + 0.58
+                                            * (n[0] * light[0]
+                                                + n[1] * light[1]
+                                                + n[2] * light[2])
+                                                .max(0.0);
+                                    if n[2] > 0.5 {
+                                        shade = (shade + 0.12).min(1.0);
+                                    }
+                                    let s = shade as f32;
+                                    let col = [
+                                        c.rgb[0] as f32 * s,
+                                        c.rgb[1] as f32 * s,
+                                        c.rgb[2] as f32 * s,
+                                        1.0,
+                                    ];
+                                    let d = (depth[quad[0]]
+                                        + depth[quad[1]]
+                                        + depth[quad[2]]
+                                        + depth[quad[3]])
+                                        * 0.25;
+                                    let q = [
+                                        proj_c[quad[0]].0, proj_c[quad[0]].1,
+                                        proj_c[quad[1]].0, proj_c[quad[1]].1,
+                                        proj_c[quad[2]].0, proj_c[quad[2]].1,
+                                        proj_c[quad[3]].0, proj_c[quad[3]].1,
+                                    ];
+                                    faces.push((d, col, q));
+                                }
+                            }
+                            // Far (larger NDC z) first.
+                            faces.sort_by(|a, b| {
+                                b.0.partial_cmp(&a.0).unwrap()
+                            });
+                            for (d, col, q) in faces.iter() {
+                                let _ = d;
+                                let verts: [f32; 12] = [
+                                    q[0], q[1], q[2], q[3], q[4], q[5], q[0],
+                                    q[1], q[4], q[5], q[6], q[7],
+                                ];
+                                crate::render3d::draw_tris(
+                                    gl, prog, &omvp, *col, &verts,
+                                );
+                            }
                         });
                     }
                 }
