@@ -557,12 +557,12 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
     }
 }
 
-/// Feet shared by all tabs.
+/// Feet shared by all tabs: version plus one single-line key hint
+/// (two rows total — the Vagues tab already fills small outputs).
 pub fn feet() -> Vec<&'static str> {
     vec![
         "canvas-wm 0.2.0",
-        "Haut/Bas : choisir, Gauche/Droite : régler",
-        "Tab : onglet, Entrée : changer, Echap : fermer",
+        "↑↓ : choisir, ←→ : régler, Tab : onglet, Entrée : changer, Echap : fermer",
     ]
 }
 
@@ -707,8 +707,16 @@ pub struct Layout {
     pub tab: usize,
 }
 
-/// Row height in screen px (text drawn at 2x scale: 16px cells).
+/// Row height in screen px: 16px type at TEXT_DY, slider track
+/// pinned above the row bottom with daylight between the two.
+/// The tallest tab must clear 800px-tall outputs (see the layout
+/// test below): keep rows tight, feet short.
 pub const ROW_H: f64 = 30.0;
+/// Text baseline offset from the row top (16px face).
+pub const TEXT_DY: f64 = 6.0;
+/// Slider track height and its gap to the row bottom.
+pub const TRACK_H: f64 = 3.0;
+pub const TRACK_PAD_BOTTOM: f64 = 4.0;
 /// Panel width (labels + values + slider tracks + swatches).
 pub const PANEL_W: f64 = 800.0;
 pub const PANEL_PAD: f64 = 24.0;
@@ -984,6 +992,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn text_and_slider_track_never_share_a_row_band() {
+        // The 16px face at TEXT_DY must end above the slider track
+        // pinned to the row bottom: regressions here paint the track
+        // straight through the glyphs.
+        let text_bottom = TEXT_DY + crate::fontvec::MENU_PX as f64;
+        let track_top = ROW_H - TRACK_PAD_BOTTOM - TRACK_H;
+        assert!(
+            text_bottom < track_top,
+            "text ends at {} but the track starts at {}",
+            text_bottom,
+            track_top
+        );
+        // The tallest tab (Vagues, 21 rows + tabs + feet) still fits
+        // a 800px-tall output with room to breathe.
+        let l = layout(TAB_VAGUES, 640.0, 400.0);
+        assert!(l.h <= 780.0, "Vagues panel {}px overflows", l.h);
+        assert!(l.y >= 10.0, "Vagues panel top {} off-screen", l.y);
+        // The single-line key hint fits the panel width.
+        let hint = feet()[1];
+        let w = crate::fontvec::FontCache::new().measure(hint) as f64;
+        assert!(
+            w < PANEL_W - PANEL_PAD * 2.0,
+            "key hint {}px overflows the panel",
+            w
+        );
     }
 
     #[test]

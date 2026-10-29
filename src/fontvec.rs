@@ -17,8 +17,9 @@ use fontdue::{Font, FontSettings};
 
 /// Embedded UI face, see assets/FONTS.md for provenance and licence.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
-/// Menu type size in px.
-pub const MENU_PX: f32 = 19.0;
+/// Menu type size in px: 16px leaves room for the slider track
+/// below the text inside a 32px row (see menu::TEXT_DY/TRACK_*).
+pub const MENU_PX: f32 = 16.0;
 /// Atlas side (RGBA bytes, white premultiplied by coverage).
 pub const ATLAS_SIDE: u32 = 512;
 /// Glyph the cache degrades to when the atlas is full.
