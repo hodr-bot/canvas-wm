@@ -351,9 +351,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     evdev,
                     pressed
                 );
-                // Options menu open: it owns presses (Up/Down/Enter nav,
+                // Options menu open: it owns nav presses (Up/Down/Enter nav,
                 // Esc closes). Releases still reach the app so nothing
-                // sticks; other presses are swallowed, never typed.
+                // sticks. Anything else falls through to normal handling:
+                // swallowing every shortcut while the menu is open made
+                // all of F/Q/E/R/WASD/Super look dead after opening it.
                 if menu.open {
                     if sym == KEY_Escape && pressed {
                         menu.open = false;
@@ -366,10 +368,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             crate::menu::KEY_UP => {
                                 menu.up();
                                 need_render = true;
+                                return;
                             }
                             crate::menu::KEY_DOWN => {
                                 menu.down();
                                 need_render = true;
+                                return;
                             }
                             crate::menu::KEY_ENTER => {
                                 if let Some(id) =
@@ -378,20 +382,21 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     log::info!("menu option {} toggled", id);
                                 }
                                 need_render = true;
+                                return;
                             }
                             _ => {}
                         }
+                    } else {
+                        // Release while open: forward to the app (anti-stick).
+                        let xid = focused_id
+                            .and_then(|id| server_state.windows.get(&id))
+                            .and_then(|c| c.x11);
+                        match (xwm.as_ref(), xid) {
+                            (Some(wm), Some(xid)) => wm.xtest_key(xid, evdev, false),
+                            _ => server.input_key(evdev, false),
+                        }
                         return;
                     }
-                    // Release while open: forward to the app (anti-stick).
-                    let xid = focused_id
-                        .and_then(|id| server_state.windows.get(&id))
-                        .and_then(|c| c.x11);
-                    match (xwm.as_ref(), xid) {
-                        (Some(wm), Some(xid)) => wm.xtest_key(xid, evdev, false),
-                        _ => server.input_key(evdev, false),
-                    }
-                    return;
                 }
                 if sym == KEY_Escape && pressed {
                     let action = session.on_event(
