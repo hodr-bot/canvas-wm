@@ -68,6 +68,18 @@
       <arg name="format" type="uint"/>
     </request>
 
+    <request name="create_prime_buffer" since="2">
+      <description summary="prime-fd buffer (unsupported, use linux-dmabuf)"/>
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="fd" type="fd" summary="prime file descriptor"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="format" type="uint"/>
+      <arg name="flags" type="uint"/>
+      <arg name="stride0" type="int"/>
+      <arg name="offset0" type="int"/>
+    </request>
+
     <request name="create_planar_buffer" since="2">
       <description summary="legacy planar GEM buffer (unsupported)"/>
       <arg name="id" type="new_id" interface="wl_buffer"/>
@@ -101,6 +113,15 @@
     <event name="capabilities" since="2">
       <description summary="compositor capability bitmask"/>
       <arg name="value" type="uint"/>
+    </event>
+
+    <event name="invalid_format">
+      <description summary="refusal of the last create_* buffer">
+        Sent when a create_buffer, create_planar_buffer or
+        create_prime_buffer request cannot produce a usable buffer.
+        The client correlates it with the buffer it just created
+        and is expected to fall back to another allocation path.
+      </description>
     </event>
   </interface>
 </protocol>

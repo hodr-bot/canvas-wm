@@ -12,6 +12,7 @@
 //! dead GEM-flink requests are ignored (allocation goes through dmabuf).
 
 use smithay::reexports::wayland_server::{Display, Filter, Global, Main};
+use std::os::unix::io::FromRawFd;
 
 // Same shim layout as wayland-protocols' `wayland_protocol!` server module:
 // the scanner output expects these names in scope via `super::`.
@@ -53,6 +54,24 @@ pub fn init_drm_global(display: &mut Display, device: String) -> Global<WlDrm> {
                     // Render-node clients never send this; answer anyway so
                     // a card-node client degrades instead of hanging.
                     DrmRequest::Authenticate { .. } => drm.authenticated(),
+                    // GEM-flink and prime buffers cannot be imported by this
+                    // compositor (allocation goes through linux-dmabuf):
+                    // implement the id so the client is not killed for an
+                    // unimplemented object, then refuse per protocol so it
+                    // can fall back instead of hanging on a dead buffer.
+                    DrmRequest::CreateBuffer { id, .. }
+                    | DrmRequest::CreatePlanarBuffer { id, .. } => {
+                        id.quick_assign(|_, _, _| {});
+                        drm.invalid_format();
+                    }
+                    DrmRequest::CreatePrimeBuffer { id, fd, .. } => {
+                        // Wayland passes ownership of the fd: close it.
+                        let _ = unsafe {
+                            std::os::unix::io::OwnedFd::from_raw_fd(fd)
+                        };
+                        id.quick_assign(|_, _, _| {});
+                        drm.invalid_format();
+                    }
                     _ => {}
                 });
                 drm.device(device.clone());
