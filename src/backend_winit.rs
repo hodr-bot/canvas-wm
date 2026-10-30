@@ -206,6 +206,26 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // without dma-buf (llvmpipe headless): the global is still announced.
     let dmabuf_formats: Vec<smithay::backend::allocator::Format> =
         graphics.renderer().dmabuf_formats().cloned().collect();
+    // Identify the GL driver: software rasterizers (llvmpipe) report
+    // importable formats but cannot back cross-process dmabuf. Advertising
+    // those makes HW GL clients request dmabuf they can never use: their
+    // EGL init dies (Mesa fd -1) and the window freezes after mapping,
+    // while software-GL and shm clients look fine. On software GL offer
+    // nothing so every client falls back to shm.
+    let gl_renderer = graphics
+        .renderer()
+        .with_context(|_, gl| crate::render3d::renderer_name(gl))
+        .map_err(|e| format!("gl renderer probe: {:?}", e))?;
+    let gl_lower = gl_renderer.to_lowercase();
+    let software_gl = ["llvmpipe", "softpipe", "swrast", "software", "basic render"]
+        .iter()
+        .any(|m| gl_lower.contains(m));
+    log::info!("gl renderer: {} (software={})", gl_renderer, software_gl);
+    let dmabuf_formats: Vec<smithay::backend::allocator::Format> = if software_gl {
+        Vec::new()
+    } else {
+        dmabuf_formats
+    };
     log::info!("renderer offers {} dmabuf formats", dmabuf_formats.len());
     let (mut server, socket) =
         Server::new(dmabuf_formats).map_err(|e| format!("wayland bind: {}", e))?;
