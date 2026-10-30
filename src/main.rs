@@ -32,6 +32,8 @@ mod settings;
 mod menu;
 #[cfg(feature = "compositor")]
 mod marbles;
+#[cfg(feature = "compositor")]
+mod drm;
 
 use std::collections::HashMap;
 

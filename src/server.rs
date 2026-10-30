@@ -404,6 +404,10 @@ pub struct Server {
     _dmabuf: Global<
         smithay::reexports::wayland_protocols::unstable::linux_dmabuf::v1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
     >,
+    /// Device handoff for Mesa hardware clients (`wl_drm` render node).
+    /// Without it they allocate against fd -1 and freeze after mapping;
+    /// keep it alive forever. None when no render node is openable.
+    _drm: Option<Global<crate::drm::WlDrm>>,
     _shell_state: Arc<Mutex<ShellState>>,
     _xdg: Global<XdgWmBase>,
     _zxdg: Global<ZxdgShellV6>,
@@ -447,6 +451,19 @@ pub struct Server {
     pointer: PointerHandle,
     serial: u32,
     start: Instant,
+}
+
+/// First openable DRM render node (`/dev/dri/renderD*`), for the `wl_drm`
+/// device handoff. Render nodes are world-openable and need no auth.
+fn pick_render_node() -> Option<String> {
+    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .filter(|path| path.contains("renderD"))
+        .collect();
+    nodes.sort();
+    nodes.into_iter().find(|path| std::fs::File::open(path).is_ok())
 }
 
 impl Server {
@@ -540,6 +557,23 @@ impl Server {
         // v3, which mako refuses to bind.
         let output_global = crate::output::init_output(&mut display.borrow_mut());
         let (output_global, output_registry) = output_global;
+        // Render-node handoff for Mesa hardware clients: without a device
+        // they allocate against fd -1, fail EGL init and freeze after the
+        // first map. Render nodes need no DRM auth, which a nested
+        // compositor could not provide anyway.
+        let drm = match pick_render_node() {
+            Some(device) => {
+                log::warn!("wl_drm device: {}", device);
+                Some(crate::drm::init_drm_global(
+                    &mut display.borrow_mut(),
+                    device,
+                ))
+            }
+            None => {
+                log::warn!("wl_drm device: none openable, hardware GL clients will fail");
+                None
+            }
+        };
         Ok((
             Self {
                 display,
@@ -547,6 +581,7 @@ impl Server {
                 _subcompositor: subcompositor,
                 _shm: shm,
                 _dmabuf: dmabuf,
+                _drm: drm,
                 _shell_state: shell_state,
                 _xdg: xdg,
                 _zxdg: zxdg,
