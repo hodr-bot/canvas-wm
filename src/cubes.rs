@@ -21,8 +21,9 @@ use crate::canvas::Vec2;
 /// GPU, fine even for llvmpipe. Anti-spam is the fresh-press guard;
 /// this only bounds memory and visual chaos.
 pub const MAX_CUBES: usize = 200;
-/// How tall windows stand (canvas px): the cube / window hitbox height.
-pub const WALL_H: f64 = 150.0;
+/// How tall windows stand (canvas px): a shallow relief so cubes
+/// visibly sit ON windows instead of floating over a flat print.
+pub const WALL_H: f64 = 28.0;
 /// Gravity, canvas px / s^2.
 const GRAV: f64 = 2600.0;
 /// Vertical bounce kept on landing.
@@ -39,14 +40,15 @@ const ROLL_FRICTION: f64 = 3.0;
 /// Below this planar speed a contacting cube sleeps.
 const SLEEP: f64 = 6.0;
 
-/// Saturated toy palette (linear-ish 0..1 RGB).
+/// Wood tones (linear-ish 0..1 RGB): every cube reads as a small
+/// wooden box, tint varies per cube so the pile stays readable.
 const PALETTE: [[f64; 3]; 6] = [
-    [0.95, 0.35, 0.30], // coral
-    [0.25, 0.80, 0.75], // teal
-    [0.95, 0.70, 0.20], // amber
-    [0.55, 0.45, 0.95], // violet
-    [0.45, 0.85, 0.30], // lime
-    [0.30, 0.55, 0.95], // blue
+    [0.72, 0.50, 0.28], // oak
+    [0.62, 0.42, 0.24], // walnut
+    [0.80, 0.60, 0.36], // pine
+    [0.55, 0.36, 0.20], // dark oak
+    [0.68, 0.46, 0.26], // chestnut
+    [0.75, 0.55, 0.32], // beech
 ];
 
 /// One toy cube. `z` = bottom height above the canvas plane; `rot`
@@ -86,9 +88,9 @@ pub fn spawn(x: f64, y: f64, seed: u64) -> Cube {
         // Yawed about the vertical; the tumble rates below tip it over.
         rot: [[cy, sy, 0.0], [-sy, cy, 0.0], [0.0, 0.0, 1.0]],
         ang: [
-            (rnd() - 0.5) * 6.0,
-            (rnd() - 0.5) * 6.0,
-            (rnd() - 0.5) * 7.0 + 2.5 * if unit > 0.5 { 1.0 } else { -1.0 },
+            (rnd() - 0.5) * 3.0,
+            (rnd() - 0.5) * 3.0,
+            (rnd() - 0.5) * 2.5 + 1.2 * if unit > 0.5 { 1.0 } else { -1.0 },
         ],
         half: 22.0 + 10.0 * rnd(),
         rgb: PALETTE[(unit * PALETTE.len() as f64) as usize % PALETTE.len()],
@@ -162,10 +164,19 @@ pub(crate) fn ground_height(
 }
 
 impl Cube {
-    /// Ground height under the centre: window tops stand tall, the
-    /// bare canvas is zero. `walls` are (x, y, w, h) canvas rects.
+    /// Ground height under the footprint: the max of centre + 4 edge
+    /// samples, so a cube straddling a window edge lands on the top
+    /// instead of clipping halfway through the side.
     fn ground(&self, walls: &[(f64, f64, f64, f64)]) -> f64 {
-        ground_height(self.pos.x, self.pos.y, walls)
+        let r = self.half * 0.7;
+        let mut g = ground_height(self.pos.x, self.pos.y, walls);
+        for (dx, dy) in [(-r, -r), (r, -r), (-r, r), (r, r)] {
+            let h = ground_height(self.pos.x + dx, self.pos.y + dy, walls);
+            if h > g {
+                g = h;
+            }
+        }
+        g
     }
 
     /// Step physics by `dt` seconds. `cam_vel` is the camera world
@@ -182,8 +193,12 @@ impl Cube {
             self.z = ground;
             if self.vz < -REST_VZ {
                 self.vz = -self.vz * BOUNCE;
+                // Vertical impact eats slide + spin: no more ice-skating
+                // after the bounce, the cube tips instead of gliding.
+                self.vel.x *= 0.78;
+                self.vel.y *= 0.78;
                 for w in self.ang.iter_mut() {
-                    *w *= 0.6;
+                    *w *= 0.4;
                 }
             } else {
                 self.vz = 0.0;
@@ -270,14 +285,21 @@ impl Cube {
             }
         } else {
             for w in self.ang.iter_mut() {
-                *w *= (-6.0 * dt).exp();
+                *w *= (-8.0 * dt).exp();
             }
-            // Settle flat: ease toward the nearest axis alignment.
-            let target = snapped(self.rot);
-            let sk = (8.0 * dt).min(1.0);
-            for i in 0..3 {
-                for j in 0..3 {
-                    self.rot[i][j] += (target[i][j] - self.rot[i][j]) * sk;
+            // Settle flat: ease toward the nearest axis alignment, slowly
+            // enough to read as the box tipping over, never as a twist.
+            // Only when the spin is nearly dead, or the snap fights the
+            // last roll and the cube pirouettes on the spot.
+            let ang_speed2 =
+                self.ang[0] * self.ang[0] + self.ang[1] * self.ang[1] + self.ang[2] * self.ang[2];
+            if ang_speed2 < 2.25 {
+                let target = snapped(self.rot);
+                let sk = (3.0 * dt).min(1.0);
+                for i in 0..3 {
+                    for j in 0..3 {
+                        self.rot[i][j] += (target[i][j] - self.rot[i][j]) * sk;
+                    }
                 }
             }
         }
@@ -321,11 +343,12 @@ impl Cube {
             .enumerate()
         {
             let (sx, sy, sz) = s;
-            // corner = centre + R * (±h); rot[j] is body axis j in world.
+            // corner = centre + sx*col0 + sy*col1 + sz*col2; rot[j] is
+            // body axis j in world, so world_x mixes column x-parts.
             out[i] = [
-                cx + (self.rot[0][0] * sx + self.rot[0][1] * sy + self.rot[0][2] * sz) * h,
-                cy + (self.rot[1][0] * sx + self.rot[1][1] * sy + self.rot[1][2] * sz) * h,
-                cz + (self.rot[2][0] * sx + self.rot[2][1] * sy + self.rot[2][2] * sz) * h,
+                cx + (self.rot[0][0] * sx + self.rot[1][0] * sy + self.rot[2][0] * sz) * h,
+                cy + (self.rot[0][1] * sx + self.rot[1][1] * sy + self.rot[2][1] * sz) * h,
+                cz + (self.rot[0][2] * sx + self.rot[1][2] * sy + self.rot[2][2] * sz) * h,
             ];
         }
         out
@@ -424,6 +447,15 @@ pub fn face_normal(rot: [[f64; 3]; 3], axis: [i32; 3]) -> [f64; 3] {
         }
     }
     n
+}
+
+/// Procedural wood grain multiplier for a point (u, v) on a face in
+/// body units (-half..half). Rings along u with a slow wobble in v:
+/// cheap, stable per cube (seeded by the caller), no texture needed.
+pub fn wood_grain(u: f64, v: f64, seed: f64) -> f64 {
+    let rings = (u * 0.35 + seed + (v * 0.12).sin() * 1.7).sin();
+    let fine = (u * 1.7 - v * 0.6 + seed * 2.3).sin();
+    1.0 + rings * 0.055 + fine * 0.025
 }
 
 #[cfg(test)]
@@ -544,6 +576,23 @@ mod tests {
     }
 
     #[test]
+    fn corners_follow_columns_yaw_90() {
+        // Regression: corners() used rows instead of columns (rendered
+        // R^T while normals used R), so faces culled wrong and cubes
+        // looked see-through + spun oddly. Yaw 90 distinguishes them.
+        let mut c = spawn(0.0, 0.0, 9);
+        c.rot = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        c.half = 10.0;
+        c.pos = crate::canvas::Vec2::new(0.0, 0.0);
+        c.z = 0.0;
+        let cs = c.corners();
+        // sx=+1, sy=-1, sz=-1 -> index 4; columns give ([1, 1, -1]) * half.
+        assert!((cs[4][0] - 10.0).abs() < 1e-9, "x {:?}", cs[4]);
+        assert!((cs[4][1] - 10.0).abs() < 1e-9, "y {:?}", cs[4]);
+        assert!((cs[4][2] - 0.0).abs() < 1e-9, "z {:?}", cs[4]);
+    }
+
+    #[test]
     fn faces_match_corner_coordinates() {
         let mut c = spawn(0.0, 0.0, 9);
         c.rot = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -561,6 +610,14 @@ mod tests {
                     cs[*qi][ax]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn wood_grain_stays_near_one() {
+        for i in 0..20 {
+            let g = wood_grain(i as f64 * 0.7, i as f64 * 1.3, 2.0);
+            assert!((g - 1.0).abs() < 0.12, "grain {} = {}", i, g);
         }
     }
 

@@ -261,6 +261,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // clock. Shadows repaint at most 4 Hz from the lamp alone so idle
     // stays cheap; camera pans repaint every frame anyway.
     let mut lamp = crate::cubes::Lamp::new();
+    let mut prev_canvas_offset = session.canvas.offset;
     let mut lamp_t: f64 = 0.0;
     let mut lamp_painted = 0.0f64;
     let mut lamp_cooldown = 0.0f64;
@@ -1615,9 +1616,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
             // Toy cubes: same clock; windows are static hitboxes (they
             // never move for cubes — a grabbed window shoves through,
-            // the push-out ejects the cube). Camera velocity couples
-            // through canvas grip so pans drag resting cubes and hard
-            // stops fling them further.
+            // the push-out ejects the cube). The VIEW slides under the
+            // cubes (camera minus canvas offset): WASD flights and
+            // left-drag pans both grip resting cubes, hard stops fling
+            // them further like boxes on a yanked tablecloth.
             {
                 let walls: Vec<(f64, f64, f64, f64)> = server_state
                     .windows
@@ -1626,16 +1628,25 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         (c.canvas.pos.x, c.canvas.pos.y, c.canvas.size.x, c.canvas.size.y)
                     })
                     .collect();
-                let cam_vel = session.camera.vel;
+                let dt_c = dt.max(1e-4);
+                let canvas_vel = crate::canvas::Vec2::new(
+                    (session.canvas.offset.x - prev_canvas_offset.x) / dt_c,
+                    (session.canvas.offset.y - prev_canvas_offset.y) / dt_c,
+                );
+                prev_canvas_offset = session.canvas.offset;
+                let slide = crate::canvas::Vec2::new(
+                    session.camera.vel.x - canvas_vel.x,
+                    session.camera.vel.y - canvas_vel.y,
+                );
                 for c in cubes.iter_mut() {
-                    if c.step(dt, cam_vel, &walls) {
+                    if c.step(dt, slide, &walls) {
                         need_render = true;
                     }
                 }
-                // Lamp pendulum: camera shoves it, self-sway keeps it
+                // Lamp pendulum: the view shoves it, self-sway keeps it
                 // alive in idle. Throttled repaints (see decl).
                 lamp_t += dt;
-                lamp.step(dt, cam_vel.x, lamp_t);
+                lamp.step(dt, slide.x, lamp_t);
                 lamp_cooldown -= dt;
                 if (lamp.theta - lamp_painted).abs() > 0.004 && lamp_cooldown <= 0.0 {
                     lamp_painted = lamp.theta;
@@ -2410,6 +2421,60 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 });
                             }
                         }
+                        // Window relief: low vertical sides (WALL_H tall) so
+                        // cubes visibly sit ON windows. Sides only — the top
+                        // stays open so the window content keeps showing.
+                        // Drawn before the cubes, cubes always overlap.
+                        {
+                            let wh = crate::cubes::WALL_H;
+                            // (verts, colour): front (+y, lamp side) lightest.
+                            let mut relief: Vec<([f32; 12], [f32; 4])> =
+                                Vec::new();
+                            for (wx, wy, ww, whh) in walls.iter() {
+                                let (wx, wy, ww, whh) = (*wx, *wy, *ww, *whh);
+                                let quads = [
+                                    (
+                                        (wx, wy + whh, wx + ww, wy + whh),
+                                        [0.32, 0.25, 0.17, 1.0],
+                                    ),
+                                    (
+                                        (wx + ww, wy, wx + ww, wy + whh),
+                                        [0.24, 0.19, 0.13, 1.0],
+                                    ),
+                                    (
+                                        (wx + ww, wy, wx, wy),
+                                        [0.15, 0.12, 0.09, 1.0],
+                                    ),
+                                    (
+                                        (wx, wy, wx, wy + whh),
+                                        [0.24, 0.19, 0.13, 1.0],
+                                    ),
+                                ];
+                                for ((ax, ay, bx, by), col) in quads {
+                                    let p0 = proj(ax, ay, 0.0);
+                                    let p1 = proj(bx, by, 0.0);
+                                    let p2 = proj(bx, by, wh);
+                                    let p3 = proj(ax, ay, wh);
+                                    let verts: [f32; 12] = [
+                                        p0.0 as f32, p0.1 as f32, p1.0 as f32,
+                                        p1.1 as f32, p2.0 as f32, p2.1 as f32,
+                                        p0.0 as f32, p0.1 as f32, p2.0 as f32,
+                                        p2.1 as f32, p3.0 as f32, p3.1 as f32,
+                                    ];
+                                    relief.push((verts, col));
+                                }
+                            }
+                            if !relief.is_empty() {
+                                let _ = renderer.with_context(|_, gl| unsafe {
+                                    for (verts, col) in relief.iter() {
+                                        crate::render3d::draw_tris(
+                                            gl, prog, &omvp, *col, verts,
+                                        );
+                                    }
+                                });
+                            }
+                        }
+
                         // Per-cube key light = the lamp: azimuth follows the
                         // swing, height keeps tops readable.
                         let cube_light = |px: f64, py: f64| {
@@ -2459,7 +2524,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                             // Faces: collect (depth, colour, quad), paint far
                             // first. Visible = normal towards the viewer
-                            // (+z); shade follows the key light.
+                            // (+z); shade follows the key light. Each face
+                            // is cut into 6 strips along its grain so the
+                            // procedural wood reads at any zoom.
+                            // Body coords of corner i: sx fastest (-1/+1).
+                            let body_of = |idx: usize| -> (f64, f64, f64) {
+                                let sz = if idx & 1 == 1 { 1.0 } else { -1.0 };
+                                let sy = if idx & 2 == 2 { 1.0 } else { -1.0 };
+                                let sx = if idx & 4 == 4 { 1.0 } else { -1.0 };
+                                (sx, sy, sz)
+                            };
                             let mut faces: Vec<(f32, [f32; 4], [f32; 8])> =
                                 Vec::new();
                             for c in cubes.iter() {
@@ -2472,6 +2546,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     proj_c[i] = (p.0 as f32, p.1 as f32);
                                     depth[i] = p.2 as f32;
                                 }
+                                // Stable per-cube grain phase (body space, so
+                                // it never swims while the cube slides).
+                                let seed = c.half * 0.91
+                                    + c.rgb[0] * 17.0
+                                    + c.rgb[1] * 9.0;
                                 for (axis, quad) in
                                     crate::cubes::FACES.iter()
                                 {
@@ -2490,25 +2569,102 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     if n[2] > 0.5 {
                                         shade = (shade + 0.12).min(1.0);
                                     }
-                                    let s = shade as f32;
-                                    let col = [
-                                        c.rgb[0] as f32 * s,
-                                        c.rgb[1] as f32 * s,
-                                        c.rgb[2] as f32 * s,
-                                        1.0,
-                                    ];
                                     let d = (depth[quad[0]]
                                         + depth[quad[1]]
                                         + depth[quad[2]]
                                         + depth[quad[3]])
                                         * 0.25;
-                                    let q = [
-                                        proj_c[quad[0]].0, proj_c[quad[0]].1,
-                                        proj_c[quad[1]].0, proj_c[quad[1]].1,
-                                        proj_c[quad[2]].0, proj_c[quad[2]].1,
-                                        proj_c[quad[3]].0, proj_c[quad[3]].1,
+                                    // Which body axes span this face?
+                                    let mut vary = [0usize, 1usize];
+                                    {
+                                        let mut k = 0;
+                                        for a in 0..3 {
+                                            if axis[a] == 0 {
+                                                vary[k] = a;
+                                                k += 1;
+                                            }
+                                        }
+                                    }
+                                    let buv = |idx: usize| -> (f64, f64) {
+                                        let b = body_of(idx);
+                                        let arr = [b.0, b.1, b.2];
+                                        (
+                                            arr[vary[0]] * c.half,
+                                            arr[vary[1]] * c.half,
+                                        )
+                                    };
+                                    let p2 = [
+                                        (proj_c[quad[0]].0, proj_c[quad[0]].1),
+                                        (proj_c[quad[1]].0, proj_c[quad[1]].1),
+                                        (proj_c[quad[2]].0, proj_c[quad[2]].1),
+                                        (proj_c[quad[3]].0, proj_c[quad[3]].1),
                                     ];
-                                    faces.push((d, col, q));
+                                    let b2 = [
+                                        buv(quad[0]),
+                                        buv(quad[1]),
+                                        buv(quad[2]),
+                                        buv(quad[3]),
+                                    ];
+                                    const STRIPS: usize = 6;
+                                    for si in 0..STRIPS {
+                                        let t0 = si as f64 / STRIPS as f64;
+                                        let t1 = (si + 1) as f64
+                                            / STRIPS as f64;
+                                        let lerp2 = |a: (f32, f32),
+                                                     b: (f32, f32),
+                                                     t: f64|
+                                         -> (f32, f32) {
+                                            (
+                                                a.0 + (b.0 - a.0) * t as f32,
+                                                a.1 + (b.1 - a.1) * t as f32,
+                                            )
+                                        };
+                                        let t_top0 = lerp2(p2[0], p2[1], t0);
+                                        let t_top1 = lerp2(p2[0], p2[1], t1);
+                                        // Note: p2[3] -> p2[2] runs the same
+                                        // t direction as p2[0] -> p2[1].
+                                        let t_bot0 = lerp2(p2[3], p2[2], t0);
+                                        let t_bot1 = lerp2(p2[3], p2[2], t1);
+                                        let tm = (t0 + t1) * 0.5;
+                                        let b_top = (
+                                            b2[0].0 + (b2[1].0 - b2[0].0) * tm,
+                                            b2[0].1 + (b2[1].1 - b2[0].1) * tm,
+                                        );
+                                        let b_bot = (
+                                            b2[3].0 + (b2[2].0 - b2[3].0) * tm,
+                                            b2[3].1 + (b2[2].1 - b2[3].1) * tm,
+                                        );
+                                        let uc = (b_top.0 + b_bot.0) * 0.5;
+                                        let vc = (b_top.1 + b_bot.1) * 0.5;
+                                        let mut g =
+                                            crate::cubes::wood_grain(
+                                                uc, vc, seed,
+                                            )
+                                            as f32;
+                                        // Bevel: darken strip edges so each
+                                        // box keeps a crisp wooden rim.
+                                        if si == 0 || si + 1 == STRIPS {
+                                            g *= 0.86;
+                                        }
+                                        if vc.abs() as f64
+                                            > c.half * 0.8
+                                        {
+                                            g *= 0.92;
+                                        }
+                                        let s2 = (shade as f32) * g;
+                                        let col = [
+                                            c.rgb[0] as f32 * s2,
+                                            c.rgb[1] as f32 * s2,
+                                            c.rgb[2] as f32 * s2,
+                                            1.0,
+                                        ];
+                                        let q = [
+                                            t_top0.0, t_top0.1, t_top1.0,
+                                            t_top1.1, t_bot1.0, t_bot1.1,
+                                            t_bot0.0, t_bot0.1,
+                                        ];
+                                        faces.push((d, col, q));
+                                    }
                                 }
                             }
                             // Far (larger NDC z) first.
