@@ -8,17 +8,22 @@
 //! Model: a marble lives on the canvas plane (world units = canvas
 //! px, `z` = bottom height above the surface). Gravity pulls it down,
 //! the plane (or a window pad) bounces it a LITTLE (glass toys tap,
-//! they don't rebound like superballs), ground friction + rolling
-//! resistance calm it. The moving canvas drags resting marbles with
-//! per-marble grip — pan fast and stop hard and each marble keeps its
-//! own slide, like beads on a yanked tablecloth, never in lockstep.
-//! The inner motif (cat's eye, swirl, ribbon — fresh every spawn)
-//! advects with the roll so the surface visibly flows.
+//! they don't rebound like superballs); every landing scatters a
+//! whisper sideways, so no two bounces match. Marbles collide with
+//! EACH OTHER (glassy clacks that wake both) — a shaken pile never
+//! repeats its layout. The canvas is the box bottom: stuck marbles
+//! ride gentle pans exactly (static friction, navigation stays
+//! calm), but a hard yank breaks them loose — the box accelerates
+//! under the marbles and they lag, slide, clack, and settle
+//! somewhere new. Ground friction + rolling resistance calm them;
+//! slow and settled re-sticks them to the box. The inner motif
+//! (cat's eye, swirl, ribbon — fresh every spawn) advects with the
+//! roll so the surface visibly flows.
 //!
 //! Windows are static hitboxes with NO visible relief: each is a low
 //! invisible pad (a few mm). Slow marbles lean on the lip and fall
-//! back; fast ones hop a little and climb on top. Marbles never
-//! collide with each other.
+//! back; fast ones hop a little and climb on top. Spawns fall from
+//! the sky (~170-300px) and tap onto the cursor point.
 
 use crate::canvas::Vec2;
 
@@ -63,6 +68,22 @@ const DRAG_RATE: f64 = 3.2;
 /// Base rolling resistance on contact (/s exponential); each marble
 /// adds its own extra so the pile never moves in lockstep.
 const ROLL_BASE: f64 = 2.2;
+/// Break-loose acceleration (px/s^2): gentle pans ride along
+/// (navigation stays calm), a real yank rattles the box.
+const BREAK_A: f64 = 1400.0;
+/// Re-stick below this canvas acceleration (px/s^2).
+const STICK_A: f64 = 500.0;
+/// Inertial coupling: the box accelerates under the marble, the
+/// marble lags (fraction of the canvas accel felt, 0..1).
+const INERT: f64 = 0.85;
+/// Floor friction for a loose marble (/s exponential): weaker than
+/// the stuck glue, so a yanked marble slides before it settles.
+const DRAG_LOOSE: f64 = 1.1;
+/// Marble-marble restitution: glass clacks, it doesn't bounce far.
+const REST_MARBLE: f64 = 0.45;
+/// Sideways kick on landing, fraction of impact speed: every bounce
+/// scatters a little, never straight up-down.
+const KICK_K: f64 = 0.10;
 /// Below this planar speed a contacting marble sleeps.
 const SLEEP: f64 = 6.0;
 /// Minimum planar speed (px/s) to mount a window lip.
@@ -122,6 +143,27 @@ pub struct Marble {
     /// direction: a yanked canvas scatters, never translates.
     jig: f64,
     jig_ang: f64,
+    /// Stuck = glued to the box (static friction): rides gentle
+    /// pans exactly. A hard yank breaks it loose; landing slow
+    /// re-sticks it. This stick-slip is what makes a shaken box
+    /// never return to the same layout.
+    stuck: bool,
+    /// Per-marble RNG (xorshift state): bounce kicks and shaken
+    /// scatter draw here, so no two marbles ever answer alike.
+    rng: u64,
+}
+
+impl Marble {
+    fn rand(&mut self) -> f64 {
+        // Advance the per-marble xorshift: every kick and scatter
+        // draw mutates the state, so the pile never repeats itself.
+        let mut s = self.rng | 1;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        self.rng = s;
+        (s as f64) / (u64::MAX as f64)
+    }
 }
 
 fn xorshift(mut s: u64) -> impl FnMut() -> f64 {
@@ -133,15 +175,16 @@ fn xorshift(mut s: u64) -> impl FnMut() -> f64 {
     }
 }
 
-/// Spawn a marble over a canvas point: a small plop (not a sky-drop),
-/// a fresh inner motif every time, its own character.
+/// Spawn a marble over a canvas point: a real sky-drop, not a plop
+/// — it falls from ~170-300px, taps, and scatters, landing on the
+/// cursor point with a fresh inner motif and its own character.
 pub fn spawn(x: f64, y: f64, seed: u64) -> Marble {
     let mut rnd = xorshift(seed.wrapping_add(0x9e37_79b9_7f4a_7c15));
     let unit = rnd();
     Marble {
         pos: Vec2::new(x, y),
-        z: 90.0 + 80.0 * rnd(),
-        vel: Vec2::new((rnd() - 0.5) * 120.0, (rnd() - 0.5) * 120.0),
+        z: 170.0 + 130.0 * rnd(),
+        vel: Vec2::new((rnd() - 0.5) * 280.0, (rnd() - 0.5) * 280.0),
         vz: 0.0,
         r: 13.0 + 9.0 * rnd(),
         tint: TINTS[(unit * TINTS.len() as f64) as usize % TINTS.len()],
@@ -163,6 +206,12 @@ pub fn spawn(x: f64, y: f64, seed: u64) -> Marble {
         roll_f: ROLL_BASE + 1.6 * rnd(),
         jig: 20.0 + 50.0 * rnd(),
         jig_ang: rnd() * std::f64::consts::TAU,
+        // Falling: not stuck until it lands slow.
+        stuck: false,
+        rng: seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0x1234_5678_9ABC_DEF0)
+            | 1,
     }
 }
 
@@ -227,10 +276,16 @@ impl Marble {
     }
 
     /// Step physics by `dt` seconds. `cam_vel` is the canvas-slide
-    /// velocity (canvas px/s) — its motion drags resting marbles, each
-    /// with its own grip and jitter so a shake scatters the pile.
+    /// velocity (canvas px/s); `accel` is its acceleration — the
+    /// yank that breaks static friction and rattles the box.
     /// Returns true while anything still moves (the frame must repaint).
-    pub fn step(&mut self, dt: f64, cam_vel: Vec2, walls: &[(f64, f64, f64, f64)]) -> bool {
+    pub fn step(
+        &mut self,
+        dt: f64,
+        cam_vel: Vec2,
+        accel: Vec2,
+        walls: &[(f64, f64, f64, f64)],
+    ) -> bool {
         let dt = dt.min(0.05);
 
         // --- resize eject FIRST: the rect grew over the marble (centre
@@ -284,6 +339,16 @@ impl Marble {
                 // The hop eats most of the slide: glass taps, then grips.
                 self.vel.x *= 0.85;
                 self.vel.y *= 0.85;
+                // Sideways scatter: every landing kicks a little,
+                // proportional to the impact, in a random direction
+                // — no two bounces ever match.
+                let impact = -self.vz / REST_BOUNCE;
+                let k1 = self.rand() - 0.5;
+                let k2 = self.rand() - 0.5;
+                self.vel.x += k1 * KICK_K * impact;
+                self.vel.y += k2 * KICK_K * impact;
+                // Taps wake it: a landing marble is live, not stuck.
+                self.stuck = false;
             } else {
                 self.vz = 0.0;
             }
@@ -293,7 +358,35 @@ impl Marble {
         // --- planar: the sliding canvas drags the marble (own grip),
         // a fixed per-marble jitter direction scatters shakes, rolling
         // resistance (own rate) bleeds motion on contact ---
-        let k = (DRAG_RATE * dt).min(1.0);
+        // --- canvas coupling: stick-slip. Stuck marbles ride gentle
+        // pans exactly (static friction — navigation stays calm). A
+        // hard yank breaks them loose: the box accelerates under the
+        // marble and the marble lags (inertia), then floor friction
+        // + collisions + scatter decide where it ends up — never
+        // where it started. Airborne marbles always feel the yank.
+        let amag = (accel.x * accel.x + accel.y * accel.y).sqrt();
+        let airborne = self.z > ground + 0.5;
+        if self.stuck && (airborne || amag > BREAK_A) {
+            self.stuck = false;
+        }
+        if !self.stuck {
+            self.vel.x -= accel.x * INERT * dt;
+            self.vel.y -= accel.y * INERT * dt;
+            // Shaken scatter: random kicks ∝ yank strength, drawn
+            // from the per-marble RNG — the pile never repeats.
+            if amag > 300.0 {
+                let s = (amag / 4000.0).min(1.0);
+                let a1 = self.rand() * std::f64::consts::TAU;
+                let a2 = self.rand() * std::f64::consts::TAU;
+                let kick = 900.0 * s * dt;
+                self.vel.x += a1.cos() * kick * (0.5 + self.rand());
+                self.vel.y += a2.sin() * kick * (0.5 + self.rand());
+            }
+        }
+        // --- planar drag: the stuck glue is snappy (rides the view),
+        // the loose floor friction is weaker (slides before settling).
+        let rate = if self.stuck { DRAG_RATE } else { DRAG_LOOSE };
+        let k = (rate * dt).min(1.0);
         self.vel.x += (-cam_vel.x * self.grip - self.vel.x) * k;
         self.vel.y += (-cam_vel.y * self.grip - self.vel.y) * k;
         let cam_speed =
@@ -395,16 +488,88 @@ impl Marble {
         }
         self.rot[2] += 0.25 * dt;
 
-        // --- sleep ---
+        // --- sleep: slow and calm canvas = re-stick to the box.
+        // A loose marble that settles slow re-glues (static
+        // friction); the strong glue then owns it again.
         if contact && speed < SLEEP {
             let cam = (cam_vel.x * cam_vel.x + cam_vel.y * cam_vel.y).sqrt();
-            if cam < 8.0 {
+            if cam < 8.0 && amag < STICK_A {
+                self.vel = Vec2::new(0.0, 0.0);
+                self.stuck = true;
+            } else if cam < 8.0 {
                 self.vel = Vec2::new(0.0, 0.0);
             }
         }
 
         !contact || speed > 0.5 || self.vz != 0.0
     }
+}
+
+/// Marble-marble collisions: the pile is a real box of glass, not
+/// ghosts. Equal masses, glassy restitution, positional split so
+/// nothing overlaps. Hard clacks wake both marbles (loose) and add
+/// a whisper of random tangential scatter — shake the box and the
+/// layout never repeats. Returns true when anything moved.
+pub fn collide_marbles(pile: &mut [Marble], rng: &mut u64) -> bool {
+    let mut step_rng = || {
+        let mut s = *rng | 1;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *rng = s;
+        (s as f64) / (u64::MAX as f64)
+    };
+    let n = pile.len();
+    let mut moved = false;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (dx, dy, rr) = {
+                let a = &pile[i];
+                let b = &pile[j];
+                (b.pos.x - a.pos.x, b.pos.y - a.pos.y, a.r + b.r)
+            };
+            let d2 = dx * dx + dy * dy;
+            if d2 >= rr * rr || d2 < 1e-12 {
+                continue;
+            }
+            let d = d2.sqrt();
+            let nx = dx / d;
+            let ny = dy / d;
+            // Positional split (share by radius so big/small part
+            // cleanly), with a hair of slop left to settle on.
+            let overlap = rr - d;
+            let (left, right) = pile.split_at_mut(j);
+            let a = &mut left[i];
+            let b = &mut right[0];
+            let share = overlap / rr;
+            a.pos.x -= nx * share * a.r;
+            a.pos.y -= ny * share * a.r;
+            b.pos.x += nx * share * b.r;
+            b.pos.y += ny * share * b.r;
+            // Impulse along the normal, glassy clack.
+            let vn = (b.vel.x - a.vel.x) * nx + (b.vel.y - a.vel.y) * ny;
+            if vn < 0.0 {
+                let jimp = -(1.0 + REST_MARBLE) * vn / 2.0;
+                a.vel.x -= jimp * nx;
+                a.vel.y -= jimp * ny;
+                b.vel.x += jimp * nx;
+                b.vel.y += jimp * ny;
+                if vn < -50.0 {
+                    // Hard clack: both wake, plus a whisper of
+                    // random sideways so chains never mirror.
+                    a.stuck = false;
+                    b.stuck = false;
+                    let t = (step_rng() - 0.5) * 0.12 * -vn;
+                    a.vel.x += -ny * t;
+                    a.vel.y += nx * t;
+                    b.vel.x += ny * t;
+                    b.vel.y += -nx * t;
+                }
+            }
+            moved = true;
+        }
+    }
+    moved
 }
 
 /// Interior ribbons: opaque colour-glass threads inside the clear
@@ -535,7 +700,7 @@ mod tests {
     fn settle(m: &mut Marble, walls: &[(f64, f64, f64, f64)], secs: f64) {
         let n = (secs / 0.016) as usize;
         for _ in 0..n {
-            m.step(0.016, Vec2::new(0.0, 0.0), walls);
+            m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), walls);
         }
     }
 
@@ -599,7 +764,7 @@ mod tests {
         let mut top = 0.0f64;
         let mut touched = false;
         for _ in 0..200 {
-            m.step(0.016, Vec2::new(0.0, 0.0), &[]);
+            m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), &[]);
             if m.z == 0.0 {
                 touched = true;
             }
@@ -627,7 +792,7 @@ mod tests {
         m.z = 0.0;
         m.vel = Vec2::new(60.0, 0.0); // below CLIMB_V
         for _ in 0..90 {
-            m.step(0.016, Vec2::new(0.0, 0.0), &walls());
+            m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), &walls());
         }
         // Still off the pad: leaning, never mounted.
         assert!(
@@ -646,7 +811,7 @@ mod tests {
         m.vel = Vec2::new(500.0, 0.0);
         let mut top = 0.0f64;
         for _ in 0..120 {
-            m.step(0.016, Vec2::new(0.0, 0.0), &walls());
+            m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), &walls());
             top = top.max(m.z);
         }
         assert!(
@@ -666,8 +831,8 @@ mod tests {
         b.vel = Vec2::new(0.0, 0.0);
         let shove = Vec2::new(-600.0, 100.0);
         for _ in 0..30 {
-            a.step(0.016, shove, &[]);
-            b.step(0.016, shove, &[]);
+            a.step(0.016, shove, Vec2::new(0.0, 0.0), &[]);
+            b.step(0.016, shove, Vec2::new(0.0, 0.0), &[]);
         }
         let dx = (a.vel.x - b.vel.x).abs() + (a.vel.y - b.vel.y).abs();
         assert!(
@@ -696,7 +861,7 @@ mod tests {
         m.z = 0.0;
         m.vel = Vec2::new(800.0, 0.0);
         for _ in 0..600 {
-            m.step(0.016, Vec2::new(0.0, 0.0), &[]);
+            m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), &[]);
         }
         assert!(
             m.flow.x.abs() <= FLOW_MAX + 1e-9,
@@ -721,13 +886,115 @@ mod tests {
         let mut m = spawn(200.0, 150.0, 7);
         m.z = 0.0;
         m.vel = Vec2::new(0.0, 0.0);
-        m.step(0.016, Vec2::new(0.0, 0.0), &walls());
+        m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), &walls());
         let (x, y, w, h) = walls()[0];
         let inside = m.pos.x >= x
             && m.pos.x <= x + w
             && m.pos.y >= y
             && m.pos.y <= y + h;
         assert!(!inside, "resize must push the marble out, pos={:?}", m.pos);
+    }
+
+    #[test]
+    fn spawn_drops_from_the_sky() {
+        // K must feel like dropping a marble into the box: height,
+        // sideways scatter, live (not stuck) until it lands slow.
+        let m = spawn(60.0, 160.0, 42);
+        assert!(
+            (170.0..=300.0).contains(&m.z),
+            "spawn must fall from height, z={}",
+            m.z
+        );
+        assert!(!m.stuck, "a falling marble is not stuck");
+    }
+
+    #[test]
+    fn bounce_kicks_sideways() {
+        // Dropped dead straight, it must not land in its own
+        // footprint: every bounce scatters a little.
+        let mut m = spawn(50.0, 50.0, 7);
+        m.pos = Vec2::new(50.0, 50.0);
+        m.vel = Vec2::new(0.0, 0.0);
+        settle(&mut m, &[], 2.5);
+        let d = ((m.pos.x - 50.0).powi(2) + (m.pos.y - 50.0).powi(2)).sqrt();
+        assert!(d > 3.0, "bounce must scatter the landing, d={}", d);
+    }
+
+    #[test]
+    fn gentle_pan_rides_but_yank_scatters() {
+        // The box contract: carry it gently and the layout rides
+        // along; yank it out and back and nothing is where it was.
+        let z = Vec2::new(0.0, 0.0);
+        let mut m = spawn(50.0, 50.0, 7);
+        m.z = 0.0;
+        m.vz = 0.0;
+        m.vel = Vec2::new(0.0, 0.0);
+        settle(&mut m, &[], 2.0);
+        assert!(m.stuck, "settled marble must be stuck, stuck={}", m.stuck);
+        // Gentle carry out (100px/s) and back: rides the box.
+        for _ in 0..62 {
+            m.step(0.016, Vec2::new(100.0, 0.0), z, &[]);
+        }
+        for _ in 0..62 {
+            m.step(0.016, Vec2::new(-100.0, 0.0), z, &[]);
+        }
+        settle(&mut m, &[], 1.0);
+        let d = ((m.pos.x - 50.0).powi(2) + (m.pos.y - 50.0).powi(2)).sqrt();
+        assert!(d < 3.0, "gentle carry must ride along, d={}", d);
+        // Yank out and back: acceleration spikes break it loose.
+        for _ in 0..15 {
+            m.step(0.016, Vec2::new(1500.0, 0.0), Vec2::new(30000.0, 0.0), &[]);
+        }
+        for _ in 0..15 {
+            m.step(0.016, Vec2::new(-1500.0, 0.0), Vec2::new(-30000.0, 0.0), &[]);
+        }
+        settle(&mut m, &[], 2.0);
+        let d = ((m.pos.x - 50.0).powi(2) + (m.pos.y - 50.0).powi(2)).sqrt();
+        assert!(d > 15.0, "a yank must move the marble, d={}", d);
+        // Same yank again from the new layout: different answer —
+        // the box never repeats itself.
+        let (px, py) = (m.pos.x, m.pos.y);
+        for _ in 0..15 {
+            m.step(0.016, Vec2::new(1500.0, 0.0), Vec2::new(30000.0, 0.0), &[]);
+        }
+        for _ in 0..15 {
+            m.step(0.016, Vec2::new(-1500.0, 0.0), Vec2::new(-30000.0, 0.0), &[]);
+        }
+        settle(&mut m, &[], 2.0);
+        let d = ((m.pos.x - px).powi(2) + (m.pos.y - py).powi(2)).sqrt();
+        assert!(d > 1.0, "no two shakes alike, d={}", d);
+    }
+
+    #[test]
+    fn marbles_clack_and_wake() {
+        // Overlapping pile, one rolling in: they must part, trade
+        // momentum, and both wake up.
+        let mut pile = vec![spawn(50.0, 50.0, 7), spawn(70.0, 50.0, 8)];
+        for m in pile.iter_mut() {
+            m.z = 0.0;
+            m.vz = 0.0;
+            m.stuck = true;
+        }
+        pile[0].vel = Vec2::new(400.0, 0.0);
+        pile[1].vel = Vec2::new(0.0, 0.0);
+        let mut rng = 0x1234_5678_9ABC_DEF1;
+        let mut moved = false;
+        let mut kick = 0.0f64;
+        for n in 0..60 {
+            for m in pile.iter_mut() {
+                m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), &[]);
+            }
+            moved |= collide_marbles(&mut pile, &mut rng);
+            if n == 8 {
+                // Early: the clack must already trade momentum.
+                kick = pile[1].vel.x;
+            }
+        }
+        let (a, b) = (&pile[0], &pile[1]);
+        let d = ((b.pos.x - a.pos.x).powi(2) + (b.pos.y - a.pos.y).powi(2)).sqrt();
+        assert!(d >= a.r + b.r - 1.0, "clack must part them, d={}", d);
+        assert!(kick > 50.0, "momentum must trade, kick={}", kick);
+        assert!(moved, "collision pass must report motion");
     }
 
     #[test]
@@ -738,7 +1005,7 @@ mod tests {
         m.vz = 0.0;
         m.vel = Vec2::new(0.0, 0.0);
         for _ in 0..30 {
-            m.step(0.016, Vec2::new(0.0, 0.0), &walls());
+            m.step(0.016, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), &walls());
         }
         let (x, y, w, h) = walls()[0];
         let inside = m.pos.x >= x
