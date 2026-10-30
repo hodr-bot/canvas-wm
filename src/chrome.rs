@@ -149,13 +149,73 @@ pub fn apply_axial_scale(
     grab: Vec2,
     mouse: Vec2,
 ) -> (Vec2, Vec2) {
+    let size = axial_target_size(center, size0, grab, mouse);
+    (Vec2::new(center.x - size.x * 0.5, center.y - size.y * 0.5), size)
+}
+
+/// Raw axial target size (the spring in the backend chases this every
+/// frame, so the rect glides instead of snapping).
+pub fn axial_target_size(center: Vec2, size0: Vec2, grab: Vec2, mouse: Vec2) -> Vec2 {
     let dx0 = (grab.x - center.x).abs().max(8.0);
     let dy0 = (grab.y - center.y).abs().max(8.0);
     let dx = (mouse.x - center.x).abs();
     let dy = (mouse.y - center.y).abs();
-    let w = (size0.x * dx / dx0).clamp(SCALE_MIN_W, SCALE_MAX_DIM);
-    let h = (size0.y * dy / dy0).clamp(SCALE_MIN_H, SCALE_MAX_DIM);
-    (Vec2::new(center.x - w * 0.5, center.y - h * 0.5), Vec2::new(w, h))
+    Vec2::new(
+        (size0.x * dx / dx0).clamp(SCALE_MIN_W, SCALE_MAX_DIM),
+        (size0.y * dy / dy0).clamp(SCALE_MIN_H, SCALE_MAX_DIM),
+    )
+}
+
+/// Live-size spring: the R-scale rect chases the raw axial target on
+/// a critically-damped spring (~95% in ~0.14s) instead of snapping to
+/// it. Frame pacing here is uneven (event-driven pump + sleep), so
+/// direct tracking turns pacing jitter into visible notches; the
+/// spring eats both the pacing and the finger micro-jitter while
+/// staying glued to the hand (no overshoot, exact settle so frames
+/// stop). Same integration as the camera spring, stiffer.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleSpring {
+    /// Current smoothed size. The backend pins the rect centre on it.
+    pub size: Vec2,
+    vel: Vec2,
+}
+
+impl ScaleSpring {
+    pub fn new(size: Vec2) -> Self {
+        Self {
+            size,
+            vel: Vec2::new(0.0, 0.0),
+        }
+    }
+
+    /// Advance toward `target` by `dt` seconds. Returns true while
+    /// still moving — the backend forces frames on true so the glide
+    /// renders to exact rest (also after release: the window lands
+    /// instead of freezing mid-glide).
+    pub fn step(&mut self, target: Vec2, dt: f64) -> bool {
+        const STIFFNESS: f64 = 1200.0;
+        let damping = 2.0 * STIFFNESS.sqrt();
+        // Clamp tab-switch spikes: smoothing stays stable, the glide
+        // just resumes next frame.
+        let dt = dt.clamp(0.0, 0.033);
+        let ax = STIFFNESS * (target.x - self.size.x) - damping * self.vel.x;
+        let ay = STIFFNESS * (target.y - self.size.y) - damping * self.vel.y;
+        self.vel.x += ax * dt;
+        self.vel.y += ay * dt;
+        self.size.x += self.vel.x * dt;
+        self.size.y += self.vel.y * dt;
+        let dx = target.x - self.size.x;
+        let dy = target.y - self.size.y;
+        if dx * dx + dy * dy < 0.25
+            && self.vel.x * self.vel.x + self.vel.y * self.vel.y < 25.0
+        {
+            self.size = target;
+            self.vel = Vec2::new(0.0, 0.0);
+            false
+        } else {
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -276,5 +336,43 @@ mod tests {
         let (_, size) =
             apply_axial_scale(center, size0, grab, Vec2::new(360.0, 280.0));
         assert_eq!((size.x, size.y), (600.0, 300.0));
+    }
+
+    #[test]
+    fn scale_spring_converges_without_overshoot() {
+        let start = Vec2::new(400.0, 300.0);
+        let target = Vec2::new(800.0, 600.0);
+        let mut s = ScaleSpring::new(start);
+        // 60Hz steps: must converge to exact rest.
+        let mut moving = true;
+        for _ in 0..600 {
+            moving = s.step(target, 1.0 / 60.0);
+            // Critically damped: never overshoots past the target.
+            assert!(s.size.x <= target.x + 1e-6);
+            assert!(s.size.y <= target.y + 1e-6);
+            if !moving {
+                break;
+            }
+        }
+        assert!(!moving);
+        assert_eq!((s.size.x, s.size.y), (target.x, target.y));
+    }
+
+    #[test]
+    fn scale_spring_survives_spike_dt_and_tracks_retarget() {
+        let mut s = ScaleSpring::new(Vec2::new(400.0, 300.0));
+        // Tab-switch spike: clamped, stays finite, keeps converging.
+        assert!(s.step(Vec2::new(800.0, 600.0), 5.0));
+        assert!(s.size.x.is_finite() && s.size.y.is_finite());
+        // Mid-glide U-turn (finger reverses): no snap, still settles.
+        let mut moving = true;
+        for _ in 0..600 {
+            moving = s.step(Vec2::new(200.0, 200.0), 1.0 / 120.0);
+            if !moving {
+                break;
+            }
+        }
+        assert!(!moving);
+        assert_eq!((s.size.x, s.size.y), (200.0, 200.0));
     }
 }

@@ -92,6 +92,22 @@ fn note_press(
 /// ignores it. The size is explicit (not read off the canvas rect)
 /// because canvas px != screen px off zoom 1: a fullscreen client
 /// owns exactly the view, whatever the live zoom.
+// Live R-scale gesture (R held): the window id, pinned centre,
+// size/grab at arm time, last pushed integer size, the raw axial
+// target, and the smoothing spring. While `live` the spring chases
+// the mouse; on release the gesture settles (same spring, frozen
+// target) so the window lands instead of freezing mid-glide.
+struct ScaleGesture {
+    id: u64,
+    center: crate::canvas::Vec2,
+    size0: crate::canvas::Vec2,
+    grab: crate::canvas::Vec2,
+    pushed: (u32, u32),
+    target: crate::canvas::Vec2,
+    spring: crate::chrome::ScaleSpring,
+    live: bool,
+}
+
 fn push_client_size(
     server: &crate::server::Server,
     xwm: Option<&Xwm>,
@@ -282,11 +298,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut prev_canvas_offset = session.canvas.offset;
     let mut prev_slide = crate::canvas::Vec2::new(0.0, 0.0);
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
-    // Centre-anchored scale (R held): window id + pinned centre +
-    // size at grab + mouse canvas pos at grab + last pushed client
-    // size (configure only on integer change).
-    let mut r_scale: Option<(u64, crate::canvas::Vec2, crate::canvas::Vec2, crate::canvas::Vec2, (u32, u32))> =
-        None;
+    // Centre-anchored scale (R held): the live gesture (id, pinned
+    // centre, grab state, smoothing spring) + the scale clock. The
+    // spring eats uneven frame pacing, so it needs its own dt (the
+    // camera clock below ticks even at rest). Client configures go
+    // out on rounded integer change only.
+    let mut r_scale: Option<ScaleGesture> = None;
+    let mut last_scale_step = std::time::Instant::now();
     // Solid-colour GL program for window chrome (seed of the 3D engine).
     let mut solid_prog: Option<(u32, i32, i32, u32)> = None;
     // Rounded-rect GL program for the Options panel (SDF corners).
@@ -985,12 +1003,24 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                                 let center = c.canvas.center();
                                                 let size0 = c.canvas.size;
                                                 let pushed = (
-                                                    size0.x as u32,
-                                                    size0.y as u32,
+                                                    size0.x.round().max(0.0) as u32,
+                                                    size0.y.round().max(0.0) as u32,
                                                 );
-                                                r_scale = Some((
-                                                    id, center, size0, cworld, pushed,
-                                                ));
+                                                r_scale = Some(ScaleGesture {
+                                                    id,
+                                                    center,
+                                                    size0,
+                                                    grab: cworld,
+                                                    pushed,
+                                                    target: size0,
+                                                    spring:
+                                                        crate::chrome::ScaleSpring::new(
+                                                            size0,
+                                                        ),
+                                                    live: true,
+                                                });
+                                                last_scale_step =
+                                                    std::time::Instant::now();
                                                 log::info!(
                                                     "scale arm window {} center=({:.0},{:.0})",
                                                     id, center.x, center.y
@@ -1000,12 +1030,18 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             log::info!("scale no window");
                                         }
                                     } else if !pressed {
-                                        // Release drops the scale. (A repeat —
+                                        // Release freezes the target: the
+                                        // spring lands the window on it
+                                        // (frames continue in the per-frame
+                                        // block until it settles) instead of
+                                        // freezing mid-glide. (A repeat —
                                         // pressed with r_held — must NOT land
                                         // here: clearing on repeat disarms
                                         // mid-gesture and the window stops
                                         // tracking the mouse entirely.)
-                                        r_scale = None;
+                                        if let Some(g) = r_scale.as_mut() {
+                                            g.live = false;
+                                        }
                                     }
                                     r_held = pressed;
                                     consumed = true;
@@ -1568,40 +1604,62 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
         }
         // R-scale, once per FRAME (never per motion): while R is held the
-        // window grows/shrinks with the mouse DISTANCE from the pinned
-        // centre (axial — X motion changes the width only, Y the height
-        // only, cursor on the centre = tiny), no button needed, release drops it. Motions
-        // can outnumber frames many-to-one; applying per frame caps the
-        // client reconfigures at the screen FPS so nothing tears. The
-        // client is reconfigured live (integer changes only) so the app
-        // reflows instead of stretching.
-        if let Some((id, center, size0, mouse0, pushed)) = r_scale {
-            let now = session.to_canvas(pointer, view);
-            let (pos, size) =
-                crate::chrome::apply_axial_scale(center, size0, mouse0, now);
+        // spring chases the axial mouse target (X motion = width only,
+        // Y = height only); on release it lands on the frozen target.
+        // The spring eats the uneven pump pacing + finger micro-jitter
+        // that made direct tracking notch. Motions can outnumber frames
+        // many-to-one; applying per frame caps the client reconfigures
+        // at the screen FPS so nothing tears. The client is
+        // reconfigured live (rounded integer changes only, so no 1px
+        // truncation flip-flop) so the app reflows instead of
+        // stretching.
+        let mut drop_scale = false;
+        if let Some(g) = r_scale.as_mut() {
+            if g.live {
+                let now = session.to_canvas(pointer, view);
+                g.target =
+                    crate::chrome::axial_target_size(g.center, g.size0, g.grab, now);
+            }
+            let tick = std::time::Instant::now();
+            let dt = tick.duration_since(last_scale_step).as_secs_f64();
+            last_scale_step = tick;
+            let moving = g.spring.step(g.target, dt);
+            let size = g.spring.size;
+            let id = g.id;
+            let center = g.center;
             let mut gone = false;
             match server_state.windows.get_mut(&id) {
                 Some(cw) => {
-                    cw.canvas.pos = pos;
+                    cw.canvas.pos = crate::canvas::Vec2::new(
+                        center.x - size.x * 0.5,
+                        center.y - size.y * 0.5,
+                    );
                     cw.canvas.size = size;
                     need_render = true;
                 }
                 None => gone = true,
             }
             if gone {
-                r_scale = None;
+                drop_scale = true;
             } else {
-                let want = (size.x.max(0.0) as u32, size.y.max(0.0) as u32);
-                if want != pushed {
+                let want = (
+                    size.x.round().max(0.0) as u32,
+                    size.y.round().max(0.0) as u32,
+                );
+                if want != g.pushed {
                     if let Some(win) = server_state.windows.get(&id) {
                         push_client_size(&server, xwm.as_ref(), id, win, false, want);
                         log::debug!("scale window {} now {}x{}", id, want.0, want.1);
                     }
-                    r_scale = Some((id, center, size0, mouse0, want));
-                } else {
-                    r_scale = Some((id, center, size0, mouse0, pushed));
+                    g.pushed = want;
+                }
+                if !g.live && !moving {
+                    drop_scale = true;
                 }
             }
+        }
+        if drop_scale {
+            r_scale = None;
         }
         if session.state == crate::session::SuperState::Canvas {
             let now_ms = frame_clock.elapsed().as_millis() as u64;
