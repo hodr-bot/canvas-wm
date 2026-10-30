@@ -450,6 +450,80 @@ pub fn window_screen_rect(
     (x, y, w, h)
 }
 
+/// Void dust: faint motes pinned to the canvas plane so camera motion
+/// reads on screen even with no window in view (panning the void
+/// otherwise shows nothing moving). Deterministic hash grid over
+/// canvas cells — infinite, stateless, zero per-frame cost beyond
+/// drawing. Two depths (rigid + half parallax) for a hint of depth.
+/// Fades out when zoomed far (overview), full at working zoom.
+/// Returns screen-space (x, y, size, alpha) in logical px.
+pub fn dust_dots(cam: &Camera, view: Vec2) -> Vec<(f64, f64, f64, f32)> {
+    const CELL: f64 = 320.0;
+    /// Cap cells per axis so zoomed-out views stay cheap: stride the
+    /// grid instead (dots shrink with zoom anyway, sparser is fine).
+    const MAX_SPAN: i64 = 24;
+    const DOTS_PER_CELL: usize = 2;
+    let fade = ((cam.zoom - 0.15) / 0.35).clamp(0.0, 1.0) as f32;
+    if fade <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // (layer, parallax k, base alpha, base size): rigid reads 1:1,
+    // half-parallax drifts behind for depth.
+    for (layer, k, base_a, base_s) in
+        [(0i64, 1.0f64, 0.30f32, 2.2f64), (1i64, 0.5, 0.15, 1.6)]
+    {
+        // Canvas range visible for this layer, padded by one cell.
+        let x0 = cam.pos.x * k - view.x / cam.zoom - CELL;
+        let x1 = cam.pos.x * k + view.x / cam.zoom + CELL;
+        let y0 = cam.pos.y * k - view.y / cam.zoom - CELL;
+        let y1 = cam.pos.y * k + view.y / cam.zoom + CELL;
+        let (cx0, cx1) = ((x0 / CELL).floor() as i64, (x1 / CELL).floor() as i64);
+        let (cy0, cy1) = ((y0 / CELL).floor() as i64, (y1 / CELL).floor() as i64);
+        let mut stride = 1i64;
+        while (cx1 - cx0) / stride > MAX_SPAN || (cy1 - cy0) / stride > MAX_SPAN {
+            stride *= 2;
+        }
+        for cx in cx0..=cx1 {
+            if (cx - cx0) % stride != 0 {
+                continue;
+            }
+            for cy in cy0..=cy1 {
+                if (cy - cy0) % stride != 0 {
+                    continue;
+                }
+                for d in 0..DOTS_PER_CELL {
+                    let h = dust_hash(cx, cy, layer * 31 + d as i64);
+                    let fx = (h as f64 / u64::MAX as f64).fract();
+                    let fy = (((h >> 21) & 0x1FFFFF) as f64 / 0x1FFFFF as f64).fract();
+                    let fv = (((h >> 42) & 0x3FF) as f64 / 0x3FF as f64) as f32;
+                    let ox = (cx as f64 + fx) * CELL;
+                    let oy = (cy as f64 + fy) * CELL;
+                    let sx = (ox - cam.pos.x * k) * cam.zoom + view.x * 0.5;
+                    let sy = (oy - cam.pos.y * k) * cam.zoom + view.y * 0.5;
+                    let s = base_s * cam.zoom * (0.4 + 0.6 * k);
+                    let a = base_a * fade * (0.6 + 0.4 * fv);
+                    out.push((sx, sy, s, a));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Stateless cell hash (splitmix64 over mixed coords): the grid never
+/// shifts, so dots sit still in the canvas while the camera moves.
+fn dust_hash(cx: i64, cy: i64, salt: i64) -> u64 {
+    let mut z = (cx as u64)
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add((cy as u64).wrapping_mul(0xBF58476D1CE4E5B9))
+        .wrapping_add((salt as u64).wrapping_mul(0x94D049BB133111EB))
+        .wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +752,59 @@ mod tests {
         ov.toggle_select(7);
         assert_eq!(ov.quit(), vec![9]);
         assert!(!ov.active);
+    }
+
+    #[test]
+    fn dust_is_deterministic_and_culled() {
+        let cam = Camera::new();
+        let view = Vec2::new(1920.0, 1080.0);
+        let a = dust_dots(&cam, view);
+        let b = dust_dots(&cam, view);
+        assert_eq!(a.len(), b.len());
+        assert!(a.len() > 50, "void should read: {}", a.len());
+        assert!(a.len() < 800, "bounded draw cost: {}", a.len());
+        for (i, (x, y, s, al)) in a.iter().enumerate() {
+            assert_eq!((*x, *y, *s, *al), b[i]);
+            // Within the covered canvas range around the view centre
+            // (cell quantisation pads up to two cells per side).
+            assert!(
+                (x - view.x / 2.0).abs() <= view.x + 640.0 + s,
+                "x={}",
+                x
+            );
+            assert!(
+                (y - view.y / 2.0).abs() <= view.y + 640.0 + s,
+                "y={}",
+                y
+            );
+            assert!(*s > 0.5 && *s < 4.0, "s={}", s);
+            assert!(*al > 0.0 && *al <= 0.32, "a={}", al);
+        }
+    }
+
+    #[test]
+    fn dust_moves_with_camera_and_fades_far() {
+        let view = Vec2::new(1920.0, 1080.0);
+        let here = dust_dots(&Camera::new(), view);
+        let mut moved = Camera::new();
+        moved.pos = Vec2::new(100.0, 0.0);
+        let there = dust_dots(&moved, view);
+        // Rigid layer shifts exactly 100px left on screen (coverage
+        // edges may add/drop cells — match on the overlap, not len).
+        let shifted = here
+            .iter()
+            .filter(|(x, y, _, _)| {
+                there.iter().any(|(x2, y2, _, _)| {
+                    (x2 - (x - 100.0)).abs() < 1e-6 && (y2 - y).abs() < 1e-6
+                })
+            })
+            .count();
+        assert!(shifted > 0, "rigid dots must track the camera 1:1");
+        // Far overview: invisible (no clutter, no cost).
+        let far = Camera {
+            zoom: 0.1,
+            ..Camera::new()
+        };
+        assert!(dust_dots(&far, view).is_empty());
     }
 }
