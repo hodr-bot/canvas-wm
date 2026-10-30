@@ -31,7 +31,7 @@ mod settings;
 #[cfg(feature = "compositor")]
 mod menu;
 #[cfg(feature = "compositor")]
-mod cubes;
+mod marbles;
 
 use std::collections::HashMap;
 
