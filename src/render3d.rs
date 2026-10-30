@@ -234,6 +234,22 @@ pub unsafe fn draw_rounded(
     gl.Enable(ffi::SCISSOR_TEST);
 }
 
+/// GL_RENDERER identification string, for driver decisions. Software
+/// rasterizers (llvmpipe) report importable texture formats but cannot
+/// back cross-process dmabuf, so their formats must never be advertised
+/// to clients: HW GL toolkits (Alacritty) would request dmabuf they can
+/// never use, die on EGL init (fd -1) and freeze right after mapping.
+#[cfg(feature = "compositor")]
+pub fn renderer_name(gl: &ffi::Gles2) -> String {
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+    unsafe {
+        CStr::from_ptr(gl.GetString(ffi::RENDERER) as *const c_char)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 /// Compile the solid-colour program. Returns the program id plus the
 /// `mvp` / `color` uniform and `position` attribute locations.
 #[cfg(feature = "compositor")]
