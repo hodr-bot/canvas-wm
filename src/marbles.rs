@@ -83,6 +83,17 @@ const TINTS: [[f64; 3]; 6] = [
     [0.90, 0.35, 0.40], // cherry
 ];
 
+/// Ribbon glass colours (opaque swirls in clear glass, photo-style).
+const INKS: [[f64; 3]; 7] = [
+    [0.10, 0.25, 0.85], // cobalt
+    [0.95, 0.25, 0.08], // red-orange
+    [1.00, 0.85, 0.10], // yellow
+    [0.05, 0.65, 0.35], // emerald
+    [0.95, 0.96, 0.97], // milk white
+    [0.15, 0.05, 0.10], // oxblood
+    [0.10, 0.70, 0.75], // teal
+];
+
 /// One glass marble. `z` = bottom height above the surface.
 pub struct Marble {
     pub pos: Vec2,
@@ -96,8 +107,12 @@ pub struct Marble {
     pub seed: f64,
     /// Inner-motif drift in units of r: advects with the roll, wraps.
     pub flow: Vec2,
-    /// Slow motif rotation (rad), for life.
-    pub spin: f64,
+    /// Interior orientation (Euler XYZ, rad, unbounded — never wraps,
+    /// so the 3D ribbons tumble with the roll without pops).
+    pub rot: [f64; 3],
+    /// Ribbon glass colours (opaque swirls in clear glass).
+    pub ink1: [f64; 3],
+    pub ink2: [f64; 3],
     /// Canvas coupling 0.65..1.25: every marble answers a shove
     /// with its own eagerness.
     grip: f64,
@@ -133,7 +148,17 @@ pub fn spawn(x: f64, y: f64, seed: u64) -> Marble {
         pattern: (rnd() * 3.0) as u8 % 3,
         seed: unit * 100.0,
         flow: Vec2::new(0.0, 0.0),
-        spin: rnd() * std::f64::consts::TAU,
+        rot: [
+            rnd() * std::f64::consts::TAU,
+            rnd() * std::f64::consts::TAU,
+            rnd() * std::f64::consts::TAU,
+        ],
+        ink1: INKS[(unit * INKS.len() as f64) as usize % INKS.len()],
+        ink2: if (unit * 7.0) as usize % 3 == 0 {
+            INKS[4] // milk-white accent, a classic
+        } else {
+            INKS[(unit * INKS.len() as f64 + 3.0) as usize % INKS.len()]
+        },
         grip: 0.65 + 0.6 * rnd(),
         roll_f: ROLL_BASE + 1.6 * rnd(),
         jig: 20.0 + 50.0 * rnd(),
@@ -352,17 +377,23 @@ impl Marble {
             }
         }
 
-        // --- rolling read: the motif advects with the roll and wraps,
-        // plus a slow spin so the glass still feels alive ---
         let speed =
             (self.vel.x * self.vel.x + self.vel.y * self.vel.y).sqrt();
+        // --- rolling read: the interior tumbles with the roll (unbounded
+        // Euler angles — never wraps, so no pops), plus a slow idle
+        // turn so resting glass still feels alive ---
         if speed > 0.5 {
             self.flow.x =
                 wrap_flow(self.flow.x - self.vel.x * dt / self.r * 0.55);
             self.flow.y =
                 wrap_flow(self.flow.y - self.vel.y * dt / self.r * 0.55);
-            self.spin += speed * dt / self.r * 0.25;
+            // Rolling: axis = up x velocity, visual rate (damped vs
+            // true rolling so fast slides read instead of strobing).
+            let w = speed / self.r * 0.35 * dt;
+            self.rot[0] += (self.vel.y / speed) * w;
+            self.rot[1] += -(self.vel.x / speed) * w;
         }
+        self.rot[2] += 0.25 * dt;
 
         // --- sleep ---
         if contact && speed < SLEEP {
@@ -374,6 +405,123 @@ impl Marble {
 
         !contact || speed > 0.5 || self.vz != 0.0
     }
+}
+
+/// Interior ribbons: opaque colour-glass threads inside the clear
+/// ball, unit-ball coords. Returns one point list per ribbon;
+/// each point is (x, y, z, half-width). Real marbles are built this
+/// way — a gather of clear glass over coloured threads — so the
+/// swirls below read like the photos, not decals.
+///
+/// 0 = cat's eye (spindle + equatorial ring), 1 = double-helix
+/// swirl, 2 = wave band + accent line.
+pub fn ribbons(pattern: u8) -> Vec<Vec<(f64, f64, f64, f64)>> {
+    let tau = std::f64::consts::TAU;
+    match pattern % 3 {
+        0 => {
+            // Spindle: fat in the middle, pointed at the poles.
+            let mut spindle = Vec::with_capacity(30);
+            for i in 0..30 {
+                let t = i as f64 / 29.0;
+                spindle.push((
+                    0.0,
+                    (t - 0.5) * 1.30,
+                    0.0,
+                    0.055 + 0.075 * (std::f64::consts::PI * t).sin(),
+                ));
+            }
+            // Thin equatorial ring, slight wave.
+            let mut ring = Vec::with_capacity(36);
+            for i in 0..36 {
+                let a = i as f64 / 36.0 * tau;
+                ring.push((
+                    0.52 * a.cos(),
+                    0.06 * (2.0 * a).sin(),
+                    0.52 * a.sin(),
+                    0.050,
+                ));
+            }
+            vec![spindle, ring]
+        }
+        1 => {
+            // Two intertwined helices, 1.5 turns pole to pole.
+            let mut out = Vec::with_capacity(2);
+            for phase in [0.0, std::f64::consts::PI] {
+                let mut helix = Vec::with_capacity(36);
+                for i in 0..36 {
+                    let t = i as f64 / 35.0;
+                    let a = t * 1.5 * tau + phase;
+                    helix.push((
+                        0.46 * a.cos(),
+                        (t - 0.5) * 1.10,
+                        0.46 * a.sin(),
+                        0.130,
+                    ));
+                }
+                out.push(helix);
+            }
+            out
+        }
+        _ => {
+            // Wave band around the belly + a thin accent line.
+            let mut band = Vec::with_capacity(40);
+            for i in 0..40 {
+                let a = i as f64 / 40.0 * tau;
+                band.push((
+                    0.58 * a.cos(),
+                    0.53 * a.sin(),
+                    0.22 * (2.0 * a + 1.0).sin(),
+                    0.125,
+                ));
+            }
+            let mut accent = Vec::with_capacity(40);
+            for i in 0..40 {
+                let a = (i as f64 / 40.0) * tau + 0.35;
+                accent.push((
+                    0.46 * a.cos(),
+                    0.42 * a.sin(),
+                    0.18 * (2.0 * a + 1.0).sin(),
+                    0.050,
+                ));
+            }
+            vec![band, accent]
+        }
+    }
+}
+
+/// Rotate a unit-ball point by Euler angles (XYZ order).
+pub fn orient(
+    px: f64,
+    py: f64,
+    pz: f64,
+    rot: [f64; 3],
+) -> (f64, f64, f64) {
+    let (sx, cx) = rot[0].sin_cos();
+    let (sy, cy) = rot[1].sin_cos();
+    let (sz, cz) = rot[2].sin_cos();
+    let y1 = py * cx - pz * sx;
+    let z1 = py * sx + pz * cx;
+    let x2 = px * cy + z1 * sy;
+    let z2 = -px * sy + z1 * cy;
+    (x2 * cz - y1 * sz, x2 * sz + y1 * cz, z2)
+}
+
+/// Apparent (x, y) of an interior point seen through the ball
+/// (unit coords): the sphere magnifies toward the centre; past
+/// ~0.9R the fresnel edge swallows the point. Returns the warped
+/// position plus an edge fade (1 = clear, 0 = gone at 0.97R).
+pub fn lens(x: f64, y: f64) -> (f64, f64, f64) {
+    let r2 = (x * x + y * y).min(1.0);
+    let s = 1.0 + 0.38 * (1.0 - r2);
+    let (mut ax, mut ay) = (x * s, y * s);
+    let ar = (ax * ax + ay * ay).sqrt();
+    let fade = ((0.97 - ar) / 0.12).clamp(0.0, 1.0);
+    if ar > 0.96 {
+        let k = 0.96 / ar;
+        ax *= k;
+        ay *= k;
+    }
+    (ax, ay, fade)
 }
 
 #[cfg(test)]
@@ -389,6 +537,48 @@ mod tests {
         for _ in 0..n {
             m.step(0.016, Vec2::new(0.0, 0.0), walls);
         }
+    }
+
+    #[test]
+    fn ribbons_stay_inside_the_ball() {
+        for p in 0..3 {
+            for rib in ribbons(p) {
+                assert!(!rib.is_empty());
+                for (x, y, z, w) in rib {
+                    let r = (x * x + y * y + z * z).sqrt() + w;
+                    assert!(r <= 0.85, "ribbon escapes the ball, r={r}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lens_keeps_points_in_view() {
+        let (ax, ay, fade) = lens(0.0, 0.0);
+        assert!(ax.abs() < 1e-12 && ay.abs() < 1e-12 && fade == 1.0);
+        let (ax, ay, fade) = lens(0.5, 0.0);
+        assert!((ax - 0.6425).abs() < 1e-9 && fade == 1.0);
+        let (ax, ay, fade) = lens(0.9, 0.0);
+        assert!((ax * ax + ay * ay).sqrt() <= 0.96 + 1e-9);
+        assert!(fade < 0.1, "rim point must fade, fade={fade}");
+        // Full sweep: nothing ever leaves the disc.
+        for i in 0..200 {
+            let a = i as f64 * 0.37;
+            let (x, y, _) =
+                orient(a.cos() * 0.7, a.sin() * 0.7, 0.3, [0.7, 0.2, a]);
+            let (ax, ay, _) = lens(x, y);
+            assert!((ax * ax + ay * ay).sqrt() <= 0.96 + 1e-9);
+        }
+    }
+
+    #[test]
+    fn orient_identity_and_turn() {
+        let (x, y, z) = orient(0.3, -0.4, 0.5, [0.0, 0.0, 0.0]);
+        assert!((x - 0.3).abs() + (y + 0.4).abs() + (z - 0.5).abs() < 1e-12);
+        // Half turn about X flips y and z.
+        let (x, y, z) =
+            orient(0.3, -0.4, 0.5, [std::f64::consts::PI, 0.0, 0.0]);
+        assert!((x - 0.3).abs() + (y - 0.4).abs() + (z + 0.5).abs() < 1e-9);
     }
 
     #[test]
