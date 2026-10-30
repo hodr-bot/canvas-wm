@@ -2682,52 +2682,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         c.rgb[1] as f32 * shade as f32,
                                         c.rgb[2] as f32 * shade as f32,
                                     ];
-                                    // Diagonal brace corner to corner; the
-                                    // diagonal alternates per face so the box
-                                    // reads hand-built, never tiled.
-                                    let (da, db) = if fi % 2 == 0 {
-                                        (p2[0], p2[2])
-                                    } else {
-                                        (p2[1], p2[3])
-                                    };
-                                    let bdx = db.0 - da.0;
-                                    let bdy = db.1 - da.1;
-                                    let bdl = (bdx * bdx + bdy * bdy)
-                                        .sqrt()
-                                        .max(1.0);
-                                    let bnx = -bdy / bdl;
-                                    let bny = bdx / bdl;
-                                    // Wide dark bed first, narrower light
-                                    // plank on top: the brace reads outlined.
-                                    for (wfrac, tone, gseed) in [
-                                        (0.20, 0.45, seed + 3.7),
-                                        (0.13, 1.10, seed + 9.1),
-                                    ] {
-                                        let ox = bnx * bdl * wfrac as f32;
-                                        let oy = bny * bdl * wfrac as f32;
-                                        let g = crate::cubes::wood_grain(
-                                            bc.0 + gseed,
-                                            bc.1 - gseed * 0.5,
-                                            gseed,
-                                        )
-                                            as f32;
-                                        let t2 = tone as f32 * g;
-                                        let col = [
-                                            (base_col[0] * t2).min(1.0),
-                                            (base_col[1] * t2).min(1.0),
-                                            (base_col[2] * t2).min(1.0),
-                                            1.0,
-                                        ];
-                                        let q = [
-                                            da.0 + ox, da.1 + oy,
-                                            da.0 - ox, da.1 - oy,
-                                            db.0 - ox, db.1 - oy,
-                                            db.0 + ox, db.1 + oy,
-                                        ];
-                                        faces.push((d, col, q));
-                                    }
-                                    // Edge frame: four beams along the face
-                                    // borders, darker stained wood.
+                                    // Edge frame first (four beams along
+                                    // the face borders, darker stained wood);
+                                    // the diagonal brace then spans the inner
+                                    // opening only, so no plank end ever pokes
+                                    // past the face edge.
                                     let fcx = (p2[0].0 + p2[1].0 + p2[2].0
                                         + p2[3].0)
                                         * 0.25;
@@ -2743,6 +2702,60 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     };
                                     let ip =
                                         [inner(p2[0]), inner(p2[1]), inner(p2[2]), inner(p2[3])];
+                                    // Diagonal brace inner-corner to
+                                    // inner-corner; the diagonal alternates per
+                                    // face so the box reads hand-built.
+                                    let (dia, dib) = if fi % 2 == 0 {
+                                        (ip[0], ip[2])
+                                    } else {
+                                        (ip[1], ip[3])
+                                    };
+                                    let bdx = dib.0 - dia.0;
+                                    let bdy = dib.1 - dia.1;
+                                    let bdl = (bdx * bdx + bdy * bdy)
+                                        .sqrt()
+                                        .max(1.0);
+                                    let bnx = -bdy / bdl;
+                                    let bny = bdx / bdl;
+                                    let bux = bdx / bdl;
+                                    let buy = bdy / bdl;
+                                    // Wide dark bed first, narrower light
+                                    // plank on top: the brace reads outlined.
+                                    // Each layer pulls its ends back along the
+                                    // axis by its own half width, so the plank
+                                    // tips stay inside the frame.
+                                    for (wfrac, tone, gseed) in [
+                                        (0.20, 0.45, seed + 3.7),
+                                        (0.13, 1.10, seed + 9.1),
+                                    ] {
+                                        let half = bdl * wfrac as f32;
+                                        let ax = dia.0 + bux * half;
+                                        let ay = dia.1 + buy * half;
+                                        let bx = dib.0 - bux * half;
+                                        let by = dib.1 - buy * half;
+                                        let ox = bnx * half;
+                                        let oy = bny * half;
+                                        let g = crate::cubes::wood_grain(
+                                            bc.0 + gseed,
+                                            bc.1 - gseed * 0.5,
+                                            gseed,
+                                        )
+                                            as f32;
+                                        let t2 = tone as f32 * g;
+                                        let col = [
+                                            (base_col[0] * t2).min(1.0),
+                                            (base_col[1] * t2).min(1.0),
+                                            (base_col[2] * t2).min(1.0),
+                                            1.0,
+                                        ];
+                                        let q = [
+                                            ax + ox, ay + oy,
+                                            ax - ox, ay - oy,
+                                            bx - ox, by - oy,
+                                            bx + ox, by + oy,
+                                        ];
+                                        faces.push((d, col, q));
+                                    }
                                     let beams = [
                                         (p2[0], p2[1], ip[1], ip[0], 0),
                                         (p2[1], p2[2], ip[2], ip[1], 1),
