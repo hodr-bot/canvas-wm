@@ -107,7 +107,7 @@ pub enum HoverKey {
     Close,
     Grab,
     Scale,
-    Cube,
+    Marble,
 }
 
 pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
@@ -119,7 +119,7 @@ pub fn hover_shortcut(code: u32, modifiers_held: bool) -> Option<HoverKey> {
         KEY_Q => Some(HoverKey::Close),
         KEY_E => Some(HoverKey::Grab),
         KEY_R => Some(HoverKey::Scale),
-        KEY_K => Some(HoverKey::Cube),
+        KEY_K => Some(HoverKey::Marble),
         _ => None,
     }
 }
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(hover_shortcut(KEY_Q, false), Some(HoverKey::Close));
         assert_eq!(hover_shortcut(KEY_E, false), Some(HoverKey::Grab));
         assert_eq!(hover_shortcut(KEY_R, false), Some(HoverKey::Scale));
-        assert_eq!(hover_shortcut(KEY_K, false), Some(HoverKey::Cube));
+        assert_eq!(hover_shortcut(KEY_K, false), Some(HoverKey::Marble));
         assert_eq!(hover_shortcut(KEY_K, true), None); // modifiers: typing
         assert_eq!(hover_shortcut(KEY_F, true), None);
         assert_eq!(hover_shortcut(30, false), None); // A is for typing

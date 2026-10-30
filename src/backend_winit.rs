@@ -274,16 +274,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let mut q_held = false;
     let mut r_held = false;
     let mut k_held = false;
-    // Toy cubes (K key, Canvas mode): canvas-anchored physics bodies.
-    let mut cubes: Vec<crate::cubes::Cube> = Vec::new();
-    let mut cube_seed: u64 = 0xC0BEu64;
-    // Overhead lamp (off-screen, above the top edge): pendulum state +
-    // clock. Shadows repaint at most 4 Hz from the lamp alone so idle
-    // stays cheap; camera pans repaint every frame anyway.
-    let mut lamp = crate::cubes::Lamp::new();
-    let mut lamp_t: f64 = 0.0;
-    let mut lamp_painted = 0.0f64;
-    let mut lamp_cooldown = 0.0f64;
+    // Toy marbles (K key, Canvas mode): canvas-anchored physics bodies.
+    let mut marbles: Vec<crate::marbles::Marble> = Vec::new();
+    let mut marble_seed: u64 = 0xC0BEu64;
+    // Frame counter: phases the far-marble LOD steps.
+    let mut frame_no: u64 = 0;
+    let mut prev_canvas_offset = session.canvas.offset;
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): window id + pinned centre +
     // size at grab + mouse canvas pos at grab + last pushed client
@@ -394,10 +390,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         settings.wave_shape = n.parse().unwrap_or(0).min(5);
         log::info!("forced wave_shape for proof: {}", settings.wave_shape);
     }
-    // Headless proof hook (screenshots): pre-drop cubes across the
-    // opening view so the fall/tumble/rest cycle is visible without a
+    // Headless proof hook (screenshots): pre-drop marbles across the
+    // opening view so the fall/roll/rest cycle is visible without a
     // working harness keyboard.
-    if let Ok(n) = std::env::var("CANVAS_SPAWN_CUBES") {
+    if let Ok(n) = std::env::var("CANVAS_SPAWN_MARBLES")
+        .or_else(|_| std::env::var("CANVAS_SPAWN_CUBES"))
+    {
         let count: usize = n.parse().unwrap_or(3).min(8);
         for i in 0..count {
             let fx = 0.3 + 0.2 * (i as f64 % 3.0);
@@ -406,15 +404,15 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 crate::canvas::Vec2::new(view.x * fx, view.y * fy),
                 view,
             );
-            cube_seed = cube_seed
+            marble_seed = marble_seed
                 .wrapping_mul(0x9E3779B97F4A7C15)
                 .wrapping_add(0xC0BE + i as u64);
-            crate::cubes::add_cube(
-                &mut cubes,
-                crate::cubes::spawn(at.x, at.y, cube_seed),
+            crate::marbles::add_marble(
+                &mut marbles,
+                crate::marbles::spawn(at.x, at.y, marble_seed),
             );
         }
-        log::info!("proof cubes spawned: {}", cubes.len());
+        log::info!("proof marbles spawned: {}", marbles.len());
     }
 
     loop {
@@ -1011,30 +1009,38 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     r_held = pressed;
                                     consumed = true;
                                 }
-                                crate::chrome::HoverKey::Cube => {
-                                    // Toy cube drop: fresh K press (no
-                                    // auto-repeat spam) spawns one 3D box
-                                    // above the cursor; it falls, tumbles,
-                                    // lands on canvas or window tops, rolls
-                                    // with slides, and rides camera pans.
-                                    // Canvas-modal like F/Q/E/R — Idle typing
-                                    // never spawns.
+                                crate::chrome::HoverKey::Marble => {
+                                    // Marble drop: fresh K press (no
+                                    // auto-repeat spam) plops one glass
+                                    // marble right at the cursor — low and
+                                    // still, so perspective never offsets
+                                    // it from the pointer (worst near the
+                                    // screen edges, where height shifts the
+                                    // projected spot most). It rolls with
+                                    // slides, and rides pans.
+                                    // Canvas-modal like F/Q/E/R — Idle
+                                    // typing never spawns.
                                     if pressed && !k_held {
-                                        cube_seed = cube_seed
+                                        marble_seed = marble_seed
                                             .wrapping_mul(0x9E3779B97F4A7C15)
                                             .wrapping_add(0xC0BE);
                                         let at = session.to_canvas(pointer, view);
-                                        crate::cubes::add_cube(
-                                            &mut cubes,
-                                            crate::cubes::spawn(
-                                                at.x, at.y, cube_seed,
-                                            ),
+                                        let mut m = crate::marbles::spawn(
+                                            at.x, at.y, marble_seed,
+                                        );
+                                        // Plop, not sky-drop: at the cursor.
+                                        m.z = 12.0;
+                                        m.vz = 0.0;
+                                        m.vel =
+                                            crate::canvas::Vec2::new(0.0, 0.0);
+                                        crate::marbles::add_marble(
+                                            &mut marbles, m,
                                         );
                                         log::info!(
-                                            "cube drop at ({:.0},{:.0}) n={}",
+                                            "marble drop at ({:.0},{:.0}) n={}",
                                             at.x,
                                             at.y,
-                                            cubes.len()
+                                            marbles.len()
                                         );
                                         need_render = true;
                                     }
@@ -1633,11 +1639,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     need_render = true;
                 }
             }
-            // Toy cubes: same clock; windows are static hitboxes (they
-            // never move for cubes — a grabbed window shoves through,
-            // the push-out ejects the cube). Camera velocity couples
-            // through canvas grip so pans drag resting cubes and hard
-            // stops fling them further.
+            // Marbles: same clock; windows are static hitboxes (they
+            // never move for marbles — a grabbed window shoves through,
+            // the push-out ejects the marble). The VIEW slides under the
+            // marbles (camera minus canvas offset): WASD flights and
+            // left-drag pans both grip resting marbles, hard stops fling
+            // them further like beads on a yanked tablecloth. Zoom never
+            // moves them: anchor tracking banks its offset as zoom slip,
+            // drained here before the slide is measured.
             {
                 let walls: Vec<(f64, f64, f64, f64)> = server_state
                     .windows
@@ -1646,21 +1655,85 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         (c.canvas.pos.x, c.canvas.pos.y, c.canvas.size.x, c.canvas.size.y)
                     })
                     .collect();
-                let cam_vel = session.camera.vel;
-                for c in cubes.iter_mut() {
-                    if c.step(dt, cam_vel, &walls) {
+                let dt_c = dt.max(1e-4);
+                let slip = session.drain_zoom_slip();
+                let canvas_vel = crate::canvas::Vec2::new(
+                    (session.canvas.offset.x - prev_canvas_offset.x - slip.x) / dt_c,
+                    (session.canvas.offset.y - prev_canvas_offset.y - slip.y) / dt_c,
+                );
+                prev_canvas_offset = session.canvas.offset;
+                // LOD prologue: the viewport in canvas coords. Marbles
+                // inside 2x the screen span step every frame; out to 10x
+                // they step every 4th frame (4x dt, same motion, quarter
+                // the cost); past 10x they are dropped — rolled too far
+                // to matter, but never popped while visible.
+                frame_no = frame_no.wrapping_add(1);
+                let ctl = session.to_canvas(
+                    crate::canvas::Vec2::new(0.0, 0.0),
+                    view,
+                );
+                let cbr = session.to_canvas(view, view);
+                let (rx0, rx1) = if ctl.x < cbr.x {
+                    (ctl.x, cbr.x)
+                } else {
+                    (cbr.x, ctl.x)
+                };
+                let (ry0, ry1) = if ctl.y < cbr.y {
+                    (ctl.y, cbr.y)
+                } else {
+                    (cbr.y, ctl.y)
+                };
+                let span = ((rx1 - rx0).max(ry1 - ry0)).max(1.0);
+                marbles.retain(|m| {
+                    let dx = if m.pos.x < rx0 {
+                        rx0 - m.pos.x
+                    } else if m.pos.x > rx1 {
+                        m.pos.x - rx1
+                    } else {
+                        0.0
+                    };
+                    let dy = if m.pos.y < ry0 {
+                        ry0 - m.pos.y
+                    } else if m.pos.y > ry1 {
+                        m.pos.y - ry1
+                    } else {
+                        0.0
+                    };
+                    crate::marbles::lod_for((dx * dx + dy * dy).sqrt(), span)
+                        != crate::marbles::Lod::Cull
+                });
+                let slide = crate::canvas::Vec2::new(
+                    session.camera.vel.x - canvas_vel.x,
+                    session.camera.vel.y - canvas_vel.y,
+                );
+                for c in marbles.iter_mut() {
+                    let dx = if c.pos.x < rx0 {
+                        rx0 - c.pos.x
+                    } else if c.pos.x > rx1 {
+                        c.pos.x - rx1
+                    } else {
+                        0.0
+                    };
+                    let dy = if c.pos.y < ry0 {
+                        ry0 - c.pos.y
+                    } else if c.pos.y > ry1 {
+                        c.pos.y - ry1
+                    } else {
+                        0.0
+                    };
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let stepped = match crate::marbles::lod_for(dist, span) {
+                        crate::marbles::Lod::Full => c.step(dt, slide, &walls),
+                        crate::marbles::Lod::Reduced
+                            if (frame_no + c.seed as u64) % 4 == 0 =>
+                        {
+                            c.step(dt * 4.0, slide, &walls)
+                        }
+                        _ => false,
+                    };
+                    if stepped {
                         need_render = true;
                     }
-                }
-                // Lamp pendulum: camera shoves it, self-sway keeps it
-                // alive in idle. Throttled repaints (see decl).
-                lamp_t += dt;
-                lamp.step(dt, cam_vel.x, lamp_t);
-                lamp_cooldown -= dt;
-                if (lamp.theta - lamp_painted).abs() > 0.004 && lamp_cooldown <= 0.0 {
-                    lamp_painted = lamp.theta;
-                    lamp_cooldown = 0.25;
-                    need_render = true;
                 }
             }
         }
@@ -2325,14 +2398,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         });
                     }
                 }
-                // Toy cubes (K key): canvas-anchored 3D bodies through the
-                // SAME perspective MVP as windows — corners CPU-projected,
-                // faces drawn as screen-space tris with the solid program
+                // Toy marbles (K key): canvas-anchored glass spheres.
+                // Screen-space layered discs with the solid program
                 // (no new shader, no depth buffer: painter's algorithm).
-                // Blob shadows on the canvas plane first (fading with
-                // height), then all faces back-to-front by projected depth.
-                // Before glow/menu so both wash over the toys.
-                if !cubes.is_empty() {
+                // All marbles far-to-near by depth. Before glow/menu so
+                // both wash over the toys.
+                if !marbles.is_empty() {
                     if let Some(prog) = solid_prog {
                         let sc = scale as f32;
                         let vw = view.x as f32 * sc;
@@ -2364,14 +2435,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 n.2,
                             )
                         };
-                        // Lamp source in world (canvas px): above the top
-                        // edge, swinging with the pendulum.
-                        let zoom = session.view_camera().zoom;
-                        let lamp_src = lamp.source(
-                            crate::canvas::Vec2::new(mid.x, mid.y),
-                            view.x / zoom / 2.0,
-                            view.y / zoom / 2.0,
-                        );
                         let walls: Vec<(f64, f64, f64, f64)> = server_state
                             .windows
                             .values()
@@ -2384,184 +2447,436 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 )
                             })
                             .collect();
-                        // Window shadows: extruded silhouettes falling away
-                        // from the lamp (windows stand WALL_H tall, static).
-                        {
-                            let wlen = crate::cubes::WALL_H * 1.6;
-                            let mut tris: Vec<f32> = Vec::new();
-                            for (wx, wy, ww, wh) in walls.iter() {
-                                let sd = lamp.shadow_dir(
-                                    crate::canvas::Vec2::new(
-                                        wx + ww / 2.0,
-                                        wy + wh / 2.0,
-                                    ),
-                                    lamp_src,
-                                );
-                                if sd.y <= 0.05 {
-                                    continue;
-                                }
-                                let ex = sd.x * wlen;
-                                let ey = sd.y * wlen;
-                                let corners = [
-                                    (*wx, *wy),
-                                    (wx + ww, *wy),
-                                    (wx + ww, wy + wh),
-                                    (*wx, wy + wh),
-                                ];
-                                for e in 0..4 {
-                                    let (ax, ay) = corners[e];
-                                    let (bx, by) = corners[(e + 1) % 4];
-                                    let p = [
-                                        proj(ax, ay, 0.0),
-                                        proj(bx, by, 0.0),
-                                        proj(bx + ex, by + ey, 0.0),
-                                        proj(ax + ex, ay + ey, 0.0),
-                                    ];
-                                    tris.extend_from_slice(&[
-                                        p[0].0, p[0].1, p[1].0, p[1].1,
-                                        p[2].0, p[2].1, p[0].0, p[0].1,
-                                        p[2].0, p[2].1, p[3].0, p[3].1,
-                                    ]);
-                                }
-                                let q = [
-                                    proj(wx + ex, wy + ey, 0.0),
-                                    proj(wx + ww + ex, wy + ey, 0.0),
-                                    proj(wx + ww + ex, wy + wh + ey, 0.0),
-                                    proj(wx + ex, wy + wh + ey, 0.0),
-                                ];
-                                tris.extend_from_slice(&[
-                                    q[0].0, q[0].1, q[1].0, q[1].1,
-                                    q[2].0, q[2].1, q[0].0, q[0].1,
-                                    q[2].0, q[2].1, q[3].0, q[3].1,
-                                ]);
-                            }
-                            if !tris.is_empty() {
-                                renderer.with_context(|_, gl| unsafe {
-                                    crate::render3d::draw_tris(
-                                        gl,
-                                        prog,
-                                        &omvp,
-                                        [0.0, 0.0, 0.0, 0.18],
-                                        &tris,
-                                    )
-                                });
-                            }
-                        }
-                        // Per-cube key light = the lamp: azimuth follows the
-                        // swing, height keeps tops readable.
-                        let cube_light = |px: f64, py: f64| {
-                            let dx = lamp_src.x - px;
-                            let dy = lamp_src.y - py;
-                            let dz = (dx * dx + dy * dy).sqrt() * 0.6 + 200.0;
-                            let m = (dx * dx + dy * dy + dz * dz).sqrt();
-                            [dx / m, dy / m, dz / m]
-                        };
                         let _ = renderer.with_context(|_, gl| unsafe {
-                            // Shadows: one soft blob per cube on the surface
-                            // below (canvas or window top), detached and
-                            // faded while airborne.
-                            for c in cubes.iter() {
-                                let gh = crate::cubes::ground_height(
-                                    c.pos.x, c.pos.y, &walls,
-                                );
-                                // Thrown away from the lamp: longer and more
-                                // detached the higher the cube flies.
-                                let sdir = lamp.shadow_dir(
-                                    crate::canvas::Vec2::new(c.pos.x, c.pos.y),
-                                    lamp_src,
-                                );
-                                let sdist = c.z * 0.9 + c.half * 0.8;
-                                let g = proj(
-                                    c.pos.x + sdir.x * sdist,
-                                    c.pos.y + sdir.y * sdist,
-                                    gh,
-                                );
-                                let fade =
-                                    (1.0 - c.z / 1400.0).clamp(0.3, 1.0) as f32;
-                                let r = c.half as f32 * 2.3 * fade + 2.0;
-                                for (grow, a) in [(1.0, 0.16), (0.68, 0.20)] {
-                                    let rr = r * grow;
-                                    let al = a * fade;
-                                    let (gx, gy) = (g.0 as f32, g.1 as f32);
-                                    let verts: [f32; 12] = [
-                                        gx - rr, gy - rr, gx + rr, gy - rr,
-                                        gx - rr, gy + rr, gx - rr, gy + rr,
-                                        gx + rr, gy - rr, gx + rr, gy + rr,
-                                    ];
-                                    crate::render3d::draw_tris(
-                                        gl, prog, &omvp, [0.0, 0.0, 0.0, al],
-                                        &verts,
-                                    );
-                                }
-                            }
-                            // Faces: collect (depth, colour, quad), paint far
-                            // first. Visible = normal towards the viewer
-                            // (+z); shade follows the key light.
-                            let mut faces: Vec<(f32, [f32; 4], [f32; 8])> =
-                                Vec::new();
-                            for c in cubes.iter() {
-                                let li = cube_light(c.pos.x, c.pos.y);
-                                let corners = c.corners();
-                                let mut proj_c = [(0.0f32, 0.0f32); 8];
-                                let mut depth = [0.0f32; 8];
-                                for (i, k) in corners.iter().enumerate() {
-                                    let p = proj(k[0], k[1], k[2]);
-                                    proj_c[i] = (p.0 as f32, p.1 as f32);
-                                    depth[i] = p.2 as f32;
-                                }
-                                for (axis, quad) in
-                                    crate::cubes::FACES.iter()
-                                {
-                                    let n = crate::cubes::face_normal(
-                                        c.rot, *axis,
-                                    );
-                                    if n[2] <= 0.02 {
-                                        continue;
-                                    }
-                                    let mut shade = 0.42
-                                        + 0.58
-                                            * (n[0] * li[0]
-                                                + n[1] * li[1]
-                                                + n[2] * li[2])
-                                                .max(0.0);
-                                    if n[2] > 0.5 {
-                                        shade = (shade + 0.12).min(1.0);
-                                    }
-                                    let s = shade as f32;
-                                    let col = [
-                                        c.rgb[0] as f32 * s,
-                                        c.rgb[1] as f32 * s,
-                                        c.rgb[2] as f32 * s,
-                                        1.0,
-                                    ];
-                                    let d = (depth[quad[0]]
-                                        + depth[quad[1]]
-                                        + depth[quad[2]]
-                                        + depth[quad[3]])
-                                        * 0.25;
-                                    let q = [
-                                        proj_c[quad[0]].0, proj_c[quad[0]].1,
-                                        proj_c[quad[1]].0, proj_c[quad[1]].1,
-                                        proj_c[quad[2]].0, proj_c[quad[2]].1,
-                                        proj_c[quad[3]].0, proj_c[quad[3]].1,
-                                    ];
-                                    faces.push((d, col, q));
-                                }
-                            }
-                            // Far (larger NDC z) first.
-                            faces.sort_by(|a, b| {
-                                b.0.partial_cmp(&a.0).unwrap()
+                            // Marbles: real glass. Painter far-to-near; each
+                            // marble stacks: (1) dark fresnel edge ring so
+                            // the glass reads on light scenes, (2) clear body
+                            // at LOW alpha so the scene behind shows through,
+                            // (3) interior ribbons: opaque colour-glass
+                            // threads in 3D (double helix / cat's eye / wave
+                            // band), tumbled by the roll, refracted by a lens
+                            // warp, depth-shaded, swallowed at the rim,
+                            // (4) light: warm caustic crescent below, cool
+                            // fresnel arc + crisp speculars above.
+                            // (No new shader, no depth buffer; a few small
+                            // tris buffers per marble.)
+                            let mut order: Vec<usize> =
+                                (0..marbles.len()).collect();
+                            order.sort_by(|&a, &b| {
+                                marbles[b]
+                                    .pos
+                                    .y
+                                    .partial_cmp(&marbles[a].pos.y)
+                                    .unwrap()
                             });
-                            for (d, col, q) in faces.iter() {
-                                let _ = d;
-                                let verts: [f32; 12] = [
-                                    q[0], q[1], q[2], q[3], q[4], q[5], q[0],
-                                    q[1], q[4], q[5], q[6], q[7],
-                                ];
-                                crate::render3d::draw_tris(
-                                    gl, prog, &omvp, *col, &verts,
-                                );
-                            }
+                            if let Some(prog) = solid_prog {
+                                    let fpi = std::f32::consts::PI;
+                                    // Unit-disc fan and quad: the only
+                                    // geometry helpers (shared with the old
+                                    // code shape).
+                                    let disc =
+                                        |cx: f32, cy: f32, r: f32, n: i32| -> Vec<f32> {
+                                            let mut v =
+                                                Vec::with_capacity((n as usize) * 6);
+                                            for i in 0..n {
+                                                let a0 = i as f32 / n as f32 * fpi * 2.0;
+                                                let a1 = (i + 1) as f32 / n as f32
+                                                    * fpi
+                                                    * 2.0;
+                                                v.extend_from_slice(&[
+                                                    cx,
+                                                    cy,
+                                                    cx + a0.cos() * r,
+                                                    cy + a0.sin() * r,
+                                                    cx + a1.cos() * r,
+                                                    cy + a1.sin() * r,
+                                                ]);
+                                            }
+                                            v
+                                        };
+                                    let quad = |x0: f32,
+                                                y0: f32,
+                                                x1: f32,
+                                                y1: f32,
+                                                x2: f32,
+                                                y2: f32,
+                                                x3: f32,
+                                                y3: f32|
+                                     -> [f32; 12] {
+                                        [
+                                            x0, y0, x1, y1, x2, y2, x0, y0, x2, y2,
+                                            x3, y3,
+                                        ]
+                                    };
+                                    // Ring segment as quad strip.
+                                    let arc = |cx: f32,
+                                               cy: f32,
+                                               r: f32,
+                                               a0: f32,
+                                               a1: f32,
+                                               w: f32|
+                                     -> Vec<f32> {
+                                        let mut v = Vec::new();
+                                        let n = 14;
+                                        for i in 0..n {
+                                            let t0 = a0
+                                                + (a1 - a0) * (i as f32)
+                                                    / (n as f32);
+                                            let t1 = a0
+                                                + (a1 - a0) * ((i + 1) as f32)
+                                                    / (n as f32);
+                                            v.extend_from_slice(&quad(
+                                                cx + (r - w) * t0.cos(),
+                                                cy + (r - w) * t0.sin(),
+                                                cx + (r + w) * t0.cos(),
+                                                cy + (r + w) * t0.sin(),
+                                                cx + (r + w) * t1.cos(),
+                                                cy + (r + w) * t1.sin(),
+                                                cx + (r - w) * t1.cos(),
+                                                cy + (r - w) * t1.sin(),
+                                            ));
+                                        }
+                                        v
+                                    };
+                                    for &mi in &order {
+                                        let m = &marbles[mi];
+                                        let (sx, sy, _) =
+                                            proj(m.pos.x, m.pos.y, 0.0);
+                                        let (ex, _, _) = proj(
+                                            m.pos.x + m.r,
+                                            m.pos.y,
+                                            0.0,
+                                        );
+                                        let rs = (ex - sx) as f32;
+                                        if rs < 1.5 {
+                                            continue;
+                                        }
+                                        let t = m.tint;
+                                        let inks = [m.ink1, m.ink2];
+                                                // 1. fresnel edge: a dark RING
+                                                // at grazing angles only —
+                                                // the centre stays clear.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.02, 0.03, 0.05, 0.75],
+                                                    &arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.925,
+                                                        0.0,
+                                                        fpi * 2.0,
+                                                        rs * 0.075,
+                                                    ),
+                                                );
+                                                // Hairline outer outline:
+                                                // the crisp glass contour.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.01, 0.02, 0.03, 0.85],
+                                                    &arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.985,
+                                                        0.0,
+                                                        fpi * 2.0,
+                                                        rs * 0.020,
+                                                    ),
+                                                );
+                                                // 2. clear body, smaller:
+                                                // the dark ring stays
+                                                // outside it; LOW alpha so
+                                                // the scene shows through.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [
+                                                        (t[0] * 0.25 + 0.75)
+                                                            as f32,
+                                                        (t[1] * 0.25 + 0.75)
+                                                            as f32,
+                                                        (t[2] * 0.25 + 0.75)
+                                                            as f32,
+                                                        0.16,
+                                                    ],
+                                                    &disc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.90,
+                                                        20,
+                                                    ),
+                                                );
+                                                // 3. interior ribbons.
+                                                for (ri, rib) in
+                                                    crate::marbles::ribbons(
+                                                        m.pattern,
+                                                    )
+                                                    .iter()
+                                                    .enumerate()
+                                                {
+                                                    let ink = inks
+                                                        [ri % inks.len()];
+                                                    let n: usize = rib.len();
+                                                    if n < 3 {
+                                                        continue;
+                                                    }
+                                                    // Closed loop (ring,
+                                                    // band) when the ends
+                                                    // meet.
+                                                    let (fx, fy, fz, _) =
+                                                        rib[0];
+                                                    let (lx, ly, lz, _) =
+                                                        rib[n - 1];
+                                                    let closed = ((fx - lx)
+                                                        * (fx - lx)
+                                                        + (fy - ly)
+                                                            * (fy - ly)
+                                                        + (fz - lz)
+                                                            * (fz - lz))
+                                                    .sqrt()
+                                                        < 1e-9;
+                                                    // Screen-space path:
+                                                    // rotate, refract, depth.
+                                                    let mut px =
+                                                        Vec::with_capacity(n);
+                                                    let mut py =
+                                                        Vec::with_capacity(n);
+                                                    let mut pz =
+                                                        Vec::with_capacity(n);
+                                                    let mut pw =
+                                                        Vec::with_capacity(n);
+                                                    for (x, y, z, w) in rib {
+                                                        let (rx, ry, rz) =
+                                                            crate::marbles::orient(
+                                                                *x, *y, *z,
+                                                                m.rot,
+                                                            );
+                                                        let (ax, ay, fade) =
+                                                            crate::marbles::lens(
+                                                                rx, ry,
+                                                            );
+                                                        px.push(
+                                                            sx + ax as f32
+                                                                * rs,
+                                                        );
+                                                        py.push(
+                                                            sy + ay as f32
+                                                                * rs,
+                                                        );
+                                                        pz.push(
+                                                            ((rz + 1.0) / 2.0)
+                                                                .clamp(0.0, 1.0)
+                                                                as f32,
+                                                        );
+                                                        pw.push(
+                                                            *w as f32 * fade
+                                                                as f32,
+                                                        );
+                                                    }
+                                                    // Two depth buckets: deep
+                                                    // glass vs lit front.
+                                                    for bucket in 0..2 {
+                                                        let mut v = Vec::new();
+                                                        for i in 0..n {
+                                                            let deep =
+                                                                pz[i] < 0.5;
+                                                            if (bucket == 0)
+                                                                != deep
+                                                            {
+                                                                continue;
+                                                            }
+                                                            let (pi_, ni_) =
+                                                                if closed {
+                                                                    (
+                                                                        (i + n
+                                                                            - 1)
+                                                                            % n,
+                                                                        (i + 1)
+                                                                            % n,
+                                                                    )
+                                                                } else {
+                                                                    (
+                                                                        i.saturating_sub(
+                                                                            1,
+                                                                        ),
+                                                                        (i + 1)
+                                                                            .min(
+                                                                                n - 1,
+                                                                            ),
+                                                                    )
+                                                                };
+                                                            let (tx, ty) = (
+                                                                px[ni_]
+                                                                    - px[pi_],
+                                                                py[ni_]
+                                                                    - py[pi_],
+                                                            );
+                                                            let tl = (tx * tx
+                                                                + ty * ty)
+                                                                .sqrt()
+                                                                .max(1e-5);
+                                                            let half = pw[i]
+                                                                * rs
+                                                                * (0.8
+                                                                    + 0.35
+                                                                        * pz[i]);
+                                                            if half < 0.4 {
+                                                                continue;
+                                                            }
+                                                            let (nx, ny) = (
+                                                                -ty / tl
+                                                                    * half,
+                                                                tx / tl * half,
+                                                            );
+                                                            v.extend_from_slice(
+                                                                &quad(
+                                                                    px[i] - nx,
+                                                                    py[i] - ny,
+                                                                    px[i] + nx,
+                                                                    py[i] + ny,
+                                                                    px[ni_]
+                                                                        + nx,
+                                                                    py[ni_]
+                                                                        + ny,
+                                                                    px[ni_]
+                                                                        - nx,
+                                                                    py[ni_]
+                                                                        - ny,
+                                                                ),
+                                                            );
+                                                        }
+                                                        if v.is_empty() {
+                                                            continue;
+                                                        }
+                                                        let (cr, cg, cb) =
+                                                            if bucket == 0 {
+                                                                (
+                                                                    ink[0]
+                                                                        * 0.5
+                                                                        + 0.05,
+                                                                    ink[1]
+                                                                        * 0.5
+                                                                        + 0.07,
+                                                                    ink[2]
+                                                                        * 0.5
+                                                                        + 0.10,
+                                                                )
+                                                            } else {
+                                                                (
+                                                                    ink[0],
+                                                                    ink[1],
+                                                                    ink[2],
+                                                                )
+                                                            };
+                                                        crate::render3d::draw_tris(
+                                                            gl,
+                                                            prog,
+                                                            &omvp,
+                                                            [
+                                                                cr as f32,
+                                                                cg as f32,
+                                                                cb as f32,
+                                                                0.95,
+                                                            ],
+                                                            &v,
+                                                        );
+                                                    }
+                                                }
+                                                // 4a. warm transmitted light:
+                                                // caustic crescent pooling
+                                                // along the bottom inner rim.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.80, 0.74, 0.62, 0.75],
+                                                    &arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.72,
+                                                        0.15 * fpi,
+                                                        0.85 * fpi,
+                                                        rs * 0.045,
+                                                    ),
+                                                );
+                                                // 4b. cool glass light:
+                                                // fresnel arc up top, crisp
+                                                // window streak + hot dot,
+                                                // faint bounce lower-right.
+                                                let mut cool: Vec<f32> =
+                                                    arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.88,
+                                                        1.12 * fpi,
+                                                        1.88 * fpi,
+                                                        rs * 0.030,
+                                                    );
+                                                // Window streak, upper-left.
+                                                let (sa, ca) = (0.6f32.sin(), 0.6f32.cos());
+                                                let (scx, scy) = (
+                                                    sx - rs * 0.30,
+                                                    sy - rs * 0.33,
+                                                );
+                                                let (dx, dy) = (
+                                                    ca * rs * 0.11,
+                                                    -sa * rs * 0.11,
+                                                );
+                                                let (wx, wy) = (
+                                                    sa * rs * 0.028,
+                                                    ca * rs * 0.028,
+                                                );
+                                                cool.extend_from_slice(
+                                                    &quad(
+                                                        scx - dx - wx,
+                                                        scy - dy - wy,
+                                                        scx - dx + wx,
+                                                        scy - dy + wy,
+                                                        scx + dx + wx,
+                                                        scy + dy + wy,
+                                                        scx + dx - wx,
+                                                        scy + dy - wy,
+                                                    ),
+                                                );
+                                                let hd = rs * 0.035;
+                                                cool.extend_from_slice(
+                                                    &quad(
+                                                        sx - rs * 0.34 - hd,
+                                                        sy - rs * 0.38 - hd,
+                                                        sx - rs * 0.34 + hd,
+                                                        sy - rs * 0.38 - hd,
+                                                        sx - rs * 0.34 + hd,
+                                                        sy - rs * 0.38 + hd,
+                                                        sx - rs * 0.34 - hd,
+                                                        sy - rs * 0.38 + hd,
+                                                    ),
+                                                );
+                                                let bd = rs * 0.05;
+                                                cool.extend_from_slice(
+                                                    &quad(
+                                                        sx + rs * 0.28 - bd,
+                                                        sy + rs * 0.28 - bd,
+                                                        sx + rs * 0.28 + bd,
+                                                        sy + rs * 0.28 - bd,
+                                                        sx + rs * 0.28 + bd,
+                                                        sy + rs * 0.28 + bd,
+                                                        sx + rs * 0.28 - bd,
+                                                        sy + rs * 0.28 + bd,
+                                                    ),
+                                                );
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.92, 0.95, 1.00, 0.60],
+                                                    &cool,
+                                                );
+                                            }
+                                }
                         });
                     }
                 }

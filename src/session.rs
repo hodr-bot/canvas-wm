@@ -97,7 +97,6 @@ pub enum SuperAction {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CanvasOrigin {
     pub offset: Vec2,
-    pub vel: Vec2,
 }
 
 /// Dwell-to-arm: staying inside one window for DWELL_ARM_MS (small moves
@@ -154,6 +153,10 @@ pub struct Session {
     /// while the zoom fade glides. Set by [`zoom_glide_at`], consumed
     /// every frame by [`track_zoom_anchor`], dropped on landing.
     pub zoom_anchor: Option<(Vec2, Vec2)>,
+    /// Canvas-offset written by ZOOM (anchor tracking + direct zoom),
+    /// accumulated here so the backend can subtract it from the offset
+    /// velocity: zoom must never shake the marbles. Drained per frame.
+    pub zoom_slip: Vec2,
 }
 
 impl Session {
@@ -168,6 +171,7 @@ impl Session {
             prev_zoom: None,
             super_dolly: 0.90,
             zoom_anchor: None,
+            zoom_slip: Vec2::new(0.0, 0.0),
         }
     }
 
@@ -201,10 +205,12 @@ impl Session {
     }
 
     /// Pan the canvas by a screen-space drag delta (content follows cursor).
+    /// The offset velocity is left for the backend to measure per-frame
+    /// (offset delta / dt): it drives the toy-cube grip, so a left-drag
+    /// fling shoves the cubes like a yanked tablecloth.
     pub fn pan_canvas(&mut self, delta_screen: Vec2) {
         self.canvas.offset.x += delta_screen.x / self.camera.zoom;
         self.canvas.offset.y += delta_screen.y / self.camera.zoom;
-        self.canvas.vel = Vec2::new(0.0, 0.0);
         // Manual pan owns the offset now: drop any zoom tracking.
         self.zoom_anchor = None;
     }
@@ -219,10 +225,22 @@ impl Session {
         self.camera.zoom_target = self.camera.zoom;
         self.camera.zoom_vel = 0.0;
         // screen = (anchor + off - pos) * z' + v/2, solved for off.
+        // Zoom owns this offset write: bank it as zoom slip so the
+        // marble physics never mistakes it for a canvas shove.
+        let old = self.canvas.offset;
         self.canvas.offset.x = (screen.x - view.x * 0.5) / self.camera.zoom + self.camera.pos.x
             - anchor.x;
         self.canvas.offset.y = (screen.y - view.y * 0.5) / self.camera.zoom + self.camera.pos.y
             - anchor.y;
+        self.zoom_slip.x += self.canvas.offset.x - old.x;
+        self.zoom_slip.y += self.canvas.offset.y - old.y;
+    }
+
+    /// Backend drain: zoom-slip accumulated since the last frame.
+    pub fn drain_zoom_slip(&mut self) -> Vec2 {
+        let slip = self.zoom_slip;
+        self.zoom_slip = Vec2::new(0.0, 0.0);
+        slip
     }
 
     /// Wheel zoom: the zoom GLIDES to the goal (smooth fade, momentum
@@ -267,10 +285,15 @@ impl Session {
     pub fn track_zoom_anchor(&mut self, view: Vec2) {
         if let Some((screen, world)) = self.zoom_anchor {
             let z = self.camera.zoom;
+            let old = self.canvas.offset;
             self.canvas.offset.x =
                 (screen.x - view.x * 0.5) / z + self.camera.pos.x - world.x;
             self.canvas.offset.y =
                 (screen.y - view.y * 0.5) / z + self.camera.pos.y - world.y;
+            // Anchor tracking rewrites the offset every frame of the
+            // fade: bank it as zoom slip, never as canvas motion.
+            self.zoom_slip.x += self.canvas.offset.x - old.x;
+            self.zoom_slip.y += self.canvas.offset.y - old.y;
             // Drop on landing — AFTER the final solve above, or the
             // last step's snap residual (up to 1e-3 zoom) stays baked
             // into the offset and the pinned point visibly shifts.
@@ -669,6 +692,34 @@ mod tests {
             chrome_visibility(1.0, 10.0, 24.0, ChromeSide::Inside),
             ChromeVisibility::Shown(ChromeSide::Inside)
         );
+    }
+
+    #[test]
+    fn zoom_never_reports_canvas_motion() {
+        let mut s = Session::new();
+        let screen = Vec2::new(1200.0, 700.0);
+        let view = Vec2::new(1920.0, 1080.0);
+        s.zoom_at(screen, view, 2.0);
+        let slip = s.drain_zoom_slip();
+        assert!(
+            slip.x.abs() + slip.y.abs() > 1e-9,
+            "direct zoom must bank its offset as slip"
+        );
+        let again = s.drain_zoom_slip();
+        assert_eq!(again.x, 0.0);
+        assert_eq!(again.y, 0.0);
+        // Glide path: tracking banks too, pan does not.
+        s.zoom_glide_at(screen, view, 1.5);
+        s.camera.zoom = s.camera.zoom_target; // pretend the fade landed
+        s.track_zoom_anchor(view);
+        let slip2 = s.drain_zoom_slip();
+        assert!(
+            slip2.x.abs() + slip2.y.abs() > 1e-9,
+            "anchor tracking must bank its offset as slip"
+        );
+        s.pan_canvas(Vec2::new(10.0, 0.0));
+        let slip3 = s.drain_zoom_slip();
+        assert_eq!(slip3.x, 0.0, "pan is real motion, never slip");
     }
 
     #[test]
