@@ -260,6 +260,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Frame counter: phases the far-marble LOD steps.
     let mut frame_no: u64 = 0;
     let mut prev_canvas_offset = session.canvas.offset;
+    let mut prev_slide = crate::canvas::Vec2::new(0.0, 0.0);
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): window id + pinned centre +
     // size at grab + mouse canvas pos at grab + last pushed client
@@ -992,27 +993,25 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 crate::chrome::HoverKey::Marble => {
                                     // Marble drop: fresh K press (no
                                     // auto-repeat spam) plops one glass
-                                    // marble right at the cursor — low and
-                                    // still, so perspective never offsets
-                                    // it from the pointer (worst near the
-                                    // screen edges, where height shifts the
-                                    // projected spot most). It rolls with
-                                    // slides, and rides pans.
-                                    // Canvas-modal like F/Q/E/R — Idle
-                                    // typing never spawns.
+                                    // Sky-drop, not a plop: the marble
+                                    // falls from ~170-300px, taps, and
+                                    // scatters onto the cursor point.
+                                    // It lands where you point (height
+                                    // shifts the projection most near
+                                    // the screen edges, reading as a
+                                    // fall). Canvas-modal like F/Q/E/R
+                                    // — Idle typing never spawns.
                                     if pressed && !k_held {
                                         marble_seed = marble_seed
                                             .wrapping_mul(0x9E3779B97F4A7C15)
                                             .wrapping_add(0xC0BE);
                                         let at = session.to_canvas(pointer, view);
-                                        let mut m = crate::marbles::spawn(
+                                        let m = crate::marbles::spawn(
                                             at.x, at.y, marble_seed,
                                         );
-                                        // Plop, not sky-drop: at the cursor.
-                                        m.z = 12.0;
-                                        m.vz = 0.0;
-                                        m.vel =
-                                            crate::canvas::Vec2::new(0.0, 0.0);
+                                        // Sky-drop as spawned: height,
+                                        // sideways scatter, live until it
+                                        // lands slow. No flattening.
                                         crate::marbles::add_marble(
                                             &mut marbles, m,
                                         );
@@ -1622,11 +1621,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             // Marbles: same clock; windows are static hitboxes (they
             // never move for marbles — a grabbed window shoves through,
             // the push-out ejects the marble). The VIEW slides under the
-            // marbles (camera minus canvas offset): WASD flights and
-            // left-drag pans both grip resting marbles, hard stops fling
-            // them further like beads on a yanked tablecloth. Zoom never
-            // moves them: anchor tracking banks its offset as zoom slip,
-            // drained here before the slide is measured.
+            // marbles (camera minus canvas offset): the canvas is the
+            // box bottom. Stuck marbles ride gentle pans exactly
+            // (static friction); a yank accelerates the box under them
+            // and they lag, clack into each other, and settle somewhere
+            // new — the layout never repeats. After stepping, the
+            // pile collides (glassy clacks). Zoom never moves them:
+            // anchor tracking banks its offset as zoom slip, drained
+            // here before the slide is measured.
             {
                 let walls: Vec<(f64, f64, f64, f64)> = server_state
                     .windows
@@ -1686,6 +1688,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     session.camera.vel.x - canvas_vel.x,
                     session.camera.vel.y - canvas_vel.y,
                 );
+                // Yank = slide acceleration: the box shoved under the
+                // marbles. Stuck ones only break loose past BREAK_A.
+                let slide_accel = crate::canvas::Vec2::new(
+                    (slide.x - prev_slide.x) / dt_c,
+                    (slide.y - prev_slide.y) / dt_c,
+                );
+                prev_slide = slide;
                 for c in marbles.iter_mut() {
                     let dx = if c.pos.x < rx0 {
                         rx0 - c.pos.x
@@ -1703,17 +1712,26 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     };
                     let dist = (dx * dx + dy * dy).sqrt();
                     let stepped = match crate::marbles::lod_for(dist, span) {
-                        crate::marbles::Lod::Full => c.step(dt, slide, &walls),
+                        crate::marbles::Lod::Full => c.step(dt, slide, slide_accel, &walls),
                         crate::marbles::Lod::Reduced
                             if (frame_no + c.seed as u64) % 4 == 0 =>
                         {
-                            c.step(dt * 4.0, slide, &walls)
+                            c.step(dt * 4.0, slide, slide_accel, &walls)
                         }
                         _ => false,
                     };
                     if stepped {
                         need_render = true;
                     }
+                }
+                // The box rattles: pairwise glass clacks. Chaos comes
+                // from a per-frame seed — same pile, same yank, never
+                // the same layout twice.
+                let mut chaos = frame_no
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_add(0xB00B1E5);
+                if crate::marbles::collide_marbles(&mut marbles, &mut chaos) {
+                    need_render = true;
                 }
             }
         }
