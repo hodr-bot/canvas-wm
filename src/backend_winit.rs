@@ -220,13 +220,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     let software_gl = ["llvmpipe", "softpipe", "swrast", "software", "basic render"]
         .iter()
         .any(|m| gl_lower.contains(m));
-    log::info!("gl renderer: {} (software={})", gl_renderer, software_gl);
+    log::warn!("gl renderer: {} (software={})", gl_renderer, software_gl);
     let dmabuf_formats: Vec<smithay::backend::allocator::Format> = if software_gl {
         Vec::new()
     } else {
         dmabuf_formats
     };
-    log::info!("renderer offers {} dmabuf formats", dmabuf_formats.len());
+    log::warn!("renderer offers {} dmabuf formats", dmabuf_formats.len());
     let (mut server, socket) =
         Server::new(dmabuf_formats).map_err(|e| format!("wayland bind: {}", e))?;
     log::info!("wayland socket ready on {:?}", socket);
