@@ -965,7 +965,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 }
                                 crate::chrome::HoverKey::Scale => {
                                     if pressed && !r_held {
-                                        // Arm the radial scale ONCE on the
+                                        // Arm the axial scale ONCE on the
                                         // hovered window (NOT on auto-repeat:
                                         // re-arming would drag the grab point
                                         // along with the mouse and collapse
@@ -1569,8 +1569,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         }
         // R-scale, once per FRAME (never per motion): while R is held the
         // window grows/shrinks with the mouse DISTANCE from the pinned
-        // centre (radial — cursor at centre = tiny, further = bigger in
-        // every direction), no button needed, release drops it. Motions
+        // centre (axial — X motion changes the width only, Y the height
+        // only, cursor on the centre = tiny), no button needed, release drops it. Motions
         // can outnumber frames many-to-one; applying per frame caps the
         // client reconfigures at the screen FPS so nothing tears. The
         // client is reconfigured live (integer changes only) so the app
@@ -1578,7 +1578,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         if let Some((id, center, size0, mouse0, pushed)) = r_scale {
             let now = session.to_canvas(pointer, view);
             let (pos, size) =
-                crate::chrome::apply_radial_scale(center, size0, mouse0, now);
+                crate::chrome::apply_axial_scale(center, size0, mouse0, now);
             let mut gone = false;
             match server_state.windows.get_mut(&id) {
                 Some(cw) => {
