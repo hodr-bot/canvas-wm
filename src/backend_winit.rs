@@ -215,9 +215,29 @@ fn client_buffer_size(buffer: &WlBuffer) -> Option<(i32, i32)> {
     }
 }
 
+/// Frames presented so far (EGL death breadcrumb: logged on backend
+/// failure so a crash line tells whether anything ever reached the
+/// screen). Written on the event loop, read on the way out.
+static FRAMES_PRESENTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of frames presented in the current `run` (0 = died before the
+/// first present: init, shader compile or first swap).
+pub fn frames_presented() -> u64 {
+    FRAMES_PRESENTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn note_frame_presented(frames: u64) {
+    FRAMES_PRESENTED.store(frames, std::sync::atomic::Ordering::SeqCst);
+    if frames == 1 {
+        log::info!("first frame presented");
+    }
+}
+
 /// Open the dev window and run until closed or `max_frames` is reached.
 /// `max_frames` exists for headless smoke tests (e.g. under Xvfb).
 pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
+    FRAMES_PRESENTED.store(0, std::sync::atomic::Ordering::SeqCst);
     let (mut graphics, mut input) = winit::init(None)?;
     graphics.window().set_title("canvas-wm");
 
@@ -3428,6 +3448,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 }
             }
             frames += 1;
+            note_frame_presented(frames);
             if let Some(max) = max_frames {
                 if frames >= max {
                     log::info!("frame budget reached ({}), exiting", frames);

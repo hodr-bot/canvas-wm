@@ -49,7 +49,11 @@ fn main() {
                 .and_then(|w| w[1].parse::<u64>().ok());
             log::info!("canvas-wm 0.1.0 starting (winit backend)");
             if let Err(err) = backend_winit::run(frames) {
-                log::error!("winit backend failed: {}", err);
+                log::error!(
+                    "winit backend failed after {} presented frames: {}",
+                    backend_winit::frames_presented(),
+                    err
+                );
                 std::process::exit(1);
             }
             return;
