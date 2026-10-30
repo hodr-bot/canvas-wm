@@ -97,16 +97,25 @@ fn note_press(
 // target, and the smoothing spring. While `live` the spring chases
 // the mouse; on release the gesture settles (same spring, frozen
 // target) so the window lands instead of freezing mid-glide.
+// Client reconfigures are throttled while live (a relayout per
+// pixel change makes heavy clients stutter in bursts); the exact
+// size is always pushed on settle.
 struct ScaleGesture {
     id: u64,
     center: crate::canvas::Vec2,
     size0: crate::canvas::Vec2,
     grab: crate::canvas::Vec2,
     pushed: (u32, u32),
+    pushed_at: std::time::Instant,
     target: crate::canvas::Vec2,
     spring: crate::chrome::ScaleSpring,
     live: bool,
 }
+
+// While live, at most one client reconfigure per interval: the rect
+// glides every frame, the app reflows behind it. Settle/release
+// frames always push (exact landing).
+const SCALE_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 fn push_client_size(
     server: &crate::server::Server,
@@ -1012,6 +1021,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                                     size0,
                                                     grab: cworld,
                                                     pushed,
+                                                    pushed_at:
+                                                        std::time::Instant::now(),
                                                     target: size0,
                                                     spring:
                                                         crate::chrome::ScaleSpring::new(
@@ -1610,9 +1621,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         // that made direct tracking notch. Motions can outnumber frames
         // many-to-one; applying per frame caps the client reconfigures
         // at the screen FPS so nothing tears. The client is
-        // reconfigured live (rounded integer changes only, so no 1px
-        // truncation flip-flop) so the app reflows instead of
-        // stretching.
+        // reconfigured live but throttled while the gesture runs
+        // (rounded size, at most 10Hz, exact on settle) so the app
+        // reflows instead of stretching.
         let mut drop_scale = false;
         if let Some(g) = r_scale.as_mut() {
             if g.live {
@@ -1646,12 +1657,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     size.x.round().max(0.0) as u32,
                     size.y.round().max(0.0) as u32,
                 );
-                if want != g.pushed {
+                // Throttle while live (heavy clients reflow in bursts
+                // otherwise); settle/release frames always land exact.
+                let due = tick.duration_since(g.pushed_at) >= SCALE_PUSH_INTERVAL;
+                if want != g.pushed && (due || !g.live) {
                     if let Some(win) = server_state.windows.get(&id) {
                         push_client_size(&server, xwm.as_ref(), id, win, false, want);
                         log::debug!("scale window {} now {}x{}", id, want.0, want.1);
                     }
                     g.pushed = want;
+                    g.pushed_at = tick;
                 }
                 if !g.live && !moving {
                     drop_scale = true;
@@ -1696,15 +1711,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     need_render = true;
                 }
             }
-            // Marbles: same clock; windows are static hitboxes (they
-            // never move for marbles — a grabbed window shoves through,
-            // the push-out ejects the marble). The VIEW slides under the
-            // marbles (camera minus canvas offset): the canvas is the
-            // box bottom. Stuck marbles ride gentle pans exactly
-            // (static friction); a yank accelerates the box under them
-            // and they lag, clack into each other, and settle somewhere
-            // new — the layout never repeats. After stepping, the
-            // pile collides (glassy clacks). Zoom never moves them:
+            // Marbles: same clock; windows are solid deep boxes (felt,
+            // never drawn — see marbles.rs). The VIEW moves over the
+            // box: camera + canvas motion both shake it, so the yank
+            // is the slide acceleration. Static friction glues calm
+            // marbles to the box (navigation rides along); a real yank
+            // breaks them loose — the box accelerates under the balls.
+            // After stepping, the pile collides (glassy clacks). Zoom never moves them:
             // anchor tracking banks its offset as zoom slip, drained
             // here before the slide is measured.
             {
@@ -1790,11 +1803,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     };
                     let dist = (dx * dx + dy * dy).sqrt();
                     let stepped = match crate::marbles::lod_for(dist, span) {
-                        crate::marbles::Lod::Full => c.step(dt, slide, slide_accel, &walls),
+                        crate::marbles::Lod::Full => c.step(dt, slide_accel, &walls),
                         crate::marbles::Lod::Reduced
                             if (frame_no + c.seed as u64) % 4 == 0 =>
                         {
-                            c.step(dt * 4.0, slide, slide_accel, &walls)
+                            c.step(dt * 4.0, slide_accel, &walls)
                         }
                         _ => false,
                     };
