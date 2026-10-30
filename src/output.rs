@@ -72,10 +72,13 @@ fn implement_output(output: Main<WlOutput>) {
 
 /// Tell every bound output that `surface` entered it. Toolkits such as
 /// Qt gate their first frame on `wl_surface.enter`; without it they map
-/// and stay blank forever.
-pub fn enter_all(outputs: &SharedOutputs, surface: &WlSurface) {
+/// and stay blank forever. Returns how many outputs got the event: zero
+/// means the client has not bound `wl_output` yet and the caller must
+/// retry on a later frame instead of consuming its one-shot.
+pub fn enter_all(outputs: &SharedOutputs, surface: &WlSurface) -> usize {
     outputs.borrow_mut().retain(|o| o.as_ref().is_alive());
     let owner = surface.as_ref().client();
+    let mut sent = 0;
     for output in outputs.borrow().iter() {
         // enter must reference same-client objects: foreign outputs
         // kill the receiver's connection on use.
@@ -85,6 +88,8 @@ pub fn enter_all(outputs: &SharedOutputs, surface: &WlSurface) {
         };
         if same {
             surface.enter(output);
+            sent += 1;
         }
     }
+    sent
 }

@@ -1737,6 +1737,23 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 })
             });
         }
+        // Undelivered output enter needs a frame too: Qt waits for
+        // `wl_surface.enter` before its first commit, so a surface that
+        // mapped before binding `wl_output` would otherwise never get
+        // its retry and would sit blank forever.
+        if !need_render {
+            let windows_pending = server_state.windows.values().any(|cw| {
+                cw.surface
+                    .as_ref()
+                    .map_or(false, |s| !server_state.is_enter_sent(s))
+            });
+            let popups_pending = server_state.popups.values().any(|p| {
+                p.surface
+                    .as_ref()
+                    .map_or(false, |s| !server_state.is_enter_sent(s))
+            });
+            need_render = windows_pending || popups_pending;
+        }
 
         if need_render || frames == 0 || max_frames.is_some() {
             let scale = graphics.window_size().scale_factor;
@@ -2934,21 +2951,43 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             // Frame callbacks: tell clients this frame was presented, so
             // paced clients (Xwayland damage throttling, animations) keep
             // committing instead of stalling after their first buffer.
-            // Output enter goes out first sight per surface: Qt waits for
-            // `wl_surface.enter` before its first frame.
+            // Output enter retries until a bound wl_output gets it: the
+            // first frame can land before the client binds the output,
+            // and Qt waits for enter before painting anything.
             let now_ms = frame_clock.elapsed().as_millis() as u32;
             let surfaces: Vec<WlSurface> = server_state
                 .windows
                 .values()
                 .filter_map(|cw| cw.surface.clone())
+                .chain(server_state.popups.values().filter_map(|p| p.surface.clone()))
                 .collect();
             for surface in &surfaces {
-                if server_state.claim_output_enter(surface) {
-                    server.enter_output(surface);
+                if server_state.is_enter_sent(surface) {
+                    continue;
+                }
+                if server.enter_output(surface) > 0 {
+                    server_state.claim_output_enter(surface);
                 }
             }
             for cw in server_state.windows.values() {
                 if let Some(surface) = cw.surface.as_ref() {
+                    let pending = with_states(surface, |states| {
+                        std::mem::take(
+                            &mut states
+                                .cached_state
+                                .current::<SurfaceAttributes>()
+                                .frame_callbacks,
+                        )
+                    });
+                    if let Ok(callbacks) = pending {
+                        for callback in callbacks {
+                            callback.done(now_ms);
+                        }
+                    }
+                }
+            }
+            for popup in server_state.popups.values() {
+                if let Some(surface) = popup.surface.as_ref() {
                     let pending = with_states(surface, |states| {
                         std::mem::take(
                             &mut states

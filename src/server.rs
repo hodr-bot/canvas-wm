@@ -315,8 +315,17 @@ impl ServerState {
             .map(|(wid, _)| *wid)
     }
 
-    /// Claim the one-shot output enter for `surface`. True on first call
-    /// per surface id; the backend sends `wl_surface.enter` then.
+    /// Check whether the one-shot output enter was already delivered for
+    /// `surface`. The backend retries until `enter_output` reaches a bound
+    /// `wl_output`, so a first frame that lands before the client binds
+    /// the output does not wedge Qt clients forever.
+    pub fn is_enter_sent(&self, surface: &WlSurface) -> bool {
+        self.entered_outputs.contains(&surface.as_ref().id())
+    }
+
+    /// Mark the one-shot output enter for `surface` as delivered. True on
+    /// first call per surface id; call only after `enter_output` reports
+    /// at least one target. The backend sends `wl_surface.enter` then.
     pub fn claim_output_enter(&mut self, surface: &WlSurface) -> bool {
         self.entered_outputs.insert(surface.as_ref().id())
     }
@@ -643,9 +652,10 @@ impl Server {
     }
 
     /// Broadcast `wl_surface.enter` for a newly seen surface. Toolkits
-    /// such as Qt wait for enter before their first frame.
-    pub fn enter_output(&self, surface: &WlSurface) {
-        crate::output::enter_all(&self.output_registry, surface);
+    /// such as Qt wait for enter before their first frame. Returns the
+    /// number of outputs that got the event; zero means retry later.
+    pub fn enter_output(&self, surface: &WlSurface) -> usize {
+        crate::output::enter_all(&self.output_registry, surface)
     }
 
     /// Install a client-requested drag as a pointer grab once per frame.
