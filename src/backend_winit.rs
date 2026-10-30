@@ -766,6 +766,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         // gamer cluster, ZQSD-labelled on azerty): D pulls
                         // focus to the window on the right, A left, W up,
                         // S down — strictly in that half-plane, or nothing.
+                        // Anchored on the CAMERA (view centre), never on the
+                        // selection: after panning into the void the view
+                        // may be nowhere near the focused window, and
+                        // searching from the selection then finds nothing
+                        // (or the wrong window) and feels stuck. Once a
+                        // flight lands, view centre == window centre, so
+                        // window-to-window hopping is unchanged.
                         // Canvas-modal and consumed, so apps never see it.
                         // Keyboard window move: Shift + WASD shoves the
                         // focused window (else the hovered one) by a fixed
@@ -839,14 +846,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     view.x / 2.0,
                                     view.y / 2.0,
                                 );
-                                let from = focused_id
-                                    .and_then(|id| {
-                                        server_state.windows.get(&id)
-                                    })
-                                    .map(|c| c.canvas.center())
-                                    .unwrap_or_else(|| {
-                                        session.to_canvas(centre, view)
-                                    });
+                                // Camera-anchored: where you look is where
+                                // the search starts (see above).
+                                let from = session.to_canvas(centre, view);
                                 let wins: Vec<crate::canvas::CanvasWindow> =
                                     server_state
                                         .windows
@@ -2012,10 +2014,18 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 } else if let Err(err) = frame.clear(color) {
                     log::error!("clear failed: {}", err);
                 }
+                // Void dust: faint canvas-pinned motes so camera motion
+                // reads even with no window in view. Stateless hash grid
+                // (canvas.rs), drawn behind windows; skipped in eco.
+                let dust = if settings.eco {
+                    Vec::new()
+                } else {
+                    crate::canvas::dust_dots(&session.view_camera(), view)
+                };
                 // Canvas props (decor layer, behind windows): parallax dust
                 // and laggy boxes through the solid program. Empty by
                 // default — this whole block is skipped when no demo.
-                if !props.is_empty() {
+                if !props.is_empty() || !dust.is_empty() {
                     if solid_prog.is_none() {
                         match renderer.with_context(|_, gl| {
                             crate::render3d::compile_solid(gl)
@@ -2049,6 +2059,33 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 );
                             }
                         });
+                        // Void dust (see above): normal alpha blending for
+                        // the pass, restored after so later draws keep
+                        // their premultiplied expectation.
+                        if !dust.is_empty() {
+                            let _ = renderer.with_context(|_, gl| unsafe {
+                                use smithay::backend::renderer::gles2::ffi;
+                                gl.BlendFunc(
+                                    ffi::SRC_ALPHA,
+                                    ffi::ONE_MINUS_SRC_ALPHA,
+                                );
+                                for (x, y, s, a) in &dust {
+                                    crate::render3d::draw_solid(
+                                        gl,
+                                        prog,
+                                        &mvp,
+                                        [0.72, 0.72, 0.78, *a],
+                                        (
+                                            *x as f32 * sc,
+                                            *y as f32 * sc,
+                                            *s as f32 * sc,
+                                            *s as f32 * sc,
+                                        ),
+                                    );
+                                }
+                                gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+                            });
+                        }
                     }
                 }
                 // Painter's algorithm: lowest z first, so the visual top
