@@ -2411,264 +2411,435 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             })
                             .collect();
                         let _ = renderer.with_context(|_, gl| unsafe {
-                            // Marbles: glass spheres, painter's algorithm (far
-                            // first). Layered screen-space discs through the
-                            // solid program: dark rim, mid glass, light
-                            // core, inner motif (per-marble pattern, it
-                            // advects with the roll), fixed speculars
-                            // top-left + a faint bounce light.
+                            // Marbles: real glass. Painter far-to-near; each
+                            // marble stacks: (1) dark fresnel edge ring so
+                            // the glass reads on light scenes, (2) clear body
+                            // at LOW alpha so the scene behind shows through,
+                            // (3) interior ribbons: opaque colour-glass
+                            // threads in 3D (double helix / cat's eye / wave
+                            // band), tumbled by the roll, refracted by a lens
+                            // warp, depth-shaded, swallowed at the rim,
+                            // (4) light: warm caustic crescent below, cool
+                            // fresnel arc + crisp speculars above.
+                            // (No new shader, no depth buffer; a few small
+                            // tris buffers per marble.)
                             let mut order: Vec<usize> =
                                 (0..marbles.len()).collect();
-                            {
-                                let depths: Vec<f32> = marbles
-                                    .iter()
-                                    .map(|m| {
-                                        proj(m.pos.x, m.pos.y, m.z + m.r).2
-                                    })
-                                    .collect();
-                                order.sort_by(|a, b| {
-                                    depths[*b]
-                                        .partial_cmp(&depths[*a])
-                                        .unwrap()
-                                });
-                            }
-                            let tau = std::f32::consts::TAU;
-                            let disc =
-                                |cx: f32, cy: f32, r: f32, n: i32| -> Vec<f32> {
-                                    let mut v =
-                                        Vec::with_capacity((n as usize) * 6);
-                                    for i in 0..n {
-                                        let a0 = i as f32 / n as f32 * tau;
-                                        let a1 = (i + 1) as f32 / n as f32
-                                            * tau;
-                                        v.extend_from_slice(&[
-                                            cx,
-                                            cy,
-                                            cx + a0.cos() * r,
-                                            cy + a0.sin() * r,
-                                            cx + a1.cos() * r,
-                                            cy + a1.sin() * r,
-                                        ]);
-                                    }
-                                    v
-                                };
-                            let quad = |x0: f32,
-                                        y0: f32,
-                                        x1: f32,
-                                        y1: f32,
-                                        x2: f32,
-                                        y2: f32,
-                                        x3: f32,
-                                        y3: f32|
-                             -> [f32; 12] {
-                                [
-                                    x0, y0, x1, y1, x2, y2, x0, y0, x2, y2,
-                                    x3, y3,
-                                ]
-                            };
-                            for idx in order.iter() {
-                                let m = &marbles[*idx];
-                                let pc = proj(m.pos.x, m.pos.y, m.z + m.r);
-                                let pr =
-                                    proj(m.pos.x + m.r, m.pos.y, m.z + m.r);
-                                let rs =
-                                    (pr.0 - pc.0).abs().max(1.0) as f32;
-                                let (cx, cy) = (pc.0 as f32, pc.1 as f32);
-                                let t = m.tint;
-                                let tone = |k: f64| {
-                                    [
-                                        (t[0] * k) as f32,
-                                        (t[1] * k) as f32,
-                                        (t[2] * k) as f32,
-                                        1.0,
-                                    ]
-                                };
-                                // Milk: tint pulled toward white.
-                                let milk = |k: f32| {
-                                    [
-                                        t[0] as f32
-                                            + (1.0 - t[0] as f32) * k,
-                                        t[1] as f32
-                                            + (1.0 - t[1] as f32) * k,
-                                        t[2] as f32
-                                            + (1.0 - t[2] as f32) * k,
-                                        1.0,
-                                    ]
-                                };
-                                // Rim / glass / core.
-                                crate::render3d::draw_tris(
-                                    gl,
-                                    prog,
-                                    &omvp,
-                                    tone(0.30),
-                                    &disc(cx, cy, rs, 18),
-                                );
-                                crate::render3d::draw_tris(
-                                    gl,
-                                    prog,
-                                    &omvp,
-                                    tone(0.55),
-                                    &disc(cx, cy, rs * 0.80, 18),
-                                );
-                                crate::render3d::draw_tris(
-                                    gl,
-                                    prog,
-                                    &omvp,
-                                    tone(0.80),
-                                    &disc(cx, cy, rs * 0.58, 18),
-                                );
-                                // Inner motif, advected with the roll.
-                                let mx = cx + m.flow.x as f32 * rs;
-                                let my = cy + m.flow.y as f32 * rs;
-                                let mr = rs * 0.45;
-                                match m.pattern {
-                                    // Cat's eye: bright vertical streak.
-                                    0 => {
-                                        crate::render3d::draw_tris(
-                                            gl,
-                                            prog,
-                                            &omvp,
-                                            milk(0.70),
-                                            &quad(
-                                                mx - mr * 0.16,
-                                                my - mr * 0.80,
-                                                mx + mr * 0.16,
-                                                my - mr * 0.80,
-                                                mx + mr * 0.16,
-                                                my + mr * 0.80,
-                                                mx - mr * 0.16,
-                                                my + mr * 0.80,
-                                            ),
-                                        );
-                                        crate::render3d::draw_tris(
-                                            gl,
-                                            prog,
-                                            &omvp,
-                                            [1.0, 1.0, 1.0, 0.95],
-                                            &quad(
-                                                mx - mr * 0.06,
-                                                my - mr * 0.72,
-                                                mx + mr * 0.06,
-                                                my - mr * 0.72,
-                                                mx + mr * 0.06,
-                                                my + mr * 0.72,
-                                                mx - mr * 0.06,
-                                                my + mr * 0.72,
-                                            ),
-                                        );
-                                    }
-                                    // Swirl: three bars turning slowly.
-                                    1 => {
-                                        for kk in 0..3 {
-                                            let ang = m.spin as f32
-                                                + kk as f32
-                                                    * std::f32::consts::PI
-                                                    / 3.0;
-                                            let (s, c) = ang.sin_cos();
-                                            let len = mr
-                                                * (0.85 - kk as f32 * 0.12);
-                                            let wid = mr * 0.22;
-                                            let dx = c * len;
-                                            let dy = s * len;
-                                            let px = -s * wid;
-                                            let py = c * wid;
-                                            crate::render3d::draw_tris(
-                                                gl,
-                                                prog,
-                                                &omvp,
-                                                milk(0.75
-                                                    - kk as f32 * 0.15),
-                                                &quad(
-                                                    mx + dx + px,
-                                                    my + dy + py,
-                                                    mx + dx - px,
-                                                    my + dy - py,
-                                                    mx - dx - px,
-                                                    my - dy - py,
-                                                    mx - dx + px,
-                                                    my - dy + py,
-                                                ),
-                                            );
+                            order.sort_by(|&a, &b| {
+                                marbles[b]
+                                    .pos
+                                    .y
+                                    .partial_cmp(&marbles[a].pos.y)
+                                    .unwrap()
+                            });
+                            if let Some(prog) = solid_prog {
+                                    let fpi = std::f32::consts::PI;
+                                    // Unit-disc fan and quad: the only
+                                    // geometry helpers (shared with the old
+                                    // code shape).
+                                    let disc =
+                                        |cx: f32, cy: f32, r: f32, n: i32| -> Vec<f32> {
+                                            let mut v =
+                                                Vec::with_capacity((n as usize) * 6);
+                                            for i in 0..n {
+                                                let a0 = i as f32 / n as f32 * fpi * 2.0;
+                                                let a1 = (i + 1) as f32 / n as f32
+                                                    * fpi
+                                                    * 2.0;
+                                                v.extend_from_slice(&[
+                                                    cx,
+                                                    cy,
+                                                    cx + a0.cos() * r,
+                                                    cy + a0.sin() * r,
+                                                    cx + a1.cos() * r,
+                                                    cy + a1.sin() * r,
+                                                ]);
+                                            }
+                                            v
+                                        };
+                                    let quad = |x0: f32,
+                                                y0: f32,
+                                                x1: f32,
+                                                y1: f32,
+                                                x2: f32,
+                                                y2: f32,
+                                                x3: f32,
+                                                y3: f32|
+                                     -> [f32; 12] {
+                                        [
+                                            x0, y0, x1, y1, x2, y2, x0, y0, x2, y2,
+                                            x3, y3,
+                                        ]
+                                    };
+                                    // Ring segment as quad strip.
+                                    let arc = |cx: f32,
+                                               cy: f32,
+                                               r: f32,
+                                               a0: f32,
+                                               a1: f32,
+                                               w: f32|
+                                     -> Vec<f32> {
+                                        let mut v = Vec::new();
+                                        let n = 14;
+                                        for i in 0..n {
+                                            let t0 = a0
+                                                + (a1 - a0) * (i as f32)
+                                                    / (n as f32);
+                                            let t1 = a0
+                                                + (a1 - a0) * ((i + 1) as f32)
+                                                    / (n as f32);
+                                            v.extend_from_slice(&quad(
+                                                cx + (r - w) * t0.cos(),
+                                                cy + (r - w) * t0.sin(),
+                                                cx + (r + w) * t0.cos(),
+                                                cy + (r + w) * t0.sin(),
+                                                cx + (r + w) * t1.cos(),
+                                                cy + (r + w) * t1.sin(),
+                                                cx + (r - w) * t1.cos(),
+                                                cy + (r - w) * t1.sin(),
+                                            ));
                                         }
-                                    }
-                                    // Ribbon: pale band across the middle.
-                                    _ => {
-                                        for (off, hh, kk) in [
-                                            (-0.30, 0.24, 0.55),
-                                            (0.0, 0.30, 0.85),
-                                            (0.30, 0.24, 0.55),
-                                        ] {
-                                            crate::render3d::draw_tris(
-                                                gl,
-                                                prog,
-                                                &omvp,
-                                                milk(kk),
-                                                &quad(
-                                                    mx - mr * 0.85,
-                                                    my + mr * (off - hh),
-                                                    mx + mr * 0.85,
-                                                    my + mr * (off - hh),
-                                                    mx + mr * 0.85,
-                                                    my + mr * (off + hh),
-                                                    mx - mr * 0.85,
-                                                    my + mr * (off + hh),
-                                                ),
-                                            );
+                                        v
+                                    };
+                                    for &mi in &order {
+                                        let m = &marbles[mi];
+                                        let (sx, sy, _) =
+                                            proj(m.pos.x, m.pos.y, 0.0);
+                                        let (ex, _, _) = proj(
+                                            m.pos.x + m.r,
+                                            m.pos.y,
+                                            0.0,
+                                        );
+                                        let rs = (ex - sx) as f32;
+                                        if rs < 1.5 {
+                                            continue;
                                         }
-                                    }
+                                        let t = m.tint;
+                                        let inks = [m.ink1, m.ink2];
+                                                // 1. fresnel edge: a dark RING
+                                                // at grazing angles only —
+                                                // the centre stays clear.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.02, 0.03, 0.05, 0.75],
+                                                    &arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.925,
+                                                        0.0,
+                                                        fpi * 2.0,
+                                                        rs * 0.075,
+                                                    ),
+                                                );
+                                                // Hairline outer outline:
+                                                // the crisp glass contour.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.01, 0.02, 0.03, 0.85],
+                                                    &arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.985,
+                                                        0.0,
+                                                        fpi * 2.0,
+                                                        rs * 0.020,
+                                                    ),
+                                                );
+                                                // 2. clear body, smaller:
+                                                // the dark ring stays
+                                                // outside it; LOW alpha so
+                                                // the scene shows through.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [
+                                                        (t[0] * 0.25 + 0.75)
+                                                            as f32,
+                                                        (t[1] * 0.25 + 0.75)
+                                                            as f32,
+                                                        (t[2] * 0.25 + 0.75)
+                                                            as f32,
+                                                        0.16,
+                                                    ],
+                                                    &disc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.90,
+                                                        20,
+                                                    ),
+                                                );
+                                                // 3. interior ribbons.
+                                                for (ri, rib) in
+                                                    crate::marbles::ribbons(
+                                                        m.pattern,
+                                                    )
+                                                    .iter()
+                                                    .enumerate()
+                                                {
+                                                    let ink = inks
+                                                        [ri % inks.len()];
+                                                    let n: usize = rib.len();
+                                                    if n < 3 {
+                                                        continue;
+                                                    }
+                                                    // Closed loop (ring,
+                                                    // band) when the ends
+                                                    // meet.
+                                                    let (fx, fy, fz, _) =
+                                                        rib[0];
+                                                    let (lx, ly, lz, _) =
+                                                        rib[n - 1];
+                                                    let closed = ((fx - lx)
+                                                        * (fx - lx)
+                                                        + (fy - ly)
+                                                            * (fy - ly)
+                                                        + (fz - lz)
+                                                            * (fz - lz))
+                                                    .sqrt()
+                                                        < 1e-9;
+                                                    // Screen-space path:
+                                                    // rotate, refract, depth.
+                                                    let mut px =
+                                                        Vec::with_capacity(n);
+                                                    let mut py =
+                                                        Vec::with_capacity(n);
+                                                    let mut pz =
+                                                        Vec::with_capacity(n);
+                                                    let mut pw =
+                                                        Vec::with_capacity(n);
+                                                    for (x, y, z, w) in rib {
+                                                        let (rx, ry, rz) =
+                                                            crate::marbles::orient(
+                                                                *x, *y, *z,
+                                                                m.rot,
+                                                            );
+                                                        let (ax, ay, fade) =
+                                                            crate::marbles::lens(
+                                                                rx, ry,
+                                                            );
+                                                        px.push(
+                                                            sx + ax as f32
+                                                                * rs,
+                                                        );
+                                                        py.push(
+                                                            sy + ay as f32
+                                                                * rs,
+                                                        );
+                                                        pz.push(
+                                                            ((rz + 1.0) / 2.0)
+                                                                .clamp(0.0, 1.0)
+                                                                as f32,
+                                                        );
+                                                        pw.push(
+                                                            *w as f32 * fade
+                                                                as f32,
+                                                        );
+                                                    }
+                                                    // Two depth buckets: deep
+                                                    // glass vs lit front.
+                                                    for bucket in 0..2 {
+                                                        let mut v = Vec::new();
+                                                        for i in 0..n {
+                                                            let deep =
+                                                                pz[i] < 0.5;
+                                                            if (bucket == 0)
+                                                                != deep
+                                                            {
+                                                                continue;
+                                                            }
+                                                            let (pi_, ni_) =
+                                                                if closed {
+                                                                    (
+                                                                        (i + n
+                                                                            - 1)
+                                                                            % n,
+                                                                        (i + 1)
+                                                                            % n,
+                                                                    )
+                                                                } else {
+                                                                    (
+                                                                        i.saturating_sub(
+                                                                            1,
+                                                                        ),
+                                                                        (i + 1)
+                                                                            .min(
+                                                                                n - 1,
+                                                                            ),
+                                                                    )
+                                                                };
+                                                            let (tx, ty) = (
+                                                                px[ni_]
+                                                                    - px[pi_],
+                                                                py[ni_]
+                                                                    - py[pi_],
+                                                            );
+                                                            let tl = (tx * tx
+                                                                + ty * ty)
+                                                                .sqrt()
+                                                                .max(1e-5);
+                                                            let half = pw[i]
+                                                                * rs
+                                                                * (0.8
+                                                                    + 0.35
+                                                                        * pz[i]);
+                                                            if half < 0.4 {
+                                                                continue;
+                                                            }
+                                                            let (nx, ny) = (
+                                                                -ty / tl
+                                                                    * half,
+                                                                tx / tl * half,
+                                                            );
+                                                            v.extend_from_slice(
+                                                                &quad(
+                                                                    px[i] - nx,
+                                                                    py[i] - ny,
+                                                                    px[i] + nx,
+                                                                    py[i] + ny,
+                                                                    px[ni_]
+                                                                        + nx,
+                                                                    py[ni_]
+                                                                        + ny,
+                                                                    px[ni_]
+                                                                        - nx,
+                                                                    py[ni_]
+                                                                        - ny,
+                                                                ),
+                                                            );
+                                                        }
+                                                        if v.is_empty() {
+                                                            continue;
+                                                        }
+                                                        let (cr, cg, cb) =
+                                                            if bucket == 0 {
+                                                                (
+                                                                    ink[0]
+                                                                        * 0.5
+                                                                        + 0.05,
+                                                                    ink[1]
+                                                                        * 0.5
+                                                                        + 0.07,
+                                                                    ink[2]
+                                                                        * 0.5
+                                                                        + 0.10,
+                                                                )
+                                                            } else {
+                                                                (
+                                                                    ink[0],
+                                                                    ink[1],
+                                                                    ink[2],
+                                                                )
+                                                            };
+                                                        crate::render3d::draw_tris(
+                                                            gl,
+                                                            prog,
+                                                            &omvp,
+                                                            [
+                                                                cr as f32,
+                                                                cg as f32,
+                                                                cb as f32,
+                                                                0.95,
+                                                            ],
+                                                            &v,
+                                                        );
+                                                    }
+                                                }
+                                                // 4a. warm transmitted light:
+                                                // caustic crescent pooling
+                                                // along the bottom inner rim.
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.80, 0.74, 0.62, 0.75],
+                                                    &arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.72,
+                                                        0.15 * fpi,
+                                                        0.85 * fpi,
+                                                        rs * 0.045,
+                                                    ),
+                                                );
+                                                // 4b. cool glass light:
+                                                // fresnel arc up top, crisp
+                                                // window streak + hot dot,
+                                                // faint bounce lower-right.
+                                                let mut cool: Vec<f32> =
+                                                    arc(
+                                                        sx,
+                                                        sy,
+                                                        rs * 0.88,
+                                                        1.12 * fpi,
+                                                        1.88 * fpi,
+                                                        rs * 0.030,
+                                                    );
+                                                // Window streak, upper-left.
+                                                let (sa, ca) = (0.6f32.sin(), 0.6f32.cos());
+                                                let (scx, scy) = (
+                                                    sx - rs * 0.30,
+                                                    sy - rs * 0.33,
+                                                );
+                                                let (dx, dy) = (
+                                                    ca * rs * 0.11,
+                                                    -sa * rs * 0.11,
+                                                );
+                                                let (wx, wy) = (
+                                                    sa * rs * 0.028,
+                                                    ca * rs * 0.028,
+                                                );
+                                                cool.extend_from_slice(
+                                                    &quad(
+                                                        scx - dx - wx,
+                                                        scy - dy - wy,
+                                                        scx - dx + wx,
+                                                        scy - dy + wy,
+                                                        scx + dx + wx,
+                                                        scy + dy + wy,
+                                                        scx + dx - wx,
+                                                        scy + dy - wy,
+                                                    ),
+                                                );
+                                                let hd = rs * 0.035;
+                                                cool.extend_from_slice(
+                                                    &quad(
+                                                        sx - rs * 0.34 - hd,
+                                                        sy - rs * 0.38 - hd,
+                                                        sx - rs * 0.34 + hd,
+                                                        sy - rs * 0.38 - hd,
+                                                        sx - rs * 0.34 + hd,
+                                                        sy - rs * 0.38 + hd,
+                                                        sx - rs * 0.34 - hd,
+                                                        sy - rs * 0.38 + hd,
+                                                    ),
+                                                );
+                                                let bd = rs * 0.05;
+                                                cool.extend_from_slice(
+                                                    &quad(
+                                                        sx + rs * 0.28 - bd,
+                                                        sy + rs * 0.28 - bd,
+                                                        sx + rs * 0.28 + bd,
+                                                        sy + rs * 0.28 - bd,
+                                                        sx + rs * 0.28 + bd,
+                                                        sy + rs * 0.28 + bd,
+                                                        sx + rs * 0.28 - bd,
+                                                        sy + rs * 0.28 + bd,
+                                                    ),
+                                                );
+                                                crate::render3d::draw_tris(
+                                                    gl,
+                                                    prog,
+                                                    &omvp,
+                                                    [0.92, 0.95, 1.00, 0.60],
+                                                    &cool,
+                                                );
+                                            }
                                 }
-                                // Speculars toward the lamp (upper-left):
-                                // a soft glint + a hot dot.
-                                crate::render3d::draw_tris(
-                                    gl,
-                                    prog,
-                                    &omvp,
-                                    [1.0, 1.0, 1.0, 0.75],
-                                    &quad(
-                                        cx - rs * 0.48,
-                                        cy - rs * 0.52,
-                                        cx - rs * 0.20,
-                                        cy - rs * 0.52,
-                                        cx - rs * 0.20,
-                                        cy - rs * 0.24,
-                                        cx - rs * 0.48,
-                                        cy - rs * 0.24,
-                                    ),
-                                );
-                                crate::render3d::draw_tris(
-                                    gl,
-                                    prog,
-                                    &omvp,
-                                    [1.0, 1.0, 1.0, 0.95],
-                                    &quad(
-                                        cx - rs * 0.44,
-                                        cy - rs * 0.48,
-                                        cx - rs * 0.32,
-                                        cy - rs * 0.48,
-                                        cx - rs * 0.32,
-                                        cy - rs * 0.36,
-                                        cx - rs * 0.44,
-                                        cy - rs * 0.36,
-                                    ),
-                                );
-                                // Faint bounce light, lower-right.
-                                crate::render3d::draw_tris(
-                                    gl,
-                                    prog,
-                                    &omvp,
-                                    [t[0] as f32, t[1] as f32, t[2] as f32, 0.5],
-                                    &quad(
-                                        cx + rs * 0.08,
-                                        cy + rs * 0.26,
-                                        cx + rs * 0.42,
-                                        cy + rs * 0.26,
-                                        cx + rs * 0.42,
-                                        cy + rs * 0.36,
-                                        cx + rs * 0.08,
-                                        cy + rs * 0.36,
-                                    ),
-                                );
-                            }
                         });
                     }
                 }
