@@ -1711,15 +1711,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     need_render = true;
                 }
             }
-            // Marbles: same clock; windows are static hitboxes (they
-            // never move for marbles — a grabbed window shoves through,
-            // the push-out ejects the marble). The VIEW slides under the
-            // marbles (camera minus canvas offset): the canvas is the
-            // box bottom. Stuck marbles ride gentle pans exactly
-            // (static friction); a yank accelerates the box under them
-            // and they lag, clack into each other, and settle somewhere
-            // new — the layout never repeats. After stepping, the
-            // pile collides (glassy clacks). Zoom never moves them:
+            // Marbles: same clock; windows are solid deep boxes (felt,
+            // never drawn — see marbles.rs). The VIEW moves over the
+            // box: camera + canvas motion both shake it, so the yank
+            // is the slide acceleration. Static friction glues calm
+            // marbles to the box (navigation rides along); a real yank
+            // breaks them loose — the box accelerates under the balls.
+            // After stepping, the pile collides (glassy clacks). Zoom never moves them:
             // anchor tracking banks its offset as zoom slip, drained
             // here before the slide is measured.
             {
@@ -1805,11 +1803,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     };
                     let dist = (dx * dx + dy * dy).sqrt();
                     let stepped = match crate::marbles::lod_for(dist, span) {
-                        crate::marbles::Lod::Full => c.step(dt, slide, slide_accel, &walls),
+                        crate::marbles::Lod::Full => c.step(dt, slide_accel, &walls),
                         crate::marbles::Lod::Reduced
                             if (frame_no + c.seed as u64) % 4 == 0 =>
                         {
-                            c.step(dt * 4.0, slide, slide_accel, &walls)
+                            c.step(dt * 4.0, slide_accel, &walls)
                         }
                         _ => false,
                     };
