@@ -2526,7 +2526,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             // first. Visible = normal towards the viewer
                             // (+z); shade follows the key light. Each face
                             // is cut into 6 strips along its grain so the
-                            // procedural wood reads at any zoom.
+                            // procedural wood reads at any zoom, then dressed
+                            // crate-style: diagonal brace + edge frame.
                             // Body coords of corner i: sx fastest (-1/+1).
                             let body_of = |idx: usize| -> (f64, f64, f64) {
                                 let sz = if idx & 1 == 1 { 1.0 } else { -1.0 };
@@ -2551,8 +2552,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 let seed = c.half * 0.91
                                     + c.rgb[0] * 17.0
                                     + c.rgb[1] * 9.0;
-                                for (axis, quad) in
-                                    crate::cubes::FACES.iter()
+                                for (fi, (axis, quad)) in
+                                    crate::cubes::FACES.iter().enumerate()
                                 {
                                     let n = crate::cubes::face_normal(
                                         c.rot, *axis,
@@ -2662,6 +2663,108 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             t_top0.0, t_top0.1, t_top1.0,
                                             t_top1.1, t_bot1.0, t_bot1.1,
                                             t_bot0.0, t_bot0.1,
+                                        ];
+                                        faces.push((d, col, q));
+                                    }
+                                    // Crate dressing: diagonal brace + edge
+                                    // frame (packing-crate spirit, our own
+                                    // proportions). Same depth as the face;
+                                    // the stable sort keeps base, brace,
+                                    // frame in paint order.
+                                    let bc = (
+                                        (b2[0].0 + b2[1].0 + b2[2].0 + b2[3].0)
+                                            * 0.25,
+                                        (b2[0].1 + b2[1].1 + b2[2].1 + b2[3].1)
+                                            * 0.25,
+                                    );
+                                    let base_col = [
+                                        c.rgb[0] as f32 * shade as f32,
+                                        c.rgb[1] as f32 * shade as f32,
+                                        c.rgb[2] as f32 * shade as f32,
+                                    ];
+                                    // Diagonal brace corner to corner; the
+                                    // diagonal alternates per face so the box
+                                    // reads hand-built, never tiled.
+                                    let (da, db) = if fi % 2 == 0 {
+                                        (p2[0], p2[2])
+                                    } else {
+                                        (p2[1], p2[3])
+                                    };
+                                    let bdx = db.0 - da.0;
+                                    let bdy = db.1 - da.1;
+                                    let bdl = (bdx * bdx + bdy * bdy)
+                                        .sqrt()
+                                        .max(1.0);
+                                    let bnx = -bdy / bdl;
+                                    let bny = bdx / bdl;
+                                    // Wide dark bed first, narrower light
+                                    // plank on top: the brace reads outlined.
+                                    for (wfrac, tone, gseed) in [
+                                        (0.20, 0.45, seed + 3.7),
+                                        (0.13, 1.10, seed + 9.1),
+                                    ] {
+                                        let ox = bnx * bdl * wfrac as f32;
+                                        let oy = bny * bdl * wfrac as f32;
+                                        let g = crate::cubes::wood_grain(
+                                            bc.0 + gseed,
+                                            bc.1 - gseed * 0.5,
+                                            gseed,
+                                        )
+                                            as f32;
+                                        let t2 = tone as f32 * g;
+                                        let col = [
+                                            (base_col[0] * t2).min(1.0),
+                                            (base_col[1] * t2).min(1.0),
+                                            (base_col[2] * t2).min(1.0),
+                                            1.0,
+                                        ];
+                                        let q = [
+                                            da.0 + ox, da.1 + oy,
+                                            da.0 - ox, da.1 - oy,
+                                            db.0 - ox, db.1 - oy,
+                                            db.0 + ox, db.1 + oy,
+                                        ];
+                                        faces.push((d, col, q));
+                                    }
+                                    // Edge frame: four beams along the face
+                                    // borders, darker stained wood.
+                                    let fcx = (p2[0].0 + p2[1].0 + p2[2].0
+                                        + p2[3].0)
+                                        * 0.25;
+                                    let fcy = (p2[0].1 + p2[1].1 + p2[2].1
+                                        + p2[3].1)
+                                        * 0.25;
+                                    let fw: f32 = 0.15;
+                                    let inner = |pp: (f32, f32)| -> (f32, f32) {
+                                        (
+                                            fcx + (pp.0 - fcx) * (1.0 - 2.0 * fw),
+                                            fcy + (pp.1 - fcy) * (1.0 - 2.0 * fw),
+                                        )
+                                    };
+                                    let ip =
+                                        [inner(p2[0]), inner(p2[1]), inner(p2[2]), inner(p2[3])];
+                                    let beams = [
+                                        (p2[0], p2[1], ip[1], ip[0], 0),
+                                        (p2[1], p2[2], ip[2], ip[1], 1),
+                                        (p2[2], p2[3], ip[3], ip[2], 2),
+                                        (p2[3], p2[0], ip[0], ip[3], 3),
+                                    ];
+                                    for (ba, bb, bcc, be, bi) in beams {
+                                        let g = crate::cubes::wood_grain(
+                                            bc.0 + bi as f64 * 2.3 + seed,
+                                            bc.1 - bi as f64 * 1.1,
+                                            seed + 7.3,
+                                        ) as f32;
+                                        let t2 = 0.55 * g;
+                                        let col = [
+                                            base_col[0] * t2,
+                                            base_col[1] * t2,
+                                            base_col[2] * t2,
+                                            1.0,
+                                        ];
+                                        let q = [
+                                            ba.0, ba.1, bb.0, bb.1, bcc.0,
+                                            bcc.1, be.0, be.1,
                                         ];
                                         faces.push((d, col, q));
                                     }
