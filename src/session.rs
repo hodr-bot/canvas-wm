@@ -97,7 +97,6 @@ pub enum SuperAction {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CanvasOrigin {
     pub offset: Vec2,
-    pub vel: Vec2,
 }
 
 /// Dwell-to-arm: staying inside one window for DWELL_ARM_MS (small moves
@@ -201,10 +200,12 @@ impl Session {
     }
 
     /// Pan the canvas by a screen-space drag delta (content follows cursor).
+    /// The offset velocity is left for the backend to measure per-frame
+    /// (offset delta / dt): it drives the toy-cube grip, so a left-drag
+    /// fling shoves the cubes like a yanked tablecloth.
     pub fn pan_canvas(&mut self, delta_screen: Vec2) {
         self.canvas.offset.x += delta_screen.x / self.camera.zoom;
         self.canvas.offset.y += delta_screen.y / self.camera.zoom;
-        self.canvas.vel = Vec2::new(0.0, 0.0);
         // Manual pan owns the offset now: drop any zoom tracking.
         self.zoom_anchor = None;
     }
