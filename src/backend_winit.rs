@@ -257,14 +257,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Toy marbles (K key, Canvas mode): canvas-anchored physics bodies.
     let mut marbles: Vec<crate::marbles::Marble> = Vec::new();
     let mut marble_seed: u64 = 0xC0BEu64;
-    // Overhead lamp (off-screen, above the top edge): pendulum state +
-    // clock. Shadows repaint at most 4 Hz from the lamp alone so idle
-    // stays cheap; camera pans repaint every frame anyway.
-    let mut lamp = crate::marbles::Lamp::new();
+    // Frame counter: phases the far-marble LOD steps.
+    let mut frame_no: u64 = 0;
     let mut prev_canvas_offset = session.canvas.offset;
-    let mut lamp_t: f64 = 0.0;
-    let mut lamp_painted = 0.0f64;
-    let mut lamp_cooldown = 0.0f64;
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): window id + pinned centre +
     // size at grab + mouse canvas pos at grab + last pushed client
@@ -996,9 +991,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 }
                                 crate::chrome::HoverKey::Marble => {
                                     // Marble drop: fresh K press (no
-                                    // auto-repeat spam) spawns one glass
-                                    // marble above the cursor; it plops,
-                                    // rolls with slides, and rides pans.
+                                    // auto-repeat spam) plops one glass
+                                    // marble right at the cursor — low and
+                                    // still, so perspective never offsets
+                                    // it from the pointer (worst near the
+                                    // screen edges, where height shifts the
+                                    // projected spot most). It rolls with
+                                    // slides, and rides pans.
                                     // Canvas-modal like F/Q/E/R — Idle
                                     // typing never spawns.
                                     if pressed && !k_held {
@@ -1006,11 +1005,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             .wrapping_mul(0x9E3779B97F4A7C15)
                                             .wrapping_add(0xC0BE);
                                         let at = session.to_canvas(pointer, view);
+                                        let mut m = crate::marbles::spawn(
+                                            at.x, at.y, marble_seed,
+                                        );
+                                        // Plop, not sky-drop: at the cursor.
+                                        m.z = 12.0;
+                                        m.vz = 0.0;
+                                        m.vel =
+                                            crate::canvas::Vec2::new(0.0, 0.0);
                                         crate::marbles::add_marble(
-                                            &mut marbles,
-                                            crate::marbles::spawn(
-                                                at.x, at.y, marble_seed,
-                                            ),
+                                            &mut marbles, m,
                                         );
                                         log::info!(
                                             "marble drop at ({:.0},{:.0}) n={}",
@@ -1638,24 +1642,78 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     (session.canvas.offset.y - prev_canvas_offset.y - slip.y) / dt_c,
                 );
                 prev_canvas_offset = session.canvas.offset;
+                // LOD prologue: the viewport in canvas coords. Marbles
+                // inside 2x the screen span step every frame; out to 10x
+                // they step every 4th frame (4x dt, same motion, quarter
+                // the cost); past 10x they are dropped — rolled too far
+                // to matter, but never popped while visible.
+                frame_no = frame_no.wrapping_add(1);
+                let ctl = session.to_canvas(
+                    crate::canvas::Vec2::new(0.0, 0.0),
+                    view,
+                );
+                let cbr = session.to_canvas(view, view);
+                let (rx0, rx1) = if ctl.x < cbr.x {
+                    (ctl.x, cbr.x)
+                } else {
+                    (cbr.x, ctl.x)
+                };
+                let (ry0, ry1) = if ctl.y < cbr.y {
+                    (ctl.y, cbr.y)
+                } else {
+                    (cbr.y, ctl.y)
+                };
+                let span = ((rx1 - rx0).max(ry1 - ry0)).max(1.0);
+                marbles.retain(|m| {
+                    let dx = if m.pos.x < rx0 {
+                        rx0 - m.pos.x
+                    } else if m.pos.x > rx1 {
+                        m.pos.x - rx1
+                    } else {
+                        0.0
+                    };
+                    let dy = if m.pos.y < ry0 {
+                        ry0 - m.pos.y
+                    } else if m.pos.y > ry1 {
+                        m.pos.y - ry1
+                    } else {
+                        0.0
+                    };
+                    crate::marbles::lod_for((dx * dx + dy * dy).sqrt(), span)
+                        != crate::marbles::Lod::Cull
+                });
                 let slide = crate::canvas::Vec2::new(
                     session.camera.vel.x - canvas_vel.x,
                     session.camera.vel.y - canvas_vel.y,
                 );
                 for c in marbles.iter_mut() {
-                    if c.step(dt, slide, &walls) {
+                    let dx = if c.pos.x < rx0 {
+                        rx0 - c.pos.x
+                    } else if c.pos.x > rx1 {
+                        c.pos.x - rx1
+                    } else {
+                        0.0
+                    };
+                    let dy = if c.pos.y < ry0 {
+                        ry0 - c.pos.y
+                    } else if c.pos.y > ry1 {
+                        c.pos.y - ry1
+                    } else {
+                        0.0
+                    };
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let stepped = match crate::marbles::lod_for(dist, span) {
+                        crate::marbles::Lod::Full => c.step(dt, slide, &walls),
+                        crate::marbles::Lod::Reduced
+                            if (frame_no + c.seed as u64) % 4 == 0 =>
+                        {
+                            c.step(dt * 4.0, slide, &walls)
+                        }
+                        _ => false,
+                    };
+                    if stepped {
                         need_render = true;
                     }
-                }
-                // Lamp pendulum: the view shoves it, self-sway keeps it
-                // alive in idle. Throttled repaints (see decl).
-                lamp_t += dt;
-                lamp.step(dt, slide.x, lamp_t);
-                lamp_cooldown -= dt;
-                if (lamp.theta - lamp_painted).abs() > 0.004 && lamp_cooldown <= 0.0 {
-                    lamp_painted = lamp.theta;
-                    lamp_cooldown = 0.25;
-                    need_render = true;
                 }
             }
         }
@@ -2306,9 +2364,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 // Toy marbles (K key): canvas-anchored glass spheres.
                 // Screen-space layered discs with the solid program
                 // (no new shader, no depth buffer: painter's algorithm).
-                // Blob shadows on the surface first (fading with hop
-                // height), then all marbles far-to-near by depth.
-                // Before glow/menu so both wash over the toys.
+                // All marbles far-to-near by depth. Before glow/menu so
+                // both wash over the toys.
                 if !marbles.is_empty() {
                     if let Some(prog) = solid_prog {
                         let sc = scale as f32;
@@ -2341,14 +2398,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 n.2,
                             )
                         };
-                        // Lamp source in world (canvas px): above the top
-                        // edge, swinging with the pendulum.
-                        let zoom = session.view_camera().zoom;
-                        let lamp_src = lamp.source(
-                            crate::canvas::Vec2::new(mid.x, mid.y),
-                            view.x / zoom / 2.0,
-                            view.y / zoom / 2.0,
-                        );
                         let walls: Vec<(f64, f64, f64, f64)> = server_state
                             .windows
                             .values()
@@ -2361,114 +2410,13 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 )
                             })
                             .collect();
-                        // Window shadows: extruded silhouettes falling away
-                        // from the lamp (pads stand PAD_H tall, felt but
-                        // never drawn). Short and subtle.
-                        {
-                            let wlen = crate::marbles::PAD_H * 1.6;
-                            let mut tris: Vec<f32> = Vec::new();
-                            for (wx, wy, ww, wh) in walls.iter() {
-                                let sd = lamp.shadow_dir(
-                                    crate::canvas::Vec2::new(
-                                        wx + ww / 2.0,
-                                        wy + wh / 2.0,
-                                    ),
-                                    lamp_src,
-                                );
-                                if sd.y <= 0.05 {
-                                    continue;
-                                }
-                                let ex = sd.x * wlen;
-                                let ey = sd.y * wlen;
-                                let corners = [
-                                    (*wx, *wy),
-                                    (wx + ww, *wy),
-                                    (wx + ww, wy + wh),
-                                    (*wx, wy + wh),
-                                ];
-                                for e in 0..4 {
-                                    let (ax, ay) = corners[e];
-                                    let (bx, by) = corners[(e + 1) % 4];
-                                    let p = [
-                                        proj(ax, ay, 0.0),
-                                        proj(bx, by, 0.0),
-                                        proj(bx + ex, by + ey, 0.0),
-                                        proj(ax + ex, ay + ey, 0.0),
-                                    ];
-                                    tris.extend_from_slice(&[
-                                        p[0].0, p[0].1, p[1].0, p[1].1,
-                                        p[2].0, p[2].1, p[0].0, p[0].1,
-                                        p[2].0, p[2].1, p[3].0, p[3].1,
-                                    ]);
-                                }
-                                let q = [
-                                    proj(wx + ex, wy + ey, 0.0),
-                                    proj(wx + ww + ex, wy + ey, 0.0),
-                                    proj(wx + ww + ex, wy + wh + ey, 0.0),
-                                    proj(wx + ex, wy + wh + ey, 0.0),
-                                ];
-                                tris.extend_from_slice(&[
-                                    q[0].0, q[0].1, q[1].0, q[1].1,
-                                    q[2].0, q[2].1, q[0].0, q[0].1,
-                                    q[2].0, q[2].1, q[3].0, q[3].1,
-                                ]);
-                            }
-                            if !tris.is_empty() {
-                                renderer.with_context(|_, gl| unsafe {
-                                    crate::render3d::draw_tris(
-                                        gl,
-                                        prog,
-                                        &omvp,
-                                        [0.0, 0.0, 0.0, 0.18],
-                                        &tris,
-                                    )
-                                });
-                            }
-                        }
                         let _ = renderer.with_context(|_, gl| unsafe {
-                            // Shadows: one soft blob per marble on the surface
-                            // below (canvas or window top), detached and
-                            // faded while airborne.
-                            for c in marbles.iter() {
-                                let gh = crate::marbles::ground_height(
-                                    c.pos.x, c.pos.y, &walls,
-                                );
-                                // Thrown away from the lamp: longer and more
-                                // detached the higher the marble hops.
-                                let sdir = lamp.shadow_dir(
-                                    crate::canvas::Vec2::new(c.pos.x, c.pos.y),
-                                    lamp_src,
-                                );
-                                let sdist = c.z * 0.9 + c.r * 0.8;
-                                let g = proj(
-                                    c.pos.x + sdir.x * sdist,
-                                    c.pos.y + sdir.y * sdist,
-                                    gh,
-                                );
-                                let fade =
-                                    (1.0 - c.z / 1400.0).clamp(0.3, 1.0) as f32;
-                                let r = c.r as f32 * 2.3 * fade + 2.0;
-                                for (grow, a) in [(1.0, 0.16), (0.68, 0.20)] {
-                                    let rr = r * grow;
-                                    let al = a * fade;
-                                    let (gx, gy) = (g.0 as f32, g.1 as f32);
-                                    let verts: [f32; 12] = [
-                                        gx - rr, gy - rr, gx + rr, gy - rr,
-                                        gx - rr, gy + rr, gx - rr, gy + rr,
-                                        gx + rr, gy - rr, gx + rr, gy + rr,
-                                    ];
-                                    crate::render3d::draw_tris(
-                                        gl, prog, &omvp, [0.0, 0.0, 0.0, al],
-                                        &verts,
-                                    );
-                                }
-                            }
                             // Marbles: glass spheres, painter's algorithm (far
                             // first). Layered screen-space discs through the
                             // solid program: dark rim, mid glass, light
                             // core, inner motif (per-marble pattern, it
                             // advects with the roll), fixed speculars
-                            // toward the lamp + a faint bounce light.
+                            // top-left + a faint bounce light.
                             let mut order: Vec<usize> =
                                 (0..marbles.len()).collect();
                             {

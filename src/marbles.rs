@@ -28,6 +28,28 @@ pub const MAX_MARBLES: usize = 200;
 /// marbles slow on the lip, hop a touch, and sit ON windows with
 /// enough momentum instead of floating over a flat print.
 pub const PAD_H: f64 = 8.0;
+/// Simulation detail by distance to the viewport (canvas px).
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum Lod {
+    /// Within 2x the screen span: every frame.
+    Full,
+    /// Between 2x and 10x: every 4th frame (4x dt, same motion).
+    Reduced,
+    /// Past 10x: dropped — rolled too far to matter.
+    Cull,
+}
+
+/// LOD tier for a marble `dist` canvas px outside the viewport, given
+/// the viewport `span` (its larger side, canvas px).
+pub fn lod_for(dist: f64, span: f64) -> Lod {
+    if dist <= 2.0 * span {
+        Lod::Full
+    } else if dist <= 10.0 * span {
+        Lod::Reduced
+    } else {
+        Lod::Cull
+    }
+}
 /// Gravity, canvas px / s^2.
 const GRAV: f64 = 2600.0;
 /// Vertical bounce kept on landing: glass gives a small hop, not a
@@ -185,6 +207,46 @@ impl Marble {
     /// Returns true while anything still moves (the frame must repaint).
     pub fn step(&mut self, dt: f64, cam_vel: Vec2, walls: &[(f64, f64, f64, f64)]) -> bool {
         let dt = dt.min(0.05);
+
+        // --- resize eject FIRST: the rect grew over the marble (centre
+        // inside while rolling below the lip). Shove it back out along
+        // the shallowest side before the ground snap, or it would pop
+        // on top instead. Clears the whole footprint (1.6r) so the rim
+        // doesn't catch the pad on the way out.
+        if self.z < PAD_H - 1.0 {
+            for (x, y, w, h) in walls {
+                if self.pos.x >= *x
+                    && self.pos.x <= x + w
+                    && self.pos.y >= *y
+                    && self.pos.y <= y + h
+                {
+                    let dl = self.pos.x - x;
+                    let dr = x + w - self.pos.x;
+                    let dpt = self.pos.y - y;
+                    let db = y + h - self.pos.y;
+                    let m = dl.min(dr).min(dpt).min(db);
+                    let (nx, ny) = if m == dl {
+                        (-1.0, 0.0)
+                    } else if m == dr {
+                        (1.0, 0.0)
+                    } else if m == dpt {
+                        (0.0, -1.0)
+                    } else {
+                        (0.0, 1.0)
+                    };
+                    self.pos.x += nx * (m + self.r * 1.6);
+                    self.pos.y += ny * (m + self.r * 1.6);
+                    let vn = self.vel.x * nx + self.vel.y * ny;
+                    if vn < 0.0 {
+                        self.vel.x -= 1.25 * vn * nx;
+                        self.vel.y -= 1.25 * vn * ny;
+                    }
+                    self.vel.x += nx * 60.0;
+                    self.vel.y += ny * 60.0;
+                    break;
+                }
+            }
+        }
         let ground = self.ground(walls);
 
         // --- vertical: gravity, small glass hop, rest ---
@@ -261,7 +323,11 @@ impl Marble {
                     && self.pos.y >= *y
                     && self.pos.y <= y + h;
                 if inside {
-                    continue; // mounting: the ground snap lifts it.
+                    // Riding on top, or a footprint straddling the lip
+                    // mid-mount: the ground snap lifts it. (Swallowed
+                    // marbles never reach here — the resize eject above
+                    // owns them.)
+                    continue;
                 }
                 let mut nx = self.pos.x - cx;
                 let mut ny = self.pos.y - cy;
@@ -307,70 +373,6 @@ impl Marble {
         }
 
         !contact || speed > 0.5 || self.vz != 0.0
-    }
-}
-
-/// Overhead lamp swinging just off-screen, above the top edge, at
-/// canvas height. Shadows fall away from it (down-screen); the camera
-/// shoves it like a chandelier: pan right and the lamp lags left.
-/// Pure state — stepped by the backend, unit-tested here.
-pub struct Lamp {
-    /// Pendulum angle (rad). 0 = centred above the view.
-    pub theta: f64,
-    /// Angular velocity (rad/s).
-    pub omega: f64,
-}
-
-impl Lamp {
-    pub fn new() -> Self {
-        Lamp {
-            theta: 0.0,
-            omega: 0.0,
-        }
-    }
-
-    /// Step by `dt`: gentle self-sway so it lives in idle, pendulum
-    /// spring + damping, minus a push from the camera x velocity.
-    pub fn step(&mut self, dt: f64, cam_vel_x: f64, t: f64) {
-        const DRIVE: f64 = 0.35; // self-sway torque (rad/s^2)
-        const SWAY_W: f64 = 0.5; // sway frequency (rad/s, ~12.6 s period)
-        const STIFF: f64 = 2.2; // pendulum (g/L)
-        const DAMP: f64 = 0.6; // damping (/s)
-        const PUSH: f64 = 0.0011; // camera coupling
-        let acc = DRIVE * (t * SWAY_W).sin() - STIFF * self.theta.sin()
-            - DAMP * self.omega
-            - PUSH * cam_vel_x;
-        self.omega += acc * dt;
-        self.theta += self.omega * dt;
-        // Keep the lamp above the screen: clamp the swing.
-        if self.theta > 1.2 {
-            self.theta = 1.2;
-            self.omega = 0.0;
-        }
-        if self.theta < -1.2 {
-            self.theta = -1.2;
-            self.omega = 0.0;
-        }
-    }
-
-    /// World position of the source: above the top screen edge, swung
-    /// sideways by the pendulum. `mid` = world view centre, `half_w` /
-    /// `half_h` = world half-extents of the view.
-    pub fn source(&self, mid: Vec2, half_w: f64, half_h: f64) -> Vec2 {
-        Vec2::new(
-            mid.x + self.theta.sin() * half_w * 0.9,
-            mid.y - half_h * 1.15,
-        )
-    }
-
-    /// Shadow direction at a world point: from the source through the
-    /// point (unit 2D vector, pointing down-screen while the lamp is
-    /// above).
-    pub fn shadow_dir(&self, at: Vec2, src: Vec2) -> Vec2 {
-        let dx = at.x - src.x;
-        let dy = at.y - src.y;
-        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-        Vec2::new(dx / len, dy / len)
     }
 }
 
@@ -513,12 +515,47 @@ mod tests {
         );
     }
 
+
     #[test]
-    fn lamp_rests_level() {
-        let mut l = Lamp::new();
-        for _ in 0..600 {
-            l.step(0.016, 0.0, 0.0);
+    fn lod_tiers_by_distance() {
+        assert_eq!(lod_for(0.0, 100.0), Lod::Full);
+        assert_eq!(lod_for(200.0, 100.0), Lod::Full);
+        assert_eq!(lod_for(201.0, 100.0), Lod::Reduced);
+        assert_eq!(lod_for(1000.0, 100.0), Lod::Reduced);
+        assert_eq!(lod_for(1001.0, 100.0), Lod::Cull);
+    }
+
+    #[test]
+    fn resize_ejects_swallowed_marble() {
+        // Grown over by a resize: centre inside, rolling below the lip.
+        let mut m = spawn(200.0, 150.0, 7);
+        m.z = 0.0;
+        m.vel = Vec2::new(0.0, 0.0);
+        m.step(0.016, Vec2::new(0.0, 0.0), &walls());
+        let (x, y, w, h) = walls()[0];
+        let inside = m.pos.x >= x
+            && m.pos.x <= x + w
+            && m.pos.y >= y
+            && m.pos.y <= y + h;
+        assert!(!inside, "resize must push the marble out, pos={:?}", m.pos);
+    }
+
+    #[test]
+    fn rider_stays_on_pad() {
+        // Already riding on top: the rect growth must not eject it.
+        let mut m = spawn(200.0, 150.0, 8);
+        m.z = PAD_H;
+        m.vz = 0.0;
+        m.vel = Vec2::new(0.0, 0.0);
+        for _ in 0..30 {
+            m.step(0.016, Vec2::new(0.0, 0.0), &walls());
         }
-        assert!(l.theta.abs() < 1.2, "lamp swing stays clamped");
+        let (x, y, w, h) = walls()[0];
+        let inside = m.pos.x >= x
+            && m.pos.x <= x + w
+            && m.pos.y >= y
+            && m.pos.y <= y + h;
+        assert!(inside, "rider must stay on the pad, pos={:?}", m.pos);
+        assert!((m.z - PAD_H).abs() < 1e-9, "rider keeps pad height");
     }
 }
