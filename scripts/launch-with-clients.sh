@@ -83,6 +83,11 @@ new_x_display() {
 
 X_BEFORE="$(ls "$X11DIR" 2>/dev/null | sed 's/^X//' | tr '\n' ' ' || true)"
 : > "$LOG"
+# Xwayland's glamor cannot open our render node from inside the nested
+# session: it hands out dmabuf with an Invalid layout modifier, which
+# poisons the compositor GL context a few frames later. Software Xwayland
+# sends plain shm instead (the proven-safe path).
+export XWAYLAND_NO_GLAMOR=1
 # shellcheck disable=SC2086
 $CANVAS_CMD >>"$LOG" 2>&1 &
 COMP_PID=$!

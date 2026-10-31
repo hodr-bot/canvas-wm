@@ -20,7 +20,7 @@ use smithay::backend::{
     renderer::{buffer_type, BufferType, Frame, ImportDma, ImportShm, Texture, Transform},
     winit::{self, WinitEvent, WinitInputError},
 };
-use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer as BufferDims};
+use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer as BufferDims, Modifier};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis as WlAxis, AxisSource};
@@ -213,6 +213,18 @@ fn client_buffer_size(buffer: &WlBuffer) -> Option<(i32, i32)> {
             .map(|d| (d.width() as i32, d.height() as i32)),
         _ => None,
     }
+}
+
+/// A dmabuf whose modifier is Invalid carries no layout: importing it
+/// "succeeds" but poisons our GL context a few frames later (radeonsi on
+/// nested X11 EGL). Xwayland with broken glamor sends exactly these.
+fn dma_layout_known(buffer: &WlBuffer) -> bool {
+    buffer
+        .as_ref()
+        .user_data()
+        .get::<Dmabuf>()
+        .map(|d| d.format().modifier != Modifier::Invalid)
+        .unwrap_or(false)
 }
 
 /// Import path of a client buffer for the frame log: `shm`, `dma` with
@@ -2193,15 +2205,28 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 );
                                 // GL clients present dmabuf, not shm: import
                                 // through the matching path, same texture
-                                // slot either way.
+                                // slot either way. A dma buffer with no
+                                // layout modifier is refused (see
+                                // dma_layout_known): the window keeps its
+                                // previous texture until a good buffer.
                                 let imported = match buffer_type(&buffer) {
-                                    Some(BufferType::Dma) => {
-                                        renderer.import_dma_buffer(&buffer)
+                                    Some(BufferType::Dma)
+                                        if dma_layout_known(&buffer) =>
+                                    {
+                                        Some(renderer.import_dma_buffer(&buffer))
                                     }
-                                    _ => renderer.import_shm_buffer(&buffer, None, &[damage]),
+                                    Some(BufferType::Dma) => {
+                                        log::warn!(
+                                            "refusing dma import with invalid modifier, keeping previous texture"
+                                        );
+                                        None
+                                    }
+                                    _ => Some(renderer.import_shm_buffer(
+                                        &buffer, None, &[damage],
+                                    )),
                                 };
                                 match imported {
-                                    Ok(tex) => {
+                                    Some(Ok(tex)) => {
                                         // Follow the buffer only when the CLIENT
                                         // resizes (first map or configure):
                                         // manual moves/resizes never snap back.
@@ -2231,7 +2256,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         );
                                         cw.texture = Some(tex)
                                     }
-                                    Err(err) => log::warn!("buffer import failed: {}", err),
+                                    Some(Err(err)) => log::warn!("buffer import failed: {}", err),
+                                    None => {}
                                 }
                             }
                         }
@@ -2414,15 +2440,28 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 );
                                 // GL clients present dmabuf, not shm: import
                                 // through the matching path, same texture
-                                // slot either way.
+                                // slot either way. A dma buffer with no
+                                // layout modifier is refused (see
+                                // dma_layout_known): the window keeps its
+                                // previous texture until a good buffer.
                                 let imported = match buffer_type(&buffer) {
-                                    Some(BufferType::Dma) => {
-                                        renderer.import_dma_buffer(&buffer)
+                                    Some(BufferType::Dma)
+                                        if dma_layout_known(&buffer) =>
+                                    {
+                                        Some(renderer.import_dma_buffer(&buffer))
                                     }
-                                    _ => renderer.import_shm_buffer(&buffer, None, &[damage]),
+                                    Some(BufferType::Dma) => {
+                                        log::warn!(
+                                            "refusing dma import with invalid modifier, keeping previous texture"
+                                        );
+                                        None
+                                    }
+                                    _ => Some(renderer.import_shm_buffer(
+                                        &buffer, None, &[damage],
+                                    )),
                                 };
                                 match imported {
-                                    Ok(tex) => {
+                                    Some(Ok(tex)) => {
                                         if let Some(pop) =
                                             server_state.popups.get_mut(&pid)
                                         {
@@ -2440,9 +2479,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             );
                                         }
                                     }
-                                    Err(err) => {
+                                    Some(Err(err)) => {
                                         log::warn!("popup buffer import failed: {}", err)
                                     }
+                                    None => {}
                                 }
                             }
                         }
