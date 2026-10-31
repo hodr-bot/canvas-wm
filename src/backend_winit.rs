@@ -1491,6 +1491,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             None => {
                                 pan_start = Some(pointer);
                                 panning = Some(pointer);
+                                log::info!(
+                                    "canvas pan start at ({:.0}, {:.0})",
+                                    pointer.x,
+                                    pointer.y
+                                );
                             }
                         }
                     } else if !pressed && left {
@@ -1933,6 +1938,20 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     .wrapping_add(0xB00B1E5);
                 if crate::marbles::collide_marbles(&mut marbles, &mut chaos) {
                     need_render = true;
+                }
+                if std::env::var("CANVAS_SHAKE_DEBUG").is_ok() && frame_no % 30 == 0
+                {
+                    let m0 = marbles.first().map(|m| (m.pos.x, m.pos.y)).unwrap_or((0.0, 0.0));
+                    log::info!(
+                        "shake dbg off=({:.0},{:.0}) acc=({:.0},{:.0}) m0=({:.0},{:.0}) n={}",
+                        session.canvas.offset.x,
+                        session.canvas.offset.y,
+                        slide_accel.x,
+                        slide_accel.y,
+                        m0.0,
+                        m0.1,
+                        marbles.len()
+                    );
                 }
             }
         }
