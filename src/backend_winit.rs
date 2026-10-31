@@ -215,6 +215,25 @@ fn client_buffer_size(buffer: &WlBuffer) -> Option<(i32, i32)> {
     }
 }
 
+/// Import path of a client buffer for the frame log: `shm`, `dma` with
+/// its format/modifier, or `other`. The old log line said "shm" even
+/// for dmabuf imports, hiding which path a dying frame took.
+fn buffer_path(buffer: &WlBuffer) -> String {
+    match buffer_type(buffer) {
+        Some(BufferType::Shm) => "shm".to_string(),
+        Some(BufferType::Dma) => {
+            let meta = buffer
+                .as_ref()
+                .user_data()
+                .get::<Dmabuf>()
+                .map(|d| format!("{:?}", d.format()))
+                .unwrap_or_else(|| "?".to_string());
+            format!("dma{}", meta)
+        }
+        _ => "other".to_string(),
+    }
+}
+
 /// Frames presented so far (EGL death breadcrumb: logged on backend
 /// failure so a crash line tells whether anything ever reached the
 /// screen). Written on the event loop, read on the way out.
@@ -2204,9 +2223,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                             );
                                         }
                                         log::info!(
-                                            "imported {}x{} shm buffer for window {}",
+                                            "imported {}x{} {} buffer for window {}",
                                             w,
                                             h,
+                                            buffer_path(&buffer),
                                             id
                                         );
                                         cw.texture = Some(tex)
@@ -2412,10 +2432,16 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                                 h as f64,
                                             );
                                             pop.texture = Some(tex);
+                                            log::info!(
+                                                "imported popup {}x{} {} buffer",
+                                                w,
+                                                h,
+                                                buffer_path(&buffer)
+                                            );
                                         }
                                     }
                                     Err(err) => {
-                                        log::warn!("popup shm import failed: {}", err)
+                                        log::warn!("popup buffer import failed: {}", err)
                                     }
                                 }
                             }
