@@ -411,7 +411,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Frame counter: phases the far-marble LOD steps.
     let mut frame_no: u64 = 0;
     let mut prev_canvas_offset = session.canvas.offset;
-    let mut prev_slide = crate::canvas::Vec2::new(0.0, 0.0);
+    let mut shake = crate::marbles::Shake::new();
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): the live gesture (id, pinned
     // centre, grab state, smoothing spring) + the scale clock. The
@@ -455,6 +455,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     > = None;
     // Canvas-mode press point: released without moving = plain canvas click.
     let mut pan_start: Option<crate::canvas::Vec2> = None;
+    // True once the current pan actually moved the canvas: an
+    // out-and-back drag ends where it started, but it is still a
+    // drag — releasing it must not count as a plain click (which
+    // would quit Canvas mode out from under the user).
+    let mut pan_moved = false;
 
     // calloop loop just for the XWayland source; polled every frame.
     let mut event_loop: EventLoop<()> =
@@ -1272,6 +1277,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 if let Some(last) = panning {
                     let dx = pointer.x - last.x;
                     let dy = pointer.y - last.y;
+                    if dx != 0.0 || dy != 0.0 {
+                        pan_moved = true;
+                    }
                     session.pan_canvas(crate::canvas::Vec2::new(dx, dy));
                     panning = Some(pointer);
                     need_render = true;
@@ -1491,14 +1499,24 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             None => {
                                 pan_start = Some(pointer);
                                 panning = Some(pointer);
+                                pan_moved = false;
+                                log::info!(
+                                    "canvas pan start at ({:.0}, {:.0})",
+                                    pointer.x,
+                                    pointer.y
+                                );
                             }
                         }
                     } else if !pressed && left {
                         grab = None;
                         panning = None;
                         // Press + release without moving = plain canvas click.
+                        // (pan_moved, not the endpoints, decides: an
+                        // out-and-back drag ends where it started.)
                         if let Some(start) = pan_start.take() {
-                            if drag_offset(start, pointer).is_none() {
+                            let moved = pan_moved;
+                            pan_moved = false;
+                            if !moved && drag_offset(start, pointer).is_none() {
                                 let action = session.on_event(
                                     SuperEvent::CanvasClick,
                                     &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
@@ -1684,6 +1702,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         grab = None;
                         panning = None;
                         pan_start = None;
+                        pan_moved = false;
                         r_scale = None;
                         held_mods.clear();
                         super_held = false;
@@ -1883,17 +1902,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     crate::marbles::lod_for((dx * dx + dy * dy).sqrt(), span)
                         != crate::marbles::Lod::Cull
                 });
-                let slide = crate::canvas::Vec2::new(
-                    session.camera.vel.x - canvas_vel.x,
-                    session.camera.vel.y - canvas_vel.y,
+                // Yank = conditioned shake: the box shoved under the
+                // marbles. Raw view velocity is a finite difference over
+                // a jittery frame clock — differentiating it raw reads
+                // every hitch as a yank and the balls shiver. Shake
+                // smooths twice and deadbands the tremor; only a real
+                // shove reaches the engine.
+                let slide_accel = shake.push(
+                    dt_c,
+                    crate::canvas::Vec2::new(
+                        session.camera.vel.x - canvas_vel.x,
+                        session.camera.vel.y - canvas_vel.y,
+                    ),
                 );
-                // Yank = slide acceleration: the box shoved under the
-                // marbles. Stuck ones only break loose past BREAK_A.
-                let slide_accel = crate::canvas::Vec2::new(
-                    (slide.x - prev_slide.x) / dt_c,
-                    (slide.y - prev_slide.y) / dt_c,
-                );
-                prev_slide = slide;
                 for c in marbles.iter_mut() {
                     let dx = if c.pos.x < rx0 {
                         rx0 - c.pos.x
@@ -1931,6 +1952,22 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     .wrapping_add(0xB00B1E5);
                 if crate::marbles::collide_marbles(&mut marbles, &mut chaos) {
                     need_render = true;
+                }
+                if std::env::var("CANVAS_SHAKE_DEBUG").is_ok() && frame_no % 30 == 0
+                {
+                    let mut all = String::new();
+                    for m in marbles.iter() {
+                        all.push_str(&format!("({:.0},{:.0})", m.pos.x, m.pos.y));
+                    }
+                    log::info!(
+                        "shake dbg off=({:.0},{:.0}) acc=({:.0},{:.0}) n={} pos={}",
+                        session.canvas.offset.x,
+                        session.canvas.offset.y,
+                        slide_accel.x,
+                        slide_accel.y,
+                        marbles.len(),
+                        all
+                    );
                 }
             }
         }

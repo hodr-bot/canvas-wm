@@ -97,6 +97,18 @@ const SUBSTEP_FACE: f64 = 0.35;
 const SUBSTEP_MAX: usize = 10;
 /// Motif drift range (units of r): wraps, so the design flows forever.
 const FLOW_MAX: f64 = 0.35;
+/// Shake conditioning: raw view velocity is a finite difference over a
+/// jittery frame clock (software GL swings 30..100 ms), so its raw
+/// derivative explodes on every hitch — a smooth pan would randomly
+/// read as a yank. Two exponential smoothers (velocity, then
+/// acceleration) plus a deadband: hand tremor and frame noise die,
+/// a real shove passes through with its shape intact.
+const SHAKE_VEL_TAU: f64 = 0.045;
+const SHAKE_ACC_TAU: f64 = 0.055;
+/// Filtered shake below this reads as zero (hand tremor, quanta).
+const SHAKE_DEAD: f64 = 130.0;
+/// Full strength past this; linear ramp between the two.
+const SHAKE_FULL: f64 = 420.0;
 
 /// Glass tints (linear-ish 0..1 RGB): jewel tones, one per marble.
 const TINTS: [[f64; 3]; 6] = [
@@ -229,6 +241,65 @@ fn wrap_flow(v: f64) -> f64 {
         u += w;
     }
     u - FLOW_MAX
+}
+
+/// Input conditioner for the engine: turns the raw per-frame view
+/// velocity (finite difference over a jittery clock) into a clean
+/// shake acceleration. Feed it every frame, even at rest — the
+/// smoothers need the quiet to settle.
+///
+/// Pipeline: EMA the velocity (kills frame-time quanta), derive,
+/// EMA the acceleration (kills single-frame spikes), deadband the
+/// tremor. A real shove survives with its shape; noise reads zero.
+pub struct Shake {
+    vel: Vec2,
+    prev: Vec2,
+    acc: Vec2,
+    live: bool,
+}
+
+impl Shake {
+    pub fn new() -> Self {
+        Shake {
+            vel: Vec2::new(0.0, 0.0),
+            prev: Vec2::new(0.0, 0.0),
+            acc: Vec2::new(0.0, 0.0),
+            live: false,
+        }
+    }
+
+    pub fn push(&mut self, dt: f64, raw_vel: Vec2) -> Vec2 {
+        let dt = dt.clamp(1e-4, 0.1);
+        if !self.live {
+            self.vel = raw_vel;
+            self.prev = raw_vel;
+            self.live = true;
+            return Vec2::new(0.0, 0.0);
+        }
+        let av = 1.0 - (-dt / SHAKE_VEL_TAU).exp();
+        self.prev = self.vel;
+        self.vel.x += (raw_vel.x - self.vel.x) * av;
+        self.vel.y += (raw_vel.y - self.vel.y) * av;
+        // Instantaneous accel from the smoother's own motion, then a
+        // second EMA to kill single-frame spikes.
+        let inst = Vec2::new(
+            (self.vel.x - self.prev.x) / dt,
+            (self.vel.y - self.prev.y) / dt,
+        );
+        let aa = 1.0 - (-dt / SHAKE_ACC_TAU).exp();
+        self.acc.x += (inst.x - self.acc.x) * aa;
+        self.acc.y += (inst.y - self.acc.y) * aa;
+        deadband(self.acc)
+    }
+}
+
+fn deadband(a: Vec2) -> Vec2 {
+    let m = (a.x * a.x + a.y * a.y).sqrt();
+    if m <= SHAKE_DEAD || m == 0.0 {
+        return Vec2::new(0.0, 0.0);
+    }
+    let k = ((m - SHAKE_DEAD) / (SHAKE_FULL - SHAKE_DEAD)).min(1.0);
+    Vec2::new(a.x * k, a.y * k)
 }
 
 impl Marble {
@@ -621,6 +692,51 @@ mod tests {
         let z = Vec2::new(0.0, 0.0);
         for _ in 0..n {
             m.step(0.016, z, walls);
+        }
+    }
+
+    #[test]
+    fn shake_kills_frame_noise_but_passes_a_shove() {
+        // A smooth pan read through a jittery clock: gentle sway and
+        // event quanta around 600 px/s, dt swinging 30..100 ms. The
+        // conditioner must never report a yank (static friction
+        // holds at 1430).
+        let mut s = Shake::new();
+        let mut peak: f64 = 0.0;
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (u64::MAX >> 11) as f64
+        };
+        let mut t = 0.0;
+        for _ in 0..200 {
+            let dt = 0.03 + 0.07 * rnd();
+            t += dt;
+            let v = 600.0
+                * (1.0
+                    + 0.08 * (6.2831 * 1.3 * t).sin()
+                    + 0.03 * (rnd() - 0.5) * 2.0);
+            let a = s.push(dt, Vec2::new(v, 0.0));
+            peak = peak.max((a.x * a.x + a.y * a.y).sqrt());
+        }
+        assert!(peak < MU_S * GRAV, "noise leaked through, peak={peak}");
+        // A real shove: 0 -> 2000 px/s in a quarter second. Must pass
+        // at yank strength so the box breaks the balls loose.
+        let mut s = Shake::new();
+        let mut peak: f64 = 0.0;
+        for i in 0..30 {
+            let v = 2000.0 * i as f64 / 29.0;
+            let a = s.push(1.0 / 120.0, Vec2::new(v, 0.0));
+            peak = peak.max((a.x * a.x + a.y * a.y).sqrt());
+        }
+        assert!(peak > MU_S * GRAV, "shove died in the filter, peak={peak}");
+        // Dead still reads zero.
+        let mut s = Shake::new();
+        for _ in 0..30 {
+            let a = s.push(0.016, Vec2::new(12.0, -7.0));
+            assert!((a.x * a.x + a.y * a.y).sqrt() == 0.0);
         }
     }
 
