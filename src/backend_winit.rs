@@ -1902,19 +1902,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     crate::marbles::lod_for((dx * dx + dy * dy).sqrt(), span)
                         != crate::marbles::Lod::Cull
                 });
-                // Yank = conditioned shake: the box shoved under the
-                // marbles. Raw view velocity is a finite difference over
-                // a jittery frame clock — differentiating it raw reads
-                // every hitch as a yank and the balls shiver. Shake
-                // smooths twice and deadbands the tremor; only a real
-                // shove reaches the engine.
-                let slide_accel = shake.push(
-                    dt_c,
-                    crate::canvas::Vec2::new(
-                        session.camera.vel.x - canvas_vel.x,
-                        session.camera.vel.y - canvas_vel.y,
-                    ),
-                );
+                // Yank = conditioned box acceleration: the box shoved
+                // from under the marbles. Feed the box's own velocity
+                // (the offset finite difference); Shake differentiates
+                // it into acceleration. NOTE: never camera.vel here —
+                // the camera lags the canvas, so camera-minus-canvas
+                // reads BACKWARDS during a yank and the balls get
+                // pushed along with the box (inverted feel).
+                let slide_accel = shake.push(dt_c, canvas_vel);
                 for c in marbles.iter_mut() {
                     let dx = if c.pos.x < rx0 {
                         rx0 - c.pos.x
