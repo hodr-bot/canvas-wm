@@ -74,11 +74,14 @@ const BOUNCE_KEEP: f64 = 0.82;
 /// scatters a little, never straight up-down.
 const KICK_K: f64 = 0.06;
 /// Static friction coefficient (glued to the box below MU_S * GRAV of
-/// shake); kinetic while sliding.
-const MU_S: f64 = 0.55;
-const MU_K: f64 = 0.38;
-/// Rolling resistance on contact (/s exponential).
-const ROLL: f64 = 1.7;
+/// shake); kinetic while sliding. Loose on purpose: a small shove
+/// breaks the balls free and they waltz — a yanked box slides from
+/// under them instead of dragging them along.
+const MU_S: f64 = 0.10;
+const MU_K: f64 = 0.05;
+/// Rolling resistance on contact (/s exponential): gentle, the waltz
+/// lasts seconds and dies soft.
+const ROLL: f64 = 0.30;
 /// Window-wall restitution: wooden-box bonk.
 const E_WALL: f64 = 0.45;
 /// Window-wall tangential kept through a bonk.
@@ -106,9 +109,12 @@ const FLOW_MAX: f64 = 0.35;
 const SHAKE_VEL_TAU: f64 = 0.045;
 const SHAKE_ACC_TAU: f64 = 0.055;
 /// Filtered shake below this reads as zero (hand tremor, quanta).
-const SHAKE_DEAD: f64 = 130.0;
+/// Low on purpose: even a small intentional move must reach the
+/// balls — the double EMA already ate the clock jitter. High
+/// enough that a stray 1px event quantum at idle reads zero.
+const SHAKE_DEAD: f64 = 100.0;
 /// Full strength past this; linear ramp between the two.
-const SHAKE_FULL: f64 = 420.0;
+const SHAKE_FULL: f64 = 300.0;
 
 /// Glass tints (linear-ish 0..1 RGB): jewel tones, one per marble.
 const TINTS: [[f64; 3]; 6] = [
@@ -696,13 +702,12 @@ mod tests {
     }
 
     #[test]
-    fn shake_kills_frame_noise_but_passes_a_shove() {
-        // A smooth pan read through a jittery clock: gentle sway and
-        // event quanta around 600 px/s, dt swinging 30..100 ms. The
-        // conditioner must never report a yank (static friction
-        // holds at 1430).
+    fn shake_kills_idle_noise_but_passes_a_gentle_pan() {
+        // Idle box read through a jittery clock: the input here is
+        // already-smooth simulated velocity (camera.vel), so idle is
+        // a ~px/s drift, not event quanta. The conditioner must
+        // report exactly zero — drift never reaches the balls.
         let mut s = Shake::new();
-        let mut peak: f64 = 0.0;
         let mut seed = 0x1234_5678_9ABC_DEF1u64;
         let mut rnd = move || {
             seed ^= seed << 13;
@@ -710,6 +715,21 @@ mod tests {
             seed ^= seed << 17;
             (seed >> 11) as f64 / (u64::MAX >> 11) as f64
         };
+        let mut peak: f64 = 0.0;
+        let mut t = 0.0;
+        for _ in 0..200 {
+            let dt = 0.03 + 0.07 * rnd();
+            t += dt;
+            let v = 3.0 * (6.2831 * 0.5 * t).sin();
+            let a = s.push(dt, Vec2::new(v, 0.0));
+            peak = peak.max((a.x * a.x + a.y * a.y).sqrt());
+        }
+        assert!(peak == 0.0, "idle drift leaked through, peak={peak}");
+        // A gentle pan (~600 px/s with hand wobble, jittery clock):
+        // Michel's spec says a small move must waltz the balls, so
+        // this must arrive at yank strength, not die in the filter.
+        let mut s = Shake::new();
+        let mut peak: f64 = 0.0;
         let mut t = 0.0;
         for _ in 0..200 {
             let dt = 0.03 + 0.07 * rnd();
@@ -721,17 +741,7 @@ mod tests {
             let a = s.push(dt, Vec2::new(v, 0.0));
             peak = peak.max((a.x * a.x + a.y * a.y).sqrt());
         }
-        assert!(peak < MU_S * GRAV, "noise leaked through, peak={peak}");
-        // A real shove: 0 -> 2000 px/s in a quarter second. Must pass
-        // at yank strength so the box breaks the balls loose.
-        let mut s = Shake::new();
-        let mut peak: f64 = 0.0;
-        for i in 0..30 {
-            let v = 2000.0 * i as f64 / 29.0;
-            let a = s.push(1.0 / 120.0, Vec2::new(v, 0.0));
-            peak = peak.max((a.x * a.x + a.y * a.y).sqrt());
-        }
-        assert!(peak > MU_S * GRAV, "shove died in the filter, peak={peak}");
+        assert!(peak > MU_S * GRAV, "gentle pan died in the filter, peak={peak}");
         // Dead still reads zero.
         let mut s = Shake::new();
         for _ in 0..30 {
@@ -852,9 +862,10 @@ mod tests {
     }
 
     #[test]
-    fn static_friction_glues_calm_balls() {
-        // A settled ball on a gently accelerated box does not move:
-        // navigation stays calm.
+    fn tremor_sleeps_but_a_small_shove_waltzes() {
+        // Tremor-scale shake never wakes a settled ball; a small but
+        // real shove breaks it loose and it waltzes (then settles —
+        // see yank test for the long glide).
         let z = Vec2::new(0.0, 0.0);
         let mut m = spawn(50.0, 50.0, 3);
         m.z = 0.0;
@@ -862,10 +873,15 @@ mod tests {
         m.vel = Vec2::new(0.0, 0.0);
         settle(&mut m, &[], 1.0);
         for _ in 0..62 {
-            m.step(0.016, Vec2::new(500.0, 0.0), &[]);
+            m.step(0.016, Vec2::new(100.0, 0.0), &[]);
         }
         let d = ((m.pos.x - 50.0).powi(2) + (m.pos.y - 50.0).powi(2)).sqrt();
-        assert!(d < 1.0, "calm box must carry the ball, d={d}");
+        assert!(d < 1.0, "tremor must not wake the ball, d={d}");
+        for _ in 0..62 {
+            m.step(0.016, Vec2::new(600.0, 0.0), &[]);
+        }
+        let d = ((m.pos.x - 50.0).powi(2) + (m.pos.y - 50.0).powi(2)).sqrt();
+        assert!(d > 5.0, "a small shove must waltz the ball, d={d}");
     }
 
     #[test]
