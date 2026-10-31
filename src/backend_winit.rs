@@ -1956,14 +1956,22 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 if std::env::var("CANVAS_SHAKE_DEBUG").is_ok() && frame_no % 30 == 0
                 {
                     let m0 = marbles.first().map(|m| (m.pos.x, m.pos.y)).unwrap_or((0.0, 0.0));
+                    let scr = session.to_screen(
+                        crate::canvas::Vec2::new(m0.0, m0.1),
+                        view,
+                    );
                     log::info!(
-                        "shake dbg off=({:.0},{:.0}) acc=({:.0},{:.0}) m0=({:.0},{:.0}) n={}",
+                        "shake dbg off=({:.0},{:.0}) cam=({:.0},{:.0}) acc=({:.0},{:.0}) m0=({:.0},{:.0}) scr=({:.0},{:.0}) n={}",
                         session.canvas.offset.x,
                         session.canvas.offset.y,
+                        session.camera.pos.x,
+                        session.camera.pos.y,
                         slide_accel.x,
                         slide_accel.y,
                         m0.0,
                         m0.1,
+                        scr.x,
+                        scr.y,
                         marbles.len()
                     );
                 }
