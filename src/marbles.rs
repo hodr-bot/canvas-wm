@@ -73,15 +73,25 @@ const BOUNCE_KEEP: f64 = 0.82;
 /// Sideways kick on landing, fraction of impact speed: every bounce
 /// scatters a little, never straight up-down.
 const KICK_K: f64 = 0.06;
-/// Static friction coefficient (glued to the box below MU_S * GRAV of
-/// shake); kinetic while sliding. Loose on purpose: a small shove
-/// breaks the balls free and they waltz — a yanked box slides from
-/// under them instead of dragging them along.
-const MU_S: f64 = 0.10;
-const MU_K: f64 = 0.05;
-/// Rolling resistance on contact (/s exponential): gentle, the waltz
-/// lasts seconds and dies soft.
+/// Static friction cap (grip while rolling without slipping);
+/// kinetic cap while truly sliding.
+const MU_S: f64 = 0.45;
+const MU_K: f64 = 0.08;
+/// Rolling resistance, Coulomb part (fraction of G): a rolling ball
+/// loses this much surface speed per second even with no slip —
+/// micro-slip at the contact. Drops settle in ~2s, waltzes glide
+/// ~10s. Together with ROLL (viscous tail) it dies soft, not dead.
+const ROLL_C: f64 = 0.02;
+/// Rolling resistance, viscous part (/s exponential): the soft tail.
 const ROLL: f64 = 0.30;
+/// Grip stiffness (/s): how fast surface slip relaxes into shared
+/// roll. Applied as an unconditionally stable exponential blend.
+/// Solid-sphere spin gains ~2x the center's loss.
+const GRIP: f64 = 25.0;
+const SPIN_GAIN: f64 = 2.0;
+/// Slip below this reads as rolling (static cap), above as sliding
+/// (kinetic cap).
+const SLIP_STATIC: f64 = 20.0;
 /// Window-wall restitution: wooden-box bonk.
 const E_WALL: f64 = 0.45;
 /// Window-wall tangential kept through a bonk.
@@ -141,6 +151,10 @@ const INKS: [[f64; 3]; 7] = [
 pub struct Marble {
     pub pos: Vec2,
     pub vel: Vec2,
+    /// Rolling spin as canvas-frame surface speed: grip feeds slip
+    /// into this instead of freezing dead, so a carried ball keeps
+    /// rolling (the waltz) after the box stops.
+    pub rs: Vec2,
     pub z: f64,
     pub vz: f64,
     pub r: f64,
@@ -196,6 +210,7 @@ pub fn spawn(x: f64, y: f64, seed: u64) -> Marble {
         pos: Vec2::new(x, y),
         z: 170.0 + 130.0 * rnd(),
         vel: Vec2::new((rnd() - 0.5) * 280.0, (rnd() - 0.5) * 280.0),
+        rs: Vec2::new(0.0, 0.0),
         vz: 0.0,
         r,
         mass: RHO * r * r * r,
@@ -394,13 +409,18 @@ impl Marble {
         }
         self.rot[2] += 0.25 * dt;
 
-        // --- sleep: slow ball on a calm box stops dead (static
-        // friction owns it again) instead of creeping forever.
+        // --- sleep: a ball rolling slow on a calm box stops dead
+        // (grip owns it again) instead of creeping forever. Both
+        // center and spin freeze, or stored spin would wake it.
         let amag = (shake.x * shake.x + shake.y * shake.y).sqrt();
         let support = support_height(self.pos.x, self.pos.y, walls);
         let contact = self.z <= support + 0.5 && self.vz == 0.0;
-        if contact && speed < SLEEP_V && amag < MU_S * GRAV {
+        let slip =
+            ((self.vel.x - self.rs.x).powi(2) + (self.vel.y - self.rs.y).powi(2))
+                .sqrt();
+        if contact && speed < SLEEP_V && slip < 3.0 && amag < MU_S * GRAV {
             self.vel = Vec2::new(0.0, 0.0);
+            self.rs = Vec2::new(0.0, 0.0);
         }
 
         !contact || speed > 0.5 || self.vz != 0.0
@@ -419,25 +439,53 @@ impl Marble {
         self.vel.x -= shake.x * h;
         self.vel.y -= shake.y * h;
 
-        // --- friction, only in contact: static glues slow balls to a
-        // calm box, kinetic + rolling bleed the sliders.
+        // --- friction, only in contact: grip turns slip into shared
+        // roll (the ball spins up instead of sticking dead), caps
+        // decide static vs kinetic, rolling resistance bleeds both
+        // together — slowly, so the waltz lasts.
         let support = support_height(self.pos.x, self.pos.y, walls);
         let contact = self.z <= support + 0.5 && self.vz <= 0.0;
         if contact {
-            let sp =
-                (self.vel.x * self.vel.x + self.vel.y * self.vel.y).sqrt();
-            let amag = (shake.x * shake.x + shake.y * shake.y).sqrt();
-            if sp < SLEEP_V && amag < MU_S * GRAV {
-                // Static friction wins: rides the box exactly.
-                self.vel = Vec2::new(0.0, 0.0);
-            } else if sp > 1e-9 {
-                // Coulomb, opposing the slide, then rolling.
-                let dv = MU_K * GRAV * h;
-                let keep = if sp <= dv { 0.0 } else { (sp - dv) / sp };
-                let roll = (-ROLL * h).exp();
-                self.vel.x *= keep * roll;
-                self.vel.y *= keep * roll;
+            let sx = self.vel.x - self.rs.x;
+            let sy = self.vel.y - self.rs.y;
+            let slip = (sx * sx + sy * sy).sqrt();
+            let cap = if slip < SLIP_STATIC { MU_S } else { MU_K } * GRAV;
+            // Exponential meet-in-the-middle: vel gives, spin takes
+            // SPIN_GAIN x. Capped so a yank still breaks loose.
+            let k = 1.0 - (-GRIP * h).exp();
+            let share = k / (1.0 + SPIN_GAIN);
+            let mut dvx = sx * share;
+            let mut dvy = sy * share;
+            let dm = (dvx * dvx + dvy * dvy).sqrt();
+            let max_dv = cap * h;
+            if dm > max_dv && dm > 1e-12 {
+                dvx *= max_dv / dm;
+                dvy *= max_dv / dm;
             }
+            self.vel.x -= dvx;
+            self.vel.y -= dvy;
+            self.rs.x += dvx * SPIN_GAIN;
+            self.rs.y += dvy * SPIN_GAIN;
+            // Rolling resistance: Coulomb on the shared roll (both
+            // center and spin lose together, rolling on), then the
+            // viscous tail. Slow enough to waltz, sure enough to
+            // settle a sky-drop in a couple of seconds.
+            let wob = ((self.vel.x + self.rs.x).powi(2)
+                + (self.vel.y + self.rs.y).powi(2))
+            .sqrt();
+            if wob > 1e-9 {
+                let dv = (ROLL_C * GRAV * h).min(wob);
+                let k = (wob - dv) / wob;
+                self.vel.x *= k;
+                self.vel.y *= k;
+                self.rs.x *= k;
+                self.rs.y *= k;
+            }
+            let roll = (-ROLL * h).exp();
+            self.vel.x *= roll;
+            self.vel.y *= roll;
+            self.rs.x *= roll;
+            self.rs.y *= roll;
         }
 
         // --- integrate.
@@ -726,8 +774,10 @@ mod tests {
         }
         assert!(peak == 0.0, "idle drift leaked through, peak={peak}");
         // A gentle pan (~600 px/s with hand wobble, jittery clock):
-        // Michel's spec says a small move must waltz the balls, so
-        // this must arrive at yank strength, not die in the filter.
+        // Michel's spec says a small move CARRIES the balls (grip,
+        // then a soft glide) — it must NOT arrive as a yank. Only a
+        // real shove breaks loose (covered at engine level by the
+        // yank test).
         let mut s = Shake::new();
         let mut peak: f64 = 0.0;
         let mut t = 0.0;
@@ -741,7 +791,7 @@ mod tests {
             let a = s.push(dt, Vec2::new(v, 0.0));
             peak = peak.max((a.x * a.x + a.y * a.y).sqrt());
         }
-        assert!(peak > MU_S * GRAV, "gentle pan died in the filter, peak={peak}");
+        assert!(peak < MU_S * GRAV, "gentle pan must not yank, peak={peak}");
         // Dead still reads zero.
         let mut s = Shake::new();
         for _ in 0..30 {
@@ -864,8 +914,8 @@ mod tests {
     #[test]
     fn tremor_sleeps_but_a_small_shove_waltzes() {
         // Tremor-scale shake never wakes a settled ball; a small but
-        // real shove breaks it loose and it waltzes (then settles —
-        // see yank test for the long glide).
+        // real shove carries it (static grip) and it glides soft
+        // after the box stops — see yank test for the long waltz.
         let z = Vec2::new(0.0, 0.0);
         let mut m = spawn(50.0, 50.0, 3);
         m.z = 0.0;
@@ -876,7 +926,7 @@ mod tests {
             m.step(0.016, Vec2::new(100.0, 0.0), &[]);
         }
         let d = ((m.pos.x - 50.0).powi(2) + (m.pos.y - 50.0).powi(2)).sqrt();
-        assert!(d < 1.0, "tremor must not wake the ball, d={d}");
+        assert!(d < 3.0, "tremor must not wake the ball, d={d}");
         for _ in 0..62 {
             m.step(0.016, Vec2::new(600.0, 0.0), &[]);
         }
