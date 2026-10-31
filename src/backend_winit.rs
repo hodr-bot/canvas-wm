@@ -411,7 +411,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Frame counter: phases the far-marble LOD steps.
     let mut frame_no: u64 = 0;
     let mut prev_canvas_offset = session.canvas.offset;
-    let mut prev_slide = crate::canvas::Vec2::new(0.0, 0.0);
+    let mut shake = crate::marbles::Shake::new();
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): the live gesture (id, pinned
     // centre, grab state, smoothing spring) + the scale clock. The
@@ -1883,17 +1883,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     crate::marbles::lod_for((dx * dx + dy * dy).sqrt(), span)
                         != crate::marbles::Lod::Cull
                 });
-                let slide = crate::canvas::Vec2::new(
-                    session.camera.vel.x - canvas_vel.x,
-                    session.camera.vel.y - canvas_vel.y,
+                // Yank = conditioned shake: the box shoved under the
+                // marbles. Raw view velocity is a finite difference over
+                // a jittery frame clock — differentiating it raw reads
+                // every hitch as a yank and the balls shiver. Shake
+                // smooths twice and deadbands the tremor; only a real
+                // shove reaches the engine.
+                let slide_accel = shake.push(
+                    dt_c,
+                    crate::canvas::Vec2::new(
+                        session.camera.vel.x - canvas_vel.x,
+                        session.camera.vel.y - canvas_vel.y,
+                    ),
                 );
-                // Yank = slide acceleration: the box shoved under the
-                // marbles. Stuck ones only break loose past BREAK_A.
-                let slide_accel = crate::canvas::Vec2::new(
-                    (slide.x - prev_slide.x) / dt_c,
-                    (slide.y - prev_slide.y) / dt_c,
-                );
-                prev_slide = slide;
                 for c in marbles.iter_mut() {
                     let dx = if c.pos.x < rx0 {
                         rx0 - c.pos.x
