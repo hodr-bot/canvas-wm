@@ -215,6 +215,61 @@ fn client_buffer_size(buffer: &WlBuffer) -> Option<(i32, i32)> {
     }
 }
 
+/// Tell every mapped client its frame was presented (`frame.done`), and
+/// retry pending output enters. Runs on EVERY pump iteration, not just
+/// rendered frames: paced clients (Qt, animations) stall forever after
+/// their first buffer if `done` only fires when the compositor repaints.
+fn flush_client_frames(server: &mut Server, server_state: &mut ServerState, now_ms: u32) {
+    let surfaces: Vec<WlSurface> = server_state
+        .windows
+        .values()
+        .filter_map(|cw| cw.surface.clone())
+        .chain(server_state.popups.values().filter_map(|p| p.surface.clone()))
+        .collect();
+    for surface in &surfaces {
+        if server_state.is_enter_sent(surface) {
+            continue;
+        }
+        if server.enter_output(surface) > 0 {
+            server_state.claim_output_enter(surface);
+        }
+    }
+    for cw in server_state.windows.values() {
+        if let Some(surface) = cw.surface.as_ref() {
+            let pending = with_states(surface, |states| {
+                std::mem::take(
+                    &mut states
+                        .cached_state
+                        .current::<SurfaceAttributes>()
+                        .frame_callbacks,
+                )
+            });
+            if let Ok(callbacks) = pending {
+                for callback in callbacks {
+                    callback.done(now_ms);
+                }
+            }
+        }
+    }
+    for popup in server_state.popups.values() {
+        if let Some(surface) = popup.surface.as_ref() {
+            let pending = with_states(surface, |states| {
+                std::mem::take(
+                    &mut states
+                        .cached_state
+                        .current::<SurfaceAttributes>()
+                        .frame_callbacks,
+                )
+            });
+            if let Ok(callbacks) = pending {
+                for callback in callbacks {
+                    callback.done(now_ms);
+                }
+            }
+        }
+    }
+}
+
 /// A dmabuf whose modifier is Invalid carries no layout: importing it
 /// "succeeds" but poisons our GL context a few frames later (radeonsi on
 /// nested X11 EGL). Xwayland with broken glamor sends exactly these.
@@ -3495,61 +3550,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 }
                 last_chrome = chrome_now;
             })?;
-            // Frame callbacks: tell clients this frame was presented, so
-            // paced clients (Xwayland damage throttling, animations) keep
-            // committing instead of stalling after their first buffer.
-            // Output enter retries until a bound wl_output gets it: the
-            // first frame can land before the client binds the output,
-            // and Qt waits for enter before painting anything.
+            // Frame callbacks + enter retries (every pump, not just
+            // rendered frames — see flush_client_frames).
             let now_ms = frame_clock.elapsed().as_millis() as u32;
-            let surfaces: Vec<WlSurface> = server_state
-                .windows
-                .values()
-                .filter_map(|cw| cw.surface.clone())
-                .chain(server_state.popups.values().filter_map(|p| p.surface.clone()))
-                .collect();
-            for surface in &surfaces {
-                if server_state.is_enter_sent(surface) {
-                    continue;
-                }
-                if server.enter_output(surface) > 0 {
-                    server_state.claim_output_enter(surface);
-                }
-            }
-            for cw in server_state.windows.values() {
-                if let Some(surface) = cw.surface.as_ref() {
-                    let pending = with_states(surface, |states| {
-                        std::mem::take(
-                            &mut states
-                                .cached_state
-                                .current::<SurfaceAttributes>()
-                                .frame_callbacks,
-                        )
-                    });
-                    if let Ok(callbacks) = pending {
-                        for callback in callbacks {
-                            callback.done(now_ms);
-                        }
-                    }
-                }
-            }
-            for popup in server_state.popups.values() {
-                if let Some(surface) = popup.surface.as_ref() {
-                    let pending = with_states(surface, |states| {
-                        std::mem::take(
-                            &mut states
-                                .cached_state
-                                .current::<SurfaceAttributes>()
-                                .frame_callbacks,
-                        )
-                    });
-                    if let Ok(callbacks) = pending {
-                        for callback in callbacks {
-                            callback.done(now_ms);
-                        }
-                    }
-                }
-            }
+            flush_client_frames(&mut server, &mut server_state, now_ms);
             frames += 1;
             note_frame_presented(frames);
             if let Some(max) = max_frames {
@@ -3558,6 +3562,14 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     break;
                 }
             }
+        }
+        // Frame callbacks even when nothing rendered: a static client
+        // (no damage, no input, no anim) would otherwise never get its
+        // next `done` and freeze after its first buffer. Cheap: only
+        // fires when a client actually waits for one.
+        {
+            let now_ms = frame_clock.elapsed().as_millis() as u32;
+            flush_client_frames(&mut server, &mut server_state, now_ms);
         }
         // Frame pump: winit run_return sleeps without OS events, so
         // without this every glide/fade/flow advances only on incoming
