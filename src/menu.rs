@@ -902,6 +902,40 @@ pub fn item_at(layout: &Layout, px: f64, py: f64) -> Option<usize> {
     None
 }
 
+/// Right-click action menu rows (Canvas mode): move, resize, close.
+/// French labels per the house style of the options menu.
+pub const ACTION_ROWS: [&str; 3] = ["Déplacer", "Redimensionner", "Fermer"];
+pub const ACTION_MOVE: usize = 0;
+pub const ACTION_SCALE: usize = 1;
+pub const ACTION_CLOSE: usize = 2;
+/// Action menu panel width in screen px (compact popup, not a sheet).
+pub const ACTION_PANEL_W: f64 = 220.0;
+pub const ACTION_PANEL_PAD: f64 = 8.0;
+
+/// Which action row (if any) sits at screen point (px, py) for a menu
+/// anchored at (ax, ay). Rows stack under a pad, same ROW_H as the
+/// options menu. Pure function.
+pub fn action_row_at(ax: f64, ay: f64, px: f64, py: f64) -> Option<usize> {
+    if px < ax || px > ax + ACTION_PANEL_W {
+        return None;
+    }
+    let rel = py - ay - ACTION_PANEL_PAD;
+    if rel < 0.0 {
+        return None;
+    }
+    let row = (rel / ROW_H) as usize;
+    if row < ACTION_ROWS.len() {
+        Some(row)
+    } else {
+        None
+    }
+}
+
+/// Action menu panel height in screen px.
+pub fn action_panel_h() -> f64 {
+    ACTION_ROWS.len() as f64 * ROW_H + ACTION_PANEL_PAD * 2.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,5 +1192,18 @@ mod tests {
         assert_eq!(item_at(&l, l.x + 10.0, row_y(11)), Some(10));
         assert_eq!(item_at(&l, l.x + 10.0, row_y(12)), None); // foot
         assert_eq!(item_at(&l, l.x - 5.0, row_y(1)), None);
+    }
+
+    #[test]
+    fn action_rows_hit_each_label_and_miss_outside() {
+        let (ax, ay) = (100.0, 200.0);
+        let row_y = |r: usize| ay + ACTION_PANEL_PAD + r as f64 * ROW_H + 4.0;
+        assert_eq!(action_row_at(ax, ay, ax + 10.0, row_y(0)), Some(ACTION_MOVE));
+        assert_eq!(action_row_at(ax, ay, ax + 10.0, row_y(1)), Some(ACTION_SCALE));
+        assert_eq!(action_row_at(ax, ay, ax + 10.0, row_y(2)), Some(ACTION_CLOSE));
+        assert_eq!(action_row_at(ax, ay, ax + 10.0, row_y(3)), None);
+        assert_eq!(action_row_at(ax, ay, ax - 5.0, row_y(0)), None);
+        assert_eq!(action_row_at(ax, ay, ax + 10.0, ay + 2.0), None);
+        assert_eq!(action_panel_h(), 3.0 * ROW_H + ACTION_PANEL_PAD * 2.0);
     }
 }

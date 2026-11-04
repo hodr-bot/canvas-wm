@@ -1492,10 +1492,100 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     if pressed && left {
                         let cw = session.to_canvas(pointer, view);
                         let hit = server_state.topmost_at(cw);
-                        if hit.is_none() && action_menu.open {
+                        // Right-click action menu owns the press while
+                        // open: a row hit acts on the target window
+                        // (move / resize / close), an outside press
+                        // closes it. Either way the menu is done; a row
+                        // action returns, an outside press falls through
+                        // to the pan below.
+                        if action_menu.open {
+                            if let Some(id) = action_menu.target {
+                                match crate::menu::action_row_at(
+                                    action_menu.anchor.x,
+                                    action_menu.anchor.y,
+                                    pointer.x,
+                                    pointer.y,
+                                ) {
+                                    Some(r) if r == crate::menu::ACTION_MOVE => {
+                                        e_grab = Some((id, cw));
+                                        server_state.raise(id);
+                                        session.overview.select(id);
+                                        focused_id = Some(id);
+                                        known_ids.insert(id);
+                                        log::info!("action move window {}", id);
+                                    }
+                                    Some(r) if r == crate::menu::ACTION_SCALE => {
+                                        server_state.raise(id);
+                                        session.overview.select(id);
+                                        focused_id = Some(id);
+                                        known_ids.insert(id);
+                                        if let Some(c) =
+                                            server_state.windows.get(&id)
+                                        {
+                                            let center = c.canvas.center();
+                                            let size0 = c.canvas.size;
+                                            let pushed = (
+                                                size0.x.round().max(0.0) as u32,
+                                                size0.y.round().max(0.0) as u32,
+                                            );
+                                            r_scale = Some(ScaleGesture {
+                                                id,
+                                                center,
+                                                size0,
+                                                grab: cw,
+                                                pushed,
+                                                pushed_at:
+                                                    std::time::Instant::now(),
+                                                target: size0,
+                                                spring:
+                                                    crate::chrome::ScaleSpring::new(
+                                                        size0,
+                                                    ),
+                                                live: true,
+                                            });
+                                            last_scale_step =
+                                                std::time::Instant::now();
+                                            log::info!(
+                                                "action scale window {}",
+                                                id
+                                            );
+                                        }
+                                    }
+                                    Some(r) if r == crate::menu::ACTION_CLOSE => {
+                                        log::info!("action close window {}", id);
+                                        if let Some(xid) =
+                                            server_state.close_window(id)
+                                        {
+                                            if let Some(wm) = xwm.as_ref() {
+                                                wm.kill(xid);
+                                            }
+                                        }
+                                        if focused_id == Some(id) {
+                                            focused_id = None;
+                                        }
+                                    }
+                                    _ => {
+                                        log::info!("action menu closed");
+                                    }
+                                }
+                            } else {
+                                log::info!("action menu closed");
+                            }
                             action_menu.open = false;
                             action_menu.target = None;
-                            log::info!("action menu closed");
+                            need_render = true;
+                            // Outside presses keep their pan (started
+                            // below); row actions skip it.
+                            if crate::menu::action_row_at(
+                                action_menu.anchor.x,
+                                action_menu.anchor.y,
+                                pointer.x,
+                                pointer.y,
+                            )
+                            .is_some()
+                            {
+                                return;
+                            }
                         }
                         pan_start = Some(pointer);
                         panning = Some(pointer);
@@ -3651,6 +3741,65 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 draw_menu_line(
                                     gl, tprog, &mvp, atlas_id, &mut font_cache, px0 + pad,
                                     fpy + slide_px + crate::menu::TEXT_DY as f32 * sc, sc, foot,
+                                );
+                            }
+                        });
+                    }
+                }
+                // Right-click action menu: compact popup at the press
+                // anchor — Déplacer / Redimensionner / Fermer. Same
+                // output-scale-only sizing as the options menu, drawn
+                // only while open.
+                if action_menu.open {
+                    if let (Some(tprog), Some(atlas), Some(rprog)) =
+                        (tex_prog, atlas_tex.as_ref(), round_prog)
+                    {
+                        let mvp2 =
+                            crate::render3d::ortho(view.x as f32, view.y as f32);
+                        let sc2 = scale as f32;
+                        let ax = action_menu.anchor.x as f32 * sc2;
+                        let ay = action_menu.anchor.y as f32 * sc2;
+                        let pw2 = crate::menu::ACTION_PANEL_W as f32 * sc2;
+                        let ph2 = crate::menu::action_panel_h() as f32 * sc2;
+                        let pad2 = crate::menu::ACTION_PANEL_PAD as f32 * sc2;
+                        let row_h2 = crate::menu::ROW_H as f32 * sc2;
+                        let atlas_id2 = atlas.tex_id();
+                        let _ = renderer.with_context(|_, gl| unsafe {
+                            crate::render3d::draw_rounded(
+                                gl,
+                                rprog,
+                                &mvp2,
+                                [0.10, 0.13, 0.22, 0.96],
+                                (ax, ay, pw2, ph2),
+                                10.0 * sc2,
+                            );
+                            crate::render3d::draw_rounded(
+                                gl,
+                                rprog,
+                                &mvp2,
+                                [0.55, 0.75, 1.0, 0.9],
+                                (
+                                    ax + 3.0 * sc2,
+                                    ay + 3.0 * sc2,
+                                    4.0 * sc2,
+                                    ph2 - 6.0 * sc2,
+                                ),
+                                2.0 * sc2,
+                            );
+                            for (ri, label) in
+                                crate::menu::ACTION_ROWS.iter().enumerate()
+                            {
+                                let rpy = ay + pad2 + ri as f32 * row_h2;
+                                draw_menu_line(
+                                    gl,
+                                    tprog,
+                                    &mvp2,
+                                    atlas_id2,
+                                    &mut font_cache,
+                                    ax + pad2 + 10.0 * sc2,
+                                    rpy + crate::menu::TEXT_DY as f32 * sc2,
+                                    sc2,
+                                    label,
                                 );
                             }
                         });
