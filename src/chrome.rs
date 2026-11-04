@@ -155,15 +155,32 @@ pub fn apply_axial_scale(
 
 /// Raw axial target size (the spring in the backend chases this every
 /// frame, so the rect glides instead of snapping).
-pub fn axial_target_size(center: Vec2, size0: Vec2, grab: Vec2, mouse: Vec2) -> Vec2 {
+/// Per-axis capped variant: width clamps to SCALE_MIN_W..min(SCALE_MAX_DIM, maxw),
+/// height to SCALE_MIN_H..min(SCALE_MAX_DIM, maxh). A cap below the
+/// minimum still floors at the minimum (upper is floored so clamp never
+/// sees min > max). Pure: unit-tested below.
+pub fn axial_target_size_capped(
+    center: Vec2,
+    size0: Vec2,
+    grab: Vec2,
+    mouse: Vec2,
+    maxw: f64,
+    maxh: f64,
+) -> Vec2 {
     let dx0 = (grab.x - center.x).abs().max(8.0);
     let dy0 = (grab.y - center.y).abs().max(8.0);
     let dx = (mouse.x - center.x).abs();
     let dy = (mouse.y - center.y).abs();
+    let cap_w = SCALE_MAX_DIM.min(maxw).max(SCALE_MIN_W);
+    let cap_h = SCALE_MAX_DIM.min(maxh).max(SCALE_MIN_H);
     Vec2::new(
-        (size0.x * dx / dx0).clamp(SCALE_MIN_W, SCALE_MAX_DIM),
-        (size0.y * dy / dy0).clamp(SCALE_MIN_H, SCALE_MAX_DIM),
+        (size0.x * dx / dx0).clamp(SCALE_MIN_W, cap_w),
+        (size0.y * dy / dy0).clamp(SCALE_MIN_H, cap_h),
     )
+}
+
+pub fn axial_target_size(center: Vec2, size0: Vec2, grab: Vec2, mouse: Vec2) -> Vec2 {
+    axial_target_size_capped(center, size0, grab, mouse, SCALE_MAX_DIM, SCALE_MAX_DIM)
 }
 
 /// Live-size spring: the R-scale rect chases the raw axial target on
@@ -336,6 +353,28 @@ mod tests {
         let (_, size) =
             apply_axial_scale(center, size0, grab, Vec2::new(360.0, 280.0));
         assert_eq!((size.x, size.y), (600.0, 300.0));
+    }
+
+    #[test]
+    fn axial_target_size_capped_clamps_to_per_axis_max() {
+        let center = Vec2::new(0.0, 0.0);
+        let size0 = Vec2::new(400.0, 300.0);
+        let grab = Vec2::new(40.0, 30.0);
+        // Far mouse: raw would be 4000x3000, capped to exactly 1280x800.
+        let size = axial_target_size_capped(center, size0, grab, Vec2::new(400.0, 300.0), 1280.0, 800.0);
+        assert_eq!((size.x, size.y), (1280.0, 800.0));
+    }
+
+    #[test]
+    fn axial_target_size_capped_below_minimum_floors_at_minimum() {
+        let center = Vec2::new(0.0, 0.0);
+        let size0 = Vec2::new(400.0, 300.0);
+        let grab = Vec2::new(40.0, 30.0);
+        // Max below the minimum: upper is floored so the size floors at the minimum.
+        let tiny = axial_target_size_capped(center, size0, grab, center, 10.0, 10.0);
+        assert_eq!((tiny.x, tiny.y), (SCALE_MIN_W, SCALE_MIN_H));
+        let huge = axial_target_size_capped(center, size0, grab, Vec2::new(4000.0, 3000.0), 10.0, 10.0);
+        assert_eq!((huge.x, huge.y), (SCALE_MIN_W, SCALE_MIN_H));
     }
 
     #[test]
