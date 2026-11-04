@@ -37,6 +37,30 @@ pub const TAB_FOND: usize = 0;
 pub const TAB_VAGUES: usize = 1;
 pub const TAB_SUPER: usize = 2;
 
+/// Precomputed per-tab row/item counts (perf: avoids building the
+/// `tab_items` Vec just to count rows in hot paths like
+/// `tab_item_count`, `layout`, `item_at`).
+/// Tabs currently hold only `Row::Item`, so row == item counts;
+/// kept as separate consts so a future `Foot` row inside a tab
+/// can diverge without touching hot-path code.
+pub const TAB_ROW_COUNTS: [usize; 3] = [11, 21, 2];
+pub const TAB_ITEM_COUNTS: [usize; 3] = [11, 21, 2];
+/// Shared feet rows (see `feet` / `FEET`).
+pub const FEET_COUNT: usize = 2;
+/// Display rows per tab: 1 tab bar + tab rows + feet.
+pub const TAB_DISPLAY_ROWS: [usize; 3] = [14, 24, 5];
+/// Panel height per tab in screen px (rows * ROW_H + PAD*2:
+/// 14*30+48=468, 24*30+48=768, 5*30+48=198). Inlined so this
+/// stays `const` regardless of declaration order below.
+pub const TAB_PANEL_H: [f64; 3] = [468.0, 768.0, 198.0];
+/// Shared feet strings (backing store for `feet()`; hot paths
+/// should borrow this / `feet_static()` instead of allocating a
+/// `Vec` per frame).
+pub const FEET: [&str; 2] = [
+    "canvas-wm 0.2.0",
+    "↑↓ : choisir, ←→ : régler, Tab : onglet, Entrée : changer, Echap : fermer",
+];
+
 /// A menu option. `Toggle` reads/flips a bool; `Choice` cycles one of
 /// three labelled levels; `Slider` steps a u8 in [min, max]; `Info`
 /// is static.
@@ -77,33 +101,72 @@ impl MenuItem {
     /// " : 15 #0F121A" for the red channel of an RGB triplet (the
     /// swatch row carries the hex preview of the whole colour).
     /// The backend draws `label + state_text`, no per-kind code there.
+    ///
+    /// Perf: `push_state_text` below is the allocation-free core;
+    /// this wrapper keeps the historical `String` API identical.
     pub fn state_text(&self, settings: &Settings) -> String {
+        let mut out = String::new();
+        self.push_state_text(settings, &mut out);
+        out
+    }
+
+    /// Append the value suffix into a reusable buffer (no per-row
+    /// allocation when the caller keeps one `String` per frame and
+    /// calls `out.clear()` before reuse). Output is byte-identical
+    /// to [`MenuItem::state_text`].
+    ///
+    /// Example per-frame reuse (backend hot path):
+    /// ```ignore
+    /// let mut line = String::with_capacity(64);
+    /// for row in rows {
+    ///     line.clear();
+    ///     line.push_str(item.label);
+    ///     item.push_state_text(&settings, &mut line);
+    ///     draw(&line);
+    /// }
+    /// ```
+    pub fn push_state_text(&self, settings: &Settings, out: &mut String) {
+        use std::fmt::Write as _;
         match &self.kind {
             MenuKind::Toggle { is_on, .. } => {
                 if is_on(settings) {
-                    " : Activé".to_string()
+                    out.push_str(" : Activé");
                 } else {
-                    " : Désactivé".to_string()
+                    out.push_str(" : Désactivé");
                 }
             }
             MenuKind::Choice { get, options, .. } => {
                 let last = options.len().saturating_sub(1);
-                format!(" : {}", options[get(settings).min(last)])
+                out.push_str(" : ");
+                out.push_str(options[get(settings).min(last)]);
             }
             MenuKind::Slider { get, unit, .. } => {
                 match self.swatch.map(|f| f(settings)) {
-                    Some(rgb) => format!(
-                        " : {} #{:02X}{:02X}{:02X}",
-                        get(settings),
-                        rgb[0],
-                        rgb[1],
-                        rgb[2]
-                    ),
-                    None => format!(" : {}{}", get(settings), unit),
+                    Some(rgb) => {
+                        let _ = write!(
+                            out,
+                            " : {} #{:02X}{:02X}{:02X}",
+                            get(settings),
+                            rgb[0],
+                            rgb[1],
+                            rgb[2]
+                        );
+                    }
+                    None => {
+                        let _ = write!(out, " : {}{}", get(settings), unit);
+                    }
                 }
             }
-            MenuKind::Info => String::new(),
+            MenuKind::Info => {}
         }
+    }
+
+    /// Append `label + state_text` into a reusable buffer (single
+    /// call for the backend row line; still zero allocation when
+    /// `out` has spare capacity).
+    pub fn push_line(&self, settings: &Settings, out: &mut String) {
+        out.push_str(self.label);
+        self.push_state_text(settings, out);
     }
 
     /// Slider fill fraction 0.0-1.0 for the track bar (None if not a slider).
@@ -575,19 +638,54 @@ pub fn tab_items(tab: usize) -> Vec<Row> {
 
 /// Feet shared by all tabs: version plus one single-line key hint
 /// (two rows total — the Vagues tab already fills small outputs).
+/// Perf: backed by the `FEET` const; this `Vec` wrapper is kept for
+/// API compatibility while hot paths borrow `FEET`/`feet_static()`
+/// with zero allocation.
 pub fn feet() -> Vec<&'static str> {
-    vec![
-        "canvas-wm 0.2.0",
-        "↑↓ : choisir, ←→ : régler, Tab : onglet, Entrée : changer, Echap : fermer",
-    ]
+    FEET.to_vec()
+}
+
+/// Zero-allocation access to the shared feet rows.
+pub fn feet_static() -> &'static [&'static str; FEET_COUNT] {
+    &FEET
+}
+
+/// Precomputed row count of a tab (no `tab_items` allocation).
+pub const fn tab_row_count(tab: usize) -> usize {
+    if tab < TAB_ROW_COUNTS.len() {
+        TAB_ROW_COUNTS[tab]
+    } else {
+        0
+    }
+}
+
+/// Precomputed display rows (1 tab bar + tab rows + feet).
+pub const fn tab_display_rows(tab: usize) -> usize {
+    if tab < TAB_DISPLAY_ROWS.len() {
+        TAB_DISPLAY_ROWS[tab]
+    } else {
+        1 + FEET_COUNT
+    }
+}
+
+/// Precomputed panel height in screen px.
+pub const fn tab_panel_h(tab: usize) -> f64 {
+    if tab < TAB_PANEL_H.len() {
+        TAB_PANEL_H[tab]
+    } else {
+        (1 + FEET_COUNT) as f64 * ROW_H + PANEL_PAD * 2.0
+    }
 }
 
 /// Number of selectable items in a tab.
+/// Perf: const lookup, no `tab_items` allocation (hot path for
+/// nav + hit-testing every frame).
 pub fn tab_item_count(tab: usize) -> usize {
-    tab_items(tab)
-        .iter()
-        .filter(|r| matches!(r, Row::Item(_)))
-        .count()
+    if tab < TAB_ITEM_COUNTS.len() {
+        TAB_ITEM_COUNTS[tab]
+    } else {
+        0
+    }
 }
 
 /// The selectable items of a tab in order.

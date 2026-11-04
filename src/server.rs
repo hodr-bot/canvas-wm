@@ -40,6 +40,33 @@ use crate::canvas::{CanvasWindow, Vec2};
 /// Default size for a fresh client window; the client configures itself after.
 pub const DEFAULT_SIZE: (f64, f64) = (800.0, 600.0);
 
+/// SHM formats every client can rely on. Kate/Alacritty negotiate these;
+/// dropping either wedges their first frame (opaque vs alpha mismatch).
+pub const SHM_FORMATS: [wl_shm::Format; 2] =
+    [wl_shm::Format::Argb8888, wl_shm::Format::Xrgb8888];
+
+/// Pure retry decision for output enter: retry until the claimed flag is set.
+/// The backend claims only after `enter_output` reports >= 1 target, so a
+/// first frame that lands before the client binds wl_output is retried on
+/// every pump instead of being dropped (Qt/Kate blank-window wedge).
+pub fn should_retry_output_enter(enter_claimed: bool) -> bool {
+    !enter_claimed
+}
+
+/// Pure claim decision for output enter: only a delivery that reached at
+/// least one bound wl_output counts. Zero targets means "client has not
+/// bound wl_output yet, retry later" — never consume the one-shot.
+pub fn should_claim_output_enter(delivered_targets: usize) -> bool {
+    delivered_targets > 0
+}
+
+/// Pure initial-configure decision: every new toplevel needs exactly one
+/// configure (v1 `send_configure` / v3 toplevel+surface configure).
+/// Kate/Alacritty wait for it before their first commit.
+pub fn should_send_initial_configure(configure_sent: bool) -> bool {
+    !configure_sent
+}
+
 /// Cascade placement on the canvas: window n sits one step down-right from
 /// the previous, wrapping every 8 so the pile stays near the origin.
 pub fn place_window(id: u64, n: usize) -> CanvasWindow {
