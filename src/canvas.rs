@@ -46,6 +46,15 @@ pub struct Camera {
     pub zoom_vel: f64,
     /// Where `zoom` is gliding to. Equals `zoom` at rest.
     pub zoom_target: f64,
+    /// Focal breathing (0..=1.2): the wheel gesture walks THIS, not the
+    /// zoom — the centre scale barely moves while the edges breathe.
+    /// Adds to the zoom-driven term inside [`focal_gain`](Self::focal_gain).
+    pub focal: f64,
+    /// Where `focal` is gliding to. Equals `focal` at rest.
+    pub focal_target: f64,
+    /// Focal glide velocity. Same rule as `zoom_vel`: goal changes keep
+    /// momentum, never snap.
+    pub focal_vel: f64,
 }
 
 impl Camera {
@@ -57,6 +66,9 @@ impl Camera {
             target: Vec2::new(0.0, 0.0),
             zoom_vel: 0.0,
             zoom_target: 1.0,
+            focal: 0.0,
+            focal_target: 0.0,
+            focal_vel: 0.0,
         }
     }
 
@@ -71,12 +83,28 @@ impl Camera {
         self.zoom_target = zoom.clamp(0.05, 4.0);
     }
 
-    /// True while flying (position, zoom, or either velocity off rest).
+    /// New focal goal, glide momentum kept. Clamped 0..=1.2 (gain
+    /// saturates at 1, the headroom keeps the top of the gesture firm).
+    pub fn focal_to(&mut self, focal: f64) {
+        self.focal_target = focal.clamp(0.0, 1.2);
+    }
+
+    /// Effective warp gain: zoom-driven term plus focal breathing,
+    /// capped at 1. At zoom 1 with focal 0 this is exactly 0 (flat,
+    /// back-compat); the wheel gesture raises `focal` so the edges
+    /// breathe while the centre scale barely moves. Pure function.
+    pub fn focal_gain(&self) -> f64 {
+        (fisheye_gain(self.zoom) + self.focal).clamp(0.0, 1.0)
+    }
+
+    /// True while flying (position, zoom, focal, or any velocity off rest).
     pub fn flying(&self) -> bool {
         self.pos != self.target
             || self.vel != Vec2::new(0.0, 0.0)
             || self.zoom != self.zoom_target
             || self.zoom_vel != 0.0
+            || self.focal != self.focal_target
+            || self.focal_vel != 0.0
     }
 
     /// Advance the spring by `dt` seconds. Critically damped: fast,
@@ -124,6 +152,19 @@ impl Camera {
         if dz2 * dz2 < 1e-6 && self.zoom_vel * self.zoom_vel < 1e-4 {
             self.zoom = self.zoom_target;
             self.zoom_vel = 0.0;
+        } else {
+            moving = true;
+        }
+        // Focal rides the same soft spring: the breathing melts in and
+        // out with the zoom fade, never a jump.
+        let df = self.focal_target - self.focal;
+        let fa = ZOOM_STIFFNESS * df - zoom_damping * self.focal_vel;
+        self.focal_vel += fa * dt;
+        self.focal += self.focal_vel * dt;
+        let df2 = self.focal_target - self.focal;
+        if df2 * df2 < 1e-6 && self.focal_vel * self.focal_vel < 1e-4 {
+            self.focal = self.focal_target;
+            self.focal_vel = 0.0;
         } else {
             moving = true;
         }
@@ -270,12 +311,12 @@ impl Prop {
 
 impl Camera {
     /// World -> screen for a viewport of `view` logical pixels.
-    /// Includes the gentle fisheye (see [`fisheye_gain`]): identity at
-    /// zoom 1, focal breathing off-centre otherwise. The centre pixel
-    /// never moves.
+    /// Includes the gentle fisheye (see [`focal_gain`](Self::focal_gain)):
+    /// identity at zoom 1 with focal 0, focal breathing off-centre
+    /// otherwise. The centre pixel never moves.
     pub fn world_to_screen(&self, world: Vec2, view: Vec2) -> Vec2 {
         let flat = Self::flat_world_to_screen(world, self.pos, self.zoom, view);
-        let gain = fisheye_gain(self.zoom);
+        let gain = self.focal_gain();
         if gain <= 0.0 {
             return flat;
         }
@@ -286,7 +327,7 @@ impl Camera {
     /// inverse of [`world_to_screen`](Self::world_to_screen), so clicks
     /// land where the warped content is drawn.
     pub fn screen_to_world(&self, screen: Vec2, view: Vec2) -> Vec2 {
-        let gain = fisheye_gain(self.zoom);
+        let gain = self.focal_gain();
         let s = if gain <= 0.0 {
             screen
         } else {
@@ -298,9 +339,9 @@ impl Camera {
     /// Pre-warp a world point so the flat GL mapping draws it exactly
     /// where [`world_to_screen`](Self::world_to_screen) says: the
     /// backend warps canvas quad corners through this before handing
-    /// them to `canvas_mvp`. Identity at zoom 1.
+    /// them to `canvas_mvp`. Identity at zoom 1 with focal 0.
     pub fn warp_world(&self, world: Vec2, view: Vec2) -> Vec2 {
-        let gain = fisheye_gain(self.zoom);
+        let gain = self.focal_gain();
         if gain <= 0.0 {
             return world;
         }
@@ -651,9 +692,9 @@ pub fn unapply_fisheye(
 /// (3.2 / 2.4) with small per-dot hash variation, never zoom-scaled.
 /// Returns screen-space (x, y, size, alpha) in logical px.
 pub fn dust_dots(cam: &Camera, view: Vec2, motion: f64) -> Vec<(f64, f64, f64, f32)> {
-    // No visibility gate: motion scales alpha (bright in motion, faint
-    // at rest) so dots never pop under a held finger.
-    let motion_k = (motion / 240.0).clamp(0.15, 1.0) as f32;
+    // No visibility gate: motion scales alpha (bright in motion,
+    // clearly visible at rest) so dots never pop under a held finger.
+    let motion_k = (motion / 240.0).clamp(0.5, 1.0) as f32;
     const CELL: f64 = 320.0;
     /// Cap cells per axis so zoomed-out views stay cheap: stride the
     /// grid instead (dots shrink with zoom anyway, sparser is fine).
@@ -699,7 +740,7 @@ pub fn dust_dots(cam: &Camera, view: Vec2, motion: f64) -> Vec<(f64, f64, f64, f
                     let sy = (oy - cam.pos.y * k) * cam.zoom + view.y * 0.5;
                     // Ride the same focal breathing as the canvas so the
                     // motes stay glued to the plane they dress.
-                    let gain = fisheye_gain(cam.zoom);
+                    let gain = cam.focal_gain();
                     let (sx, sy) = if gain <= 0.0 || !sx.is_finite() || !sy.is_finite() {
                         (sx, sy)
                     } else {
@@ -1105,6 +1146,39 @@ mod tests {
             assert!(q.x > centre.x);
             assert!((q.y - centre.y).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn focal_gain_drives_warp_at_unit_zoom() {
+        let mut cam = Camera::new();
+        let view = Vec2::new(1920.0, 1080.0);
+        // Flat at rest: focal 0 at zoom 1 is exactly identity.
+        assert_eq!(cam.focal_gain(), 0.0);
+        let w = Vec2::new(300.0, -250.0);
+        let flat = cam.world_to_screen(w, view);
+        // Focal 1 at zoom 1: centre scale untouched, edges breathe.
+        cam.focal = 1.0;
+        assert!((cam.focal_gain() - 1.0).abs() < 1e-12);
+        let warped = cam.world_to_screen(w, view);
+        assert!(
+            warped.x > flat.x && warped.y < flat.y,
+            "focal must push off-centre content outward"
+        );
+        // Picking roundtrips through the focal warp.
+        let back = cam.screen_to_world(warped, view);
+        assert!(
+            (back.x - w.x).abs() < 1e-6 && (back.y - w.y).abs() < 1e-6,
+            "focal roundtrip failed: got {:?}",
+            back
+        );
+        // Zoom term + focal clamp at 1, never above.
+        cam.zoom = 2.0;
+        assert_eq!(cam.focal_gain(), 1.0);
+        // focal_to clamps its goal; momentum API keeps working.
+        cam.focal_to(5.0);
+        assert_eq!(cam.focal_target, 1.2);
+        cam.focal_to(-1.0);
+        assert_eq!(cam.focal_target, 0.0);
     }
 
     #[test]

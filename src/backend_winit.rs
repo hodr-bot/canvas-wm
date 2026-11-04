@@ -2964,9 +2964,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 crate::canvas::Vec2::new(sx as f64, sy as f64),
                                 crate::canvas::view_centre(view),
                                 crate::canvas::view_half_diag(view),
-                                crate::canvas::fisheye_gain(
-                                    session.view_camera().zoom,
-                                ),
+                                session.view_camera().focal_gain(),
                             );
                             (w.x as f32, w.y as f32, n.2)
                         };

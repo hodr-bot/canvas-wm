@@ -212,6 +212,10 @@ impl Session {
                 self.camera.pos.y - self.canvas.offset.y,
             ),
             zoom: self.camera.zoom,
+            // The focal rides along: picking/render mappings must see
+            // the same gain as the anchor solver (else off-centre
+            // anchors drift by the warp residual).
+            focal: self.camera.focal,
             ..Camera::new()
         }
     }
@@ -264,7 +268,7 @@ impl Session {
         // Zoom owns this offset write: bank it as zoom slip so the
         // marble physics never mistakes it for a canvas shove.
         let old = self.canvas.offset;
-        let gain = crate::canvas::fisheye_gain(self.camera.zoom);
+        let gain = self.camera.focal_gain();
         let s = if gain <= 0.0 {
             screen
         } else {
@@ -316,10 +320,22 @@ impl Session {
     /// [`track_zoom_anchor`], so the content stays glued with zero
     /// jump; at most one frame renders the pre-notch offset, which is
     /// still correct for the ~unchanged live zoom.
+    /// Wheel gesture: this walks the FOCAL, barely the zoom. Each notch
+    /// adds ±0.12 focal (full breathing in ~10 notches) while the scale
+    /// creeps only ×1.03 — the centre almost stands still while the
+    /// edges breathe (shorter focal length, not a dolly). Zooming back
+    /// out drains the focal first, then the scale melts back.
+    ///
+    /// Glide, momentum and anchor tracking are unchanged (see above):
+    /// only the composition of the goal is focal-first.
     pub fn zoom_glide_at(&mut self, screen: Vec2, view: Vec2, factor: f64) {
         let anchor = self.to_world(screen, view);
-        let zt = (self.camera.zoom_target * factor).clamp(0.05, 4.0);
+        // Scale barely moves per notch; the focal does the talking.
+        let zf = if factor > 1.0 { 1.03 } else { 1.0 / 1.03 };
+        let zt = (self.camera.zoom_target * zf).clamp(0.05, 4.0);
         self.camera.zoom_to(zt);
+        let df = if factor > 1.0 { 0.12 } else { -0.12 };
+        self.camera.focal_to(self.camera.focal_target + df);
         // Pin (screen, world) for the fade: every frame re-solves the
         // offset at the LIVE zoom so the content stays glued under the
         // cursor while the value melts (see track_zoom_anchor).
@@ -336,7 +352,7 @@ impl Session {
             // Solve through the same warp the mappings use: unwarp the
             // pinned screen point at the LIVE gain first, then the flat
             // solve lands the anchor glued (1e-9) at any zoom.
-            let gain = crate::canvas::fisheye_gain(z);
+            let gain = self.camera.focal_gain();
             let s = if gain <= 0.0 {
                 screen
             } else {
@@ -362,7 +378,10 @@ impl Session {
             // into the offset and the pinned point visibly shifts.
             // (Only visible off-centre: at screen centre the residual
             // scales by (screen - v/2) = 0 and hides.)
-            if self.camera.zoom == self.camera.zoom_target && self.camera.zoom_vel == 0.0 {
+            if self.camera.zoom == self.camera.zoom_target && self.camera.zoom_vel == 0.0
+                && self.camera.focal == self.camera.focal_target
+                && self.camera.focal_vel == 0.0
+            {
                 self.zoom_anchor = None;
             }
         }
@@ -574,17 +593,54 @@ mod tests {
     }
 
     #[test]
+    fn wheel_walks_focal_barely_zoom() {
+        let mut s = Session::new();
+        let view = Vec2::new(1920.0, 1080.0);
+        let at = Vec2::new(960.0, 540.0);
+        // Notch 1: focal strides (+0.12), scale barely creeps (x1.03).
+        s.zoom_glide_at(at, view, 1.15);
+        assert!((s.camera.zoom_target - 1.03).abs() < 1e-12);
+        assert!((s.camera.focal_target - 0.12).abs() < 1e-12);
+        assert!((s.camera.zoom - 1.0).abs() < 0.05);
+        // Ten notches: focal saturates at full breathing, scale only
+        // ~1.34 — the gesture is focal length, not a dolly.
+        for _ in 0..9 {
+            s.zoom_glide_at(at, view, 1.15);
+        }
+        assert!((s.camera.focal_target - 1.2).abs() < 1e-12);
+        assert!(s.camera.zoom_target < 1.4);
+        // Back out: focal drains first.
+        s.zoom_glide_at(at, view, 1.0 / 1.15);
+        assert!(s.camera.focal_target < 1.2);
+        // Focal glides to rest exactly (frames stop).
+        for _ in 0..1200 {
+            s.camera.step(1.0 / 120.0);
+            s.track_zoom_anchor(view);
+            if !s.camera.flying() && s.zoom_anchor.is_none() {
+                break;
+            }
+        }
+        assert!(!s.camera.flying());
+        assert_eq!(s.camera.focal, s.camera.focal_target);
+        // Landed with focal breathing: the warp is really on.
+        assert!(s.camera.focal_gain() > 0.9);
+    }
+
+    #[test]
     fn wheel_glides_without_snapping_and_survives_quit() {
         let mut s = Session::new();
         let view = Vec2::new(1920.0, 1080.0);
         let at = Vec2::new(960.0, 540.0);
-        // Notch 1: no snap — the live zoom barely moved, the target did.
+        // Notch 1: no snap — the live values barely moved, the targets
+        // did (zoom x1.03, focal +0.12: focal-first gesture).
         s.zoom_glide_at(at, view, 1.15);
-        assert!((s.camera.zoom_target - 1.15).abs() < 1e-12);
+        assert!((s.camera.zoom_target - 1.03).abs() < 1e-12);
+        assert!((s.camera.focal_target - 0.12).abs() < 1e-12);
         assert!((s.camera.zoom - 1.0).abs() < 0.05);
-        // Notch 2 composes onto the settled target, not the live value.
+        // Notch 2 composes onto the settled targets, not live values.
         s.zoom_glide_at(at, view, 1.15);
-        assert!((s.camera.zoom_target - 1.15 * 1.15).abs() < 1e-12);
+        assert!((s.camera.zoom_target - 1.03 * 1.03).abs() < 1e-12);
+        assert!((s.camera.focal_target - 0.24).abs() < 1e-12);
         // Quit mid-glide then wheel: the return trip survives — the
         // notch re-aims it instead of snapping over it.
         let wins = two_windows();
