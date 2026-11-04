@@ -270,18 +270,56 @@ impl Prop {
 
 impl Camera {
     /// World -> screen for a viewport of `view` logical pixels.
+    /// Includes the gentle fisheye (see [`fisheye_gain`]): identity at
+    /// zoom 1, focal breathing off-centre otherwise. The centre pixel
+    /// never moves.
     pub fn world_to_screen(&self, world: Vec2, view: Vec2) -> Vec2 {
+        let flat = Self::flat_world_to_screen(world, self.pos, self.zoom, view);
+        let gain = fisheye_gain(self.zoom);
+        if gain <= 0.0 {
+            return flat;
+        }
+        apply_fisheye_gain(flat, view_centre(view), view_half_diag(view), gain)
+    }
+
+    /// Screen -> world (for picking windows on the canvas). Exact
+    /// inverse of [`world_to_screen`](Self::world_to_screen), so clicks
+    /// land where the warped content is drawn.
+    pub fn screen_to_world(&self, screen: Vec2, view: Vec2) -> Vec2 {
+        let gain = fisheye_gain(self.zoom);
+        let s = if gain <= 0.0 {
+            screen
+        } else {
+            unapply_fisheye(screen, view_centre(view), view_half_diag(view), gain)
+        };
+        Self::flat_screen_to_world(s, self.pos, self.zoom, view)
+    }
+
+    /// Pre-warp a world point so the flat GL mapping draws it exactly
+    /// where [`world_to_screen`](Self::world_to_screen) says: the
+    /// backend warps canvas quad corners through this before handing
+    /// them to `canvas_mvp`. Identity at zoom 1.
+    pub fn warp_world(&self, world: Vec2, view: Vec2) -> Vec2 {
+        let gain = fisheye_gain(self.zoom);
+        if gain <= 0.0 {
+            return world;
+        }
+        let flat = Self::flat_world_to_screen(world, self.pos, self.zoom, view);
+        let w = apply_fisheye_gain(flat, view_centre(view), view_half_diag(view), gain);
+        Self::flat_screen_to_world(w, self.pos, self.zoom, view)
+    }
+
+    fn flat_world_to_screen(world: Vec2, pos: Vec2, zoom: f64, view: Vec2) -> Vec2 {
         Vec2::new(
-            (world.x - self.pos.x) * self.zoom + view.x * 0.5,
-            (world.y - self.pos.y) * self.zoom + view.y * 0.5,
+            (world.x - pos.x) * zoom + view.x * 0.5,
+            (world.y - pos.y) * zoom + view.y * 0.5,
         )
     }
 
-    /// Screen -> world (for picking windows on the canvas).
-    pub fn screen_to_world(&self, screen: Vec2, view: Vec2) -> Vec2 {
+    fn flat_screen_to_world(screen: Vec2, pos: Vec2, zoom: f64, view: Vec2) -> Vec2 {
         Vec2::new(
-            (screen.x - view.x * 0.5) / self.zoom + self.pos.x,
-            (screen.y - view.y * 0.5) / self.zoom + self.pos.y,
+            (screen.x - view.x * 0.5) / zoom + pos.x,
+            (screen.y - view.y * 0.5) / zoom + pos.y,
         )
     }
 }
@@ -381,6 +419,28 @@ pub fn fit_view_for_selection(
     let zoom = ((view.x - padding * 2.0) / bbox_w)
         .min((view.y - padding * 2.0) / bbox_h)
         .clamp(0.05, 2.0);
+    // The gentle fisheye pushes off-centre content outward (up to ~8%
+    // at the corners when zoomed), so a flat fit can overflow the
+    // padding. Shrink until the WARPED bbox corners honour it.
+    let probe = |zx: f64, px: f64, py: f64| {
+        let mut c = Camera::new();
+        c.pos = Vec2::new(px, py);
+        c.zoom = zx;
+        [
+            Vec2::new(min_x, min_y),
+            Vec2::new(max_x, min_y),
+            Vec2::new(min_x, max_y),
+            Vec2::new(max_x, max_y),
+        ]
+        .into_iter()
+        .map(|corner| c.world_to_screen(corner, view))
+        .all(|s| {
+            s.x >= padding
+                && s.x <= view.x - padding
+                && s.y >= padding
+                && s.y <= view.y - padding
+        })
+    };
     // Keep the approach side: if we are left of the bbox, stay slightly left
     // so the camera travels from where it comes from (Stick Fight feel).
     let cx = (min_x + max_x) * 0.5;
@@ -400,9 +460,18 @@ pub fn fit_view_for_selection(
     } else {
         cy
     };
+    // Shrink the zoom until the warped corners honour the padding
+    // (flat fit is the first probe; each step loses 3%).
+    let mut fit_zoom = zoom;
+    for _ in 0..12 {
+        if probe(fit_zoom, approach_x, approach_y) {
+            break;
+        }
+        fit_zoom = (fit_zoom * 0.97).clamp(0.05, 2.0);
+    }
     Some(Camera {
         pos: Vec2::new(approach_x, approach_y),
-        zoom,
+        zoom: fit_zoom,
         ..Camera::new()
     })
 }
@@ -478,6 +547,20 @@ pub fn fisheye_factor(dist_px: f64, half_diag_px: f64) -> f64 {
 /// `centre` by [`fisheye_factor`]. Identity at the centre, smooth and
 /// monotonic outward, capped near 8% at the corners. Pure function.
 pub fn apply_fisheye(screen: Vec2, centre: Vec2, half_diag: f64) -> Vec2 {
+    apply_fisheye_gain(screen, centre, half_diag, 1.0)
+}
+
+/// Gain-scaled fisheye: `gain` 0..=1 scales the (factor − 1) term, so
+/// gain 0 is exactly identity and gain 1 is [`apply_fisheye`]. The
+/// zoom drives the gain (see [`fisheye_gain`]): half the zoom feel
+/// stays real scale, up to half comes from this focal breathing.
+/// Pure function.
+pub fn apply_fisheye_gain(
+    screen: Vec2,
+    centre: Vec2,
+    half_diag: f64,
+    gain: f64,
+) -> Vec2 {
     let ox = screen.x - centre.x;
     let oy = screen.y - centre.y;
     if ox == 0.0 && oy == 0.0 {
@@ -486,9 +569,73 @@ pub fn apply_fisheye(screen: Vec2, centre: Vec2, half_diag: f64) -> Vec2 {
     if !(half_diag > 0.0) {
         return screen;
     }
+    let g = gain.clamp(0.0, 1.0);
+    if g <= 0.0 {
+        return screen;
+    }
     let dist = (ox * ox + oy * oy).sqrt();
-    let f = fisheye_factor(dist, half_diag);
+    let f = 1.0 + (fisheye_factor(dist, half_diag) - 1.0) * g;
     Vec2::new(centre.x + ox * f, centre.y + oy * f)
+}
+
+/// Fisheye gain from the camera zoom: 0 at zoom 1 (flat, back-compat),
+/// ramping with |zoom − 1|, capped at 1. Zoomed-in and zoomed-out both
+/// breathe; the centre never moves. Pure function.
+pub fn fisheye_gain(zoom: f64) -> f64 {
+    if !zoom.is_finite() {
+        return 0.0;
+    }
+    ((zoom - 1.0).abs() * 0.75).clamp(0.0, 1.0)
+}
+
+/// View centre and half-diagonal (centre-to-corner) in screen px.
+pub fn view_centre(view: Vec2) -> Vec2 {
+    Vec2::new(view.x * 0.5, view.y * 0.5)
+}
+
+/// View centre and half-diagonal (centre-to-corner) in screen px.
+pub fn view_half_diag(view: Vec2) -> f64 {
+    (view.x * view.x + view.y * view.y).sqrt() * 0.5
+}
+
+/// Inverse of [`apply_fisheye_gain`]: the radial map r ↦ r·f(r) is
+/// strictly increasing (f rises smoothly from 1), so bisection on the
+/// radius converges. Identity at the centre. Pure function.
+pub fn unapply_fisheye(
+    screen: Vec2,
+    centre: Vec2,
+    half_diag: f64,
+    gain: f64,
+) -> Vec2 {
+    let ox = screen.x - centre.x;
+    let oy = screen.y - centre.y;
+    if ox == 0.0 && oy == 0.0 {
+        return centre;
+    }
+    if !(half_diag > 0.0) {
+        return screen;
+    }
+    let g = gain.clamp(0.0, 1.0);
+    if g <= 0.0 {
+        return screen;
+    }
+    let target = (ox * ox + oy * oy).sqrt();
+    // Forward map is monotonic with f >= 1: the pre-image radius never
+    // exceeds the image radius, so [0, target] brackets the root.
+    let mut lo = 0.0;
+    let mut hi = target;
+    for _ in 0..48 {
+        let mid = (lo + hi) * 0.5;
+        let f = 1.0 + (fisheye_factor(mid, half_diag) - 1.0) * g;
+        if mid * f < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let r = (lo + hi) * 0.5;
+    let k = if target > 0.0 { r / target } else { 0.0 };
+    Vec2::new(centre.x + ox * k, centre.y + oy * k)
 }
 
 /// Void dust: faint motes pinned to the canvas plane so camera motion
@@ -548,6 +695,20 @@ pub fn dust_dots(cam: &Camera, view: Vec2, motion: f64) -> Vec<(f64, f64, f64, f
                     let oy = (cy as f64 + fy) * CELL;
                     let sx = (ox - cam.pos.x * k) * cam.zoom + view.x * 0.5;
                     let sy = (oy - cam.pos.y * k) * cam.zoom + view.y * 0.5;
+                    // Ride the same focal breathing as the canvas so the
+                    // motes stay glued to the plane they dress.
+                    let gain = fisheye_gain(cam.zoom);
+                    let (sx, sy) = if gain <= 0.0 || !sx.is_finite() || !sy.is_finite() {
+                        (sx, sy)
+                    } else {
+                        let w = apply_fisheye_gain(
+                            Vec2::new(sx, sy),
+                            view_centre(view),
+                            view_half_diag(view),
+                            gain,
+                        );
+                        (w.x, w.y)
+                    };
                     let s = base_s * (0.8 + 0.4 * f64::from(fv));
                     let a = base_a * fade * (0.6 + 0.4 * fv);
                     out.push((sx, sy, s, a));
@@ -924,6 +1085,147 @@ mod tests {
             // Same side, no flip: gentle, no nausea.
             assert!(q.x > centre.x);
             assert!((q.y - centre.y).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn fisheye_gain_zero_at_unit_zoom_capped() {
+        assert_eq!(fisheye_gain(1.0), 0.0);
+        assert_eq!(fisheye_gain(f64::NAN), 0.0);
+        assert_eq!(fisheye_gain(f64::INFINITY), 0.0);
+        // Ramps symmetrically, capped at 1.
+        assert!((fisheye_gain(2.0) - 0.75).abs() < 1e-9);
+        assert!((fisheye_gain(0.0) - 0.75).abs() < 1e-9);
+        assert_eq!(fisheye_gain(4.0), 1.0);
+        assert_eq!(fisheye_gain(-2.0), 1.0);
+    }
+
+    #[test]
+    fn fisheye_gain_scales_warp() {
+        let centre = Vec2::new(960.0, 540.0);
+        let half_diag = 1100.0;
+        let p = Vec2::new(centre.x + 800.0, centre.y);
+        // Gain 0 is exactly identity; gain 1 matches apply_fisheye.
+        assert_eq!(apply_fisheye_gain(p, centre, half_diag, 0.0), p);
+        assert_eq!(
+            apply_fisheye_gain(p, centre, half_diag, 1.0),
+            apply_fisheye(p, centre, half_diag)
+        );
+        // Half gain displaces half as far.
+        let full = apply_fisheye_gain(p, centre, half_diag, 1.0).x - p.x;
+        let half = apply_fisheye_gain(p, centre, half_diag, 0.5).x - p.x;
+        assert!((half * 2.0 - full).abs() < 1e-9);
+        // Out-of-range gains clamp.
+        assert_eq!(
+            apply_fisheye_gain(p, centre, half_diag, 3.0),
+            apply_fisheye(p, centre, half_diag)
+        );
+        assert_eq!(apply_fisheye_gain(p, centre, half_diag, -2.0), p);
+    }
+
+    #[test]
+    fn fisheye_inverse_roundtrips() {
+        let view = Vec2::new(1920.0, 1080.0);
+        let centre = view_centre(view);
+        let half_diag = view_half_diag(view);
+        for gain in [0.25, 0.5, 1.0] {
+            for &(dx, dy) in &[
+                (0.0, 0.0),
+                (100.0, -50.0),
+                (900.0, 500.0),
+                (-960.0, 540.0),
+                (300.0, 300.0),
+            ] {
+                let p = Vec2::new(centre.x + dx, centre.y + dy);
+                let fwd = apply_fisheye_gain(p, centre, half_diag, gain);
+                let back = unapply_fisheye(fwd, centre, half_diag, gain);
+                assert!(
+                    (back.x - p.x).abs() < 1e-6 && (back.y - p.y).abs() < 1e-6,
+                    "roundtrip failed at {:?} gain {}: got {:?}",
+                    p,
+                    gain,
+                    back
+                );
+            }
+        }
+        // Degenerate inputs stay identity.
+        let p = Vec2::new(100.0, 100.0);
+        assert_eq!(unapply_fisheye(p, centre, 0.0, 1.0), p);
+        assert_eq!(unapply_fisheye(p, centre, half_diag, 0.0), p);
+    }
+
+    #[test]
+    fn camera_mappings_flat_at_unit_zoom() {
+        let mut cam = Camera::new();
+        cam.pos = Vec2::new(10.0, -20.0);
+        let view = Vec2::new(1920.0, 1080.0);
+        for w in [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(500.0, 300.0),
+            Vec2::new(-200.0, 700.0),
+        ] {
+            let s = cam.world_to_screen(w, view);
+            assert_eq!(
+                s,
+                Vec2::new(
+                    (w.x - 10.0) + 960.0,
+                    (w.y + 20.0) + 540.0
+                )
+            );
+            // Roundtrip exact, pre-warp identity.
+            assert_eq!(cam.screen_to_world(s, view), w);
+            assert_eq!(cam.warp_world(w, view), w);
+        }
+    }
+
+    #[test]
+    fn camera_warp_draw_pick_consistent() {
+        let mut cam = Camera::new();
+        cam.zoom = 2.0;
+        let view = Vec2::new(1920.0, 1080.0);
+        // Centre never moves, even zoomed.
+        let centre_world = cam.screen_to_world(view_centre(view), view);
+        assert_eq!(cam.world_to_screen(centre_world, view), view_centre(view));
+        for w in [
+            Vec2::new(100.0, 50.0),
+            Vec2::new(-400.0, 200.0),
+            Vec2::new(300.0, -250.0),
+        ] {
+            // Picking roundtrips: click where drawn lands back on w.
+            let s = cam.world_to_screen(w, view);
+            let back = cam.screen_to_world(s, view);
+            assert!(
+                (back.x - w.x).abs() < 1e-6 && (back.y - w.y).abs() < 1e-6,
+                "pick roundtrip failed for {:?}: got {:?}",
+                w,
+                back
+            );
+            // warp_world is draw-consistent: flat-mapping the warped
+            // point lands exactly on the warped screen point.
+            let warped = cam.warp_world(w, view);
+            let drawn = Vec2::new(
+                (warped.x - cam.pos.x) * cam.zoom + view.x * 0.5,
+                (warped.y - cam.pos.y) * cam.zoom + view.y * 0.5,
+            );
+            assert!(
+                (drawn.x - s.x).abs() < 1e-9 && (drawn.y - s.y).abs() < 1e-9,
+                "draw/pick diverge for {:?}: drawn {:?} vs picked {:?}",
+                w,
+                drawn,
+                s
+            );
+            // Warp pushes outward, never inward, and stays small.
+            let flat = Vec2::new(
+                (w.x - cam.pos.x) * cam.zoom + view.x * 0.5,
+                (w.y - cam.pos.y) * cam.zoom + view.y * 0.5,
+            );
+            let df = ((flat.x - 960.0).powi(2) + (flat.y - 540.0).powi(2)).sqrt();
+            let ds = ((s.x - 960.0).powi(2) + (s.y - 540.0).powi(2)).sqrt();
+            assert!(ds >= df - 1e-9, "warp must not pull inward");
+            assert!(
+                ds <= df * 1.08 + 1e-6,
+                "warp exceeds the 8% corner cap"
+            );
         }
     }
 }

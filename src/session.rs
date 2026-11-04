@@ -194,13 +194,26 @@ impl Session {
         // stale target and burn frames forever.
         self.camera.zoom_target = self.camera.zoom;
         self.camera.zoom_vel = 0.0;
-        // screen = (anchor + off - pos) * z' + v/2, solved for off.
+        // screen = warp((anchor + off - pos) * z' + v/2), solved for
+        // off: unwarp the pinned point at the NEW gain first so the
+        // anchor stays glued exactly, like track_zoom_anchor.
         // Zoom owns this offset write: bank it as zoom slip so the
         // marble physics never mistakes it for a canvas shove.
         let old = self.canvas.offset;
-        self.canvas.offset.x = (screen.x - view.x * 0.5) / self.camera.zoom + self.camera.pos.x
+        let gain = crate::canvas::fisheye_gain(self.camera.zoom);
+        let s = if gain <= 0.0 {
+            screen
+        } else {
+            crate::canvas::unapply_fisheye(
+                screen,
+                crate::canvas::view_centre(view),
+                crate::canvas::view_half_diag(view),
+                gain,
+            )
+        };
+        self.canvas.offset.x = (s.x - view.x * 0.5) / self.camera.zoom + self.camera.pos.x
             - anchor.x;
-        self.canvas.offset.y = (screen.y - view.y * 0.5) / self.camera.zoom + self.camera.pos.y
+        self.canvas.offset.y = (s.y - view.y * 0.5) / self.camera.zoom + self.camera.pos.y
             - anchor.y;
         self.zoom_slip.x += self.canvas.offset.x - old.x;
         self.zoom_slip.y += self.canvas.offset.y - old.y;
@@ -255,11 +268,25 @@ impl Session {
     pub fn track_zoom_anchor(&mut self, view: Vec2) {
         if let Some((screen, world)) = self.zoom_anchor {
             let z = self.camera.zoom;
+            // Solve through the same warp the mappings use: unwarp the
+            // pinned screen point at the LIVE gain first, then the flat
+            // solve lands the anchor glued (1e-9) at any zoom.
+            let gain = crate::canvas::fisheye_gain(z);
+            let s = if gain <= 0.0 {
+                screen
+            } else {
+                crate::canvas::unapply_fisheye(
+                    screen,
+                    crate::canvas::view_centre(view),
+                    crate::canvas::view_half_diag(view),
+                    gain,
+                )
+            };
             let old = self.canvas.offset;
             self.canvas.offset.x =
-                (screen.x - view.x * 0.5) / z + self.camera.pos.x - world.x;
+                (s.x - view.x * 0.5) / z + self.camera.pos.x - world.x;
             self.canvas.offset.y =
-                (screen.y - view.y * 0.5) / z + self.camera.pos.y - world.y;
+                (s.y - view.y * 0.5) / z + self.camera.pos.y - world.y;
             // Anchor tracking rewrites the offset every frame of the
             // fade: bank it as zoom slip, never as canvas motion.
             self.zoom_slip.x += self.canvas.offset.x - old.x;

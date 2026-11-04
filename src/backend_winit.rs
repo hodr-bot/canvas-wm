@@ -2551,14 +2551,34 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 // maps canvas -> screen; physical px = logical
                                 // times the output scale.
                                 let sc = scale as f32;
-                                let (qx, qy) = (
-                                    cw.canvas.pos.x as f32 * sc,
-                                    -(cw.canvas.pos.y as f32) * sc,
+                                // Fisheye: pre-warp the quad corners through
+                                // the camera warp so the flat MVP draws them
+                                // exactly where world_to_screen says (and
+                                // where picking looks). Identity at zoom 1.
+                                let vcam = session.view_camera();
+                                let w00 = vcam.warp_world(cw.canvas.pos, view);
+                                let w10 = vcam.warp_world(
+                                    crate::canvas::Vec2::new(
+                                        cw.canvas.pos.x + cw.canvas.size.x,
+                                        cw.canvas.pos.y,
+                                    ),
+                                    view,
                                 );
-                                let (qw, qh) = (
-                                    cw.canvas.size.x as f32 * sc,
-                                    -(cw.canvas.size.y as f32) * sc,
+                                let w01 = vcam.warp_world(
+                                    crate::canvas::Vec2::new(
+                                        cw.canvas.pos.x,
+                                        cw.canvas.pos.y + cw.canvas.size.y,
+                                    ),
+                                    view,
                                 );
+                                let w11 = vcam.warp_world(
+                                    crate::canvas::Vec2::new(
+                                        cw.canvas.pos.x + cw.canvas.size.x,
+                                        cw.canvas.pos.y + cw.canvas.size.y,
+                                    ),
+                                    view,
+                                );
+                                // (qx/qy/qw/qh folded into w00..w11 above.)
                                 let vw = view.x as f32 * sc;
                                 let vh = view.y as f32 * sc;
                                 let mid = session.to_world(
@@ -2572,10 +2592,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     tilt,
                                 );
                                 let verts: [f32; 16] = [
-                                    qx, qy, 0.0, 0.0, //
-                                    qx + qw, qy, 1.0, 0.0, //
-                                    qx, qy + qh, 0.0, 1.0, //
-                                    qx + qw, qy + qh, 1.0, 1.0,
+                                    w00.x as f32 * sc, -(w00.y as f32) * sc, 0.0, 0.0, //
+                                    w10.x as f32 * sc, -(w10.y as f32) * sc, 1.0, 0.0, //
+                                    w01.x as f32 * sc, -(w01.y as f32) * sc, 0.0, 1.0, //
+                                    w11.x as f32 * sc, -(w11.y as f32) * sc, 1.0, 1.0,
                                 ];
                                 let tid = tex.tex_id();
                                 // X-format buffers carry no real alpha (the X
@@ -2765,10 +2785,25 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         if let Some(prog) = tex_prog {
                             let tilt = (0.0, 0.0);
                             let sc = scale as f32;
-                            let (qx, qy) =
-                                (org.x as f32 * sc, -(org.y as f32) * sc);
-                            let (qw, qh) =
-                                (size.x as f32 * sc, -(size.y as f32) * sc);
+                            // Same fisheye pre-warp as the main pass: all
+                            // four warped corners, identity at zoom 1.
+                            let vcam = session.view_camera();
+                            let w00 = vcam.warp_world(org, view);
+                            let w10 = vcam.warp_world(
+                                crate::canvas::Vec2::new(org.x + size.x, org.y),
+                                view,
+                            );
+                            let w01 = vcam.warp_world(
+                                crate::canvas::Vec2::new(org.x, org.y + size.y),
+                                view,
+                            );
+                            let w11 = vcam.warp_world(
+                                crate::canvas::Vec2::new(
+                                    org.x + size.x,
+                                    org.y + size.y,
+                                ),
+                                view,
+                            );
                             let vw = view.x as f32 * sc;
                             let vh = view.y as f32 * sc;
                             let mid = session.to_world(
@@ -2782,10 +2817,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 tilt,
                             );
                             let verts: [f32; 16] = [
-                                qx, qy, 0.0, 0.0, //
-                                qx + qw, qy, 1.0, 0.0, //
-                                qx, qy + qh, 0.0, 1.0, //
-                                qx + qw, qy + qh, 1.0, 1.0,
+                                w00.x as f32 * sc, -(w00.y as f32) * sc, 0.0, 0.0, //
+                                w10.x as f32 * sc, -(w10.y as f32) * sc, 1.0, 0.0, //
+                                w01.x as f32 * sc, -(w01.y as f32) * sc, 0.0, 1.0, //
+                                w11.x as f32 * sc, -(w11.y as f32) * sc, 1.0, 1.0,
                             ];
                             let _ = renderer.with_context(|_, gl| unsafe {
                                 crate::render3d::draw_textured(
@@ -2894,11 +2929,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 -(wy as f32) * sc,
                                 wz as f32 * sc,
                             );
-                            (
-                                (n.0 * 0.5 + 0.5) * view.x as f32,
-                                (1.0 - (n.1 * 0.5 + 0.5)) * view.y as f32,
-                                n.2,
-                            )
+                            let sx = (n.0 * 0.5 + 0.5) * view.x as f32;
+                            let sy = (1.0 - (n.1 * 0.5 + 0.5)) * view.y as f32;
+                            // Same focal breathing as the window quads so
+                            // the toys sit on the same bent plane.
+                            let w = crate::canvas::apply_fisheye_gain(
+                                crate::canvas::Vec2::new(sx as f64, sy as f64),
+                                crate::canvas::view_centre(view),
+                                crate::canvas::view_half_diag(view),
+                                crate::canvas::fisheye_gain(
+                                    session.view_camera().zoom,
+                                ),
+                            );
+                            (w.x as f32, w.y as f32, n.2)
                         };
                         let walls: Vec<(f64, f64, f64, f64)> = server_state
                             .windows
