@@ -450,14 +450,26 @@ pub fn window_screen_rect(
     (x, y, w, h)
 }
 
+/// Canvas offset that puts `target` at the view centre given camera
+/// position `cam_pos`: camera pos minus target. Pure helper.
+pub fn offset_to_centre(cam_pos: Vec2, target: Vec2) -> Vec2 {
+    cam_pos - target
+}
+
 /// Void dust: faint motes pinned to the canvas plane so camera motion
 /// reads on screen even with no window in view (panning the void
 /// otherwise shows nothing moving). Deterministic hash grid over
 /// canvas cells — infinite, stateless, zero per-frame cost beyond
 /// drawing. Two depths (rigid + half parallax) for a hint of depth.
 /// Fades out when zoomed far (overview), full at working zoom.
+/// `motion` is camera speed in canvas px/s; below 60 the void stays
+/// clean (no dust at rest). Sizes are constant screen px per layer
+/// (3.2 / 2.4) with small per-dot hash variation, never zoom-scaled.
 /// Returns screen-space (x, y, size, alpha) in logical px.
-pub fn dust_dots(cam: &Camera, view: Vec2) -> Vec<(f64, f64, f64, f32)> {
+pub fn dust_dots(cam: &Camera, view: Vec2, motion: f64) -> Vec<(f64, f64, f64, f32)> {
+    if motion < 60.0 {
+        return Vec::new();
+    }
     const CELL: f64 = 320.0;
     /// Cap cells per axis so zoomed-out views stay cheap: stride the
     /// grid instead (dots shrink with zoom anyway, sparser is fine).
@@ -471,7 +483,7 @@ pub fn dust_dots(cam: &Camera, view: Vec2) -> Vec<(f64, f64, f64, f32)> {
     // (layer, parallax k, base alpha, base size): rigid reads 1:1,
     // half-parallax drifts behind for depth.
     for (layer, k, base_a, base_s) in
-        [(0i64, 1.0f64, 0.30f32, 2.2f64), (1i64, 0.5, 0.15, 1.6)]
+        [(0i64, 1.0f64, 0.30f32, 3.2f64), (1i64, 0.5, 0.15, 2.4)]
     {
         // Canvas range visible for this layer, padded by one cell.
         let x0 = cam.pos.x * k - view.x / cam.zoom - CELL;
@@ -501,7 +513,7 @@ pub fn dust_dots(cam: &Camera, view: Vec2) -> Vec<(f64, f64, f64, f32)> {
                     let oy = (cy as f64 + fy) * CELL;
                     let sx = (ox - cam.pos.x * k) * cam.zoom + view.x * 0.5;
                     let sy = (oy - cam.pos.y * k) * cam.zoom + view.y * 0.5;
-                    let s = base_s * cam.zoom * (0.4 + 0.6 * k);
+                    let s = base_s * (0.8 + 0.4 * f64::from(fv));
                     let a = base_a * fade * (0.6 + 0.4 * fv);
                     out.push((sx, sy, s, a));
                 }
@@ -758,8 +770,9 @@ mod tests {
     fn dust_is_deterministic_and_culled() {
         let cam = Camera::new();
         let view = Vec2::new(1920.0, 1080.0);
-        let a = dust_dots(&cam, view);
-        let b = dust_dots(&cam, view);
+        let a = dust_dots(&cam, view, 500.0);
+        let b = dust_dots(&cam, view, 500.0);
+        assert!(dust_dots(&cam, view, 0.0).is_empty());
         assert_eq!(a.len(), b.len());
         assert!(a.len() > 50, "void should read: {}", a.len());
         assert!(a.len() < 800, "bounded draw cost: {}", a.len());
@@ -777,7 +790,7 @@ mod tests {
                 "y={}",
                 y
             );
-            assert!(*s > 0.5 && *s < 4.0, "s={}", s);
+            assert!(*s >= 1.5 && *s <= 5.0, "s={}", s);
             assert!(*al > 0.0 && *al <= 0.32, "a={}", al);
         }
     }
@@ -785,10 +798,10 @@ mod tests {
     #[test]
     fn dust_moves_with_camera_and_fades_far() {
         let view = Vec2::new(1920.0, 1080.0);
-        let here = dust_dots(&Camera::new(), view);
+        let here = dust_dots(&Camera::new(), view, 500.0);
         let mut moved = Camera::new();
         moved.pos = Vec2::new(100.0, 0.0);
-        let there = dust_dots(&moved, view);
+        let there = dust_dots(&moved, view, 500.0);
         // Rigid layer shifts exactly 100px left on screen (coverage
         // edges may add/drop cells — match on the overlap, not len).
         let shifted = here
@@ -805,6 +818,17 @@ mod tests {
             zoom: 0.1,
             ..Camera::new()
         };
-        assert!(dust_dots(&far, view).is_empty());
+        assert!(dust_dots(&far, view, 500.0).is_empty());
+    }
+
+    #[test]
+    fn offset_to_centre_is_cam_minus_target() {
+        let cam = Vec2::new(100.0, -50.0);
+        let target = Vec2::new(30.0, 20.0);
+        assert_eq!(offset_to_centre(cam, target), Vec2::new(70.0, -70.0));
+        assert_eq!(
+            offset_to_centre(Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0)),
+            Vec2::new(0.0, 0.0)
+        );
     }
 }
