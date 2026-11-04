@@ -57,6 +57,13 @@ pub struct FontCache {
     row_h: u32,
     slots: HashMap<char, Slot>,
     dirty: bool,
+    /// Shaped-line cache: shaping + raster lookup per distinct string
+    /// happens once, then frames reuse it. The menu redraws the same
+    /// dozen lines at 60fps; without this every frame re-shapes every
+    /// line (that was the bulk of the options-menu lag). Keyed by the
+    /// full line text, so settings changes (different strings) simply
+    /// miss and re-shape. Clear on menu close for hygiene.
+    laid: HashMap<String, (f32, Vec<Placed>)>,
 }
 
 impl FontCache {
@@ -75,7 +82,14 @@ impl FontCache {
             row_h: 0,
             slots: HashMap::new(),
             dirty: true,
+            laid: HashMap::new(),
         }
+    }
+
+    /// Drop cached shapings (menu closed). The atlas keeps its glyphs;
+    /// only the string -> placement map is forgotten.
+    pub fn clear_layout_cache(&mut self) {
+        self.laid.clear();
     }
 
     /// Full line advance: ascent - descent + gap at menu size.
@@ -177,7 +191,18 @@ impl FontCache {
     /// pen space (x grows right, y grows down from the line top).
     /// Every glyph is rasterized into the atlas on the way; a glyph
     /// that does not fit degrades to the fallback square.
+    /// Results are cached per distinct string: repeats return a clone
+    /// without re-shaping (the glyphs were rasterized on first sight).
     pub fn layout_line(&mut self, text: &str) -> (f32, Vec<Placed>) {
+        if let Some(hit) = self.laid.get(text) {
+            return hit.clone();
+        }
+        let shaped = self.shape_line(text);
+        self.laid.insert(text.to_string(), shaped.clone());
+        shaped
+    }
+
+    fn shape_line(&mut self, text: &str) -> (f32, Vec<Placed>) {
         self.layout.reset(&LayoutSettings {
             x: 0.0,
             y: 0.0,
@@ -294,6 +319,22 @@ mod tests {
         for g in &glyphs {
             assert!(g.x + g.w <= w + 1.0, "glyph overflows advance");
         }
+    }
+
+    /// Shaped-line cache: repeats return identical clones, distinct
+    /// strings re-shape, clearing forgets without breaking output.
+    #[test]
+    fn layout_cache_returns_identical_clones() {
+        let mut cache = FontCache::new();
+        let (w1, g1) = cache.layout_line("Échelle : 50");
+        let (w2, g2) = cache.layout_line("Échelle : 50");
+        assert_eq!(w1, w2);
+        assert_eq!(g1.len(), g2.len());
+        assert_eq!(cache.measure("Échelle : 50"), w1);
+        cache.clear_layout_cache();
+        let (w3, g3) = cache.layout_line("Échelle : 50");
+        assert_eq!(w1, w3);
+        assert_eq!(g1.len(), g3.len());
     }
 
     /// Dev-only visual probe: renders a French sample to /tmp so the

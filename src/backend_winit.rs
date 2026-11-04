@@ -174,6 +174,8 @@ pub fn background_color(camera: &Camera) -> [f32; 4] {
 /// atlas (coverage alpha, kerning included). Screen space, y down;
 /// `u` is the output scale, the face is laid out at MENU_PX and the
 /// quads are scaled to physical px (linear filtering smooths them).
+/// The whole line goes out as ONE indexed draw call: per-glyph calls
+/// here cost the menu hundreds of GL submissions per frame.
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_menu_line(
     gl: &smithay::backend::renderer::gles2::ffi::Gles2,
@@ -187,6 +189,7 @@ unsafe fn draw_menu_line(
     text: &str,
 ) {
     let (_, glyphs) = cache.layout_line(text);
+    let mut quads: Vec<[f32; 16]> = Vec::with_capacity(glyphs.len());
     for g in glyphs {
         let slot = match cache.slot(g.ch) {
             Some(s) if s.w > 0 => *s,
@@ -196,14 +199,14 @@ unsafe fn draw_menu_line(
         let y0 = y + g.y * u;
         let x1 = x0 + g.w * u;
         let y1 = y0 + g.h * u;
-        let verts: [f32; 16] = [
+        quads.push([
             x0, y0, slot.u0, slot.v0, //
             x1, y0, slot.u1, slot.v0, //
             x0, y1, slot.u0, slot.v1, //
             x1, y1, slot.u1, slot.v1,
-        ];
-        crate::render3d::draw_textured(gl, tprog, mvp, atlas, &verts, false);
+        ]);
     }
+    crate::render3d::draw_textured_batch(gl, tprog, mvp, atlas, &quads, false);
 }
 
 /// Buffer size whatever the sharing mode: shm via its contents, dmabuf
@@ -741,6 +744,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 if menu.open {
                     if sym == KEY_Escape && pressed {
                         menu.open = false;
+                        font_cache.clear_layout_cache();
                         log::info!("menu closed");
                         need_render = true;
                         return;
@@ -1475,6 +1479,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                             }
                             None => {
                                 menu.open = false;
+                                font_cache.clear_layout_cache();
                                 log::info!("menu closed");
                             }
                         }

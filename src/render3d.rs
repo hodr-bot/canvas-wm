@@ -451,6 +451,87 @@ pub unsafe fn draw_textured(
     gl.Enable(ffi::SCISSOR_TEST);
 }
 
+/// Quad index list for a batch of `n` independent quads drawn as
+/// indexed triangles. Matches the TRIANGLE_STRIP winding of
+/// [`draw_textured`] (strip v0,v1,v2,v3 = triangles (0,1,2),(2,1,3)).
+/// Pure function, unit-tested below.
+pub fn batch_quad_indices(n: usize) -> Vec<u16> {
+    let mut idx = Vec::with_capacity(n * 6);
+    for q in 0..n {
+        let b = (q * 4) as u16;
+        idx.extend_from_slice(&[b, b + 1, b + 2, b + 2, b + 1, b + 3]);
+    }
+    idx
+}
+
+/// Textured batch draw: `quads` are (x, y, u, v) quads like
+/// [`draw_textured`], rendered as ONE indexed draw call instead of one
+/// call per quad. The menu text path batches a whole line this way
+/// (hundreds of glyph calls per frame become ~twenty line calls).
+/// Empty input draws nothing.
+#[cfg(feature = "compositor")]
+pub unsafe fn draw_textured_batch(
+    gl: &ffi::Gles2,
+    prog: (u32, i32, i32, i32, u32, u32),
+    mvp: &[f32; 16],
+    tex_id: u32,
+    quads: &[[f32; 16]],
+    opaque: bool,
+) {
+    if quads.is_empty() {
+        return;
+    }
+    let (program, u_mvp, u_tex, u_opaque, a_pos, a_uv) = prog;
+    gl.Disable(ffi::SCISSOR_TEST);
+    gl.UseProgram(program);
+    gl.UniformMatrix4fv(u_mvp, 1, ffi::FALSE as u8, mvp.as_ptr());
+    gl.ActiveTexture(ffi::TEXTURE0);
+    gl.BindTexture(ffi::TEXTURE_2D, tex_id);
+    gl.Uniform1i(u_tex, 0);
+    gl.Uniform1f(u_opaque, if opaque { 1.0 } else { 0.0 });
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+    gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+    // Interleave into position + uv arrays (client-side, like the
+    // single-quad path above).
+    let mut pos: Vec<f32> = Vec::with_capacity(quads.len() * 8);
+    let mut uv: Vec<f32> = Vec::with_capacity(quads.len() * 8);
+    for q in quads {
+        pos.extend_from_slice(&[q[0], q[1], q[4], q[5], q[8], q[9], q[12], q[13]]);
+        uv.extend_from_slice(&[q[2], q[3], q[6], q[7], q[10], q[11], q[14], q[15]]);
+    }
+    let idx = batch_quad_indices(quads.len());
+    gl.EnableVertexAttribArray(a_pos);
+    gl.EnableVertexAttribArray(a_uv);
+    gl.VertexAttribPointer(
+        a_pos,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE as u8,
+        0,
+        pos.as_ptr() as *const _,
+    );
+    gl.VertexAttribPointer(
+        a_uv,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE as u8,
+        0,
+        uv.as_ptr() as *const _,
+    );
+    gl.DrawElements(
+        ffi::TRIANGLES,
+        idx.len() as i32,
+        ffi::UNSIGNED_SHORT,
+        idx.as_ptr() as *const _,
+    );
+    gl.DisableVertexAttribArray(a_uv);
+    gl.DisableVertexAttribArray(a_pos);
+    gl.BindTexture(ffi::TEXTURE_2D, 0);
+    gl.UseProgram(0);
+    gl.Enable(ffi::SCISSOR_TEST);
+}
+
 /// True when an shm buffer format carries no real alpha: the X byte is
 /// whatever the X server left behind (usually 0x00), so sampling it as
 /// alpha turns the window transparent wherever nothing opaque was drawn
@@ -864,6 +945,21 @@ mod tests {
         let clip_x = m[0] * x + m[4] * y + m[12];
         let clip_y = m[1] * x + m[5] * y + m[13];
         (clip_x, clip_y)
+    }
+
+    #[test]
+    fn batch_indices_match_strip_winding() {
+        assert!(batch_quad_indices(0).is_empty());
+        assert_eq!(batch_quad_indices(1), vec![0, 1, 2, 2, 1, 3]);
+        let two = batch_quad_indices(2);
+        assert_eq!(two.len(), 12);
+        assert_eq!(&two[6..], &[4, 5, 6, 6, 5, 7]);
+        // Every index addresses a real vertex of its quad.
+        for (qi, chunk) in two.chunks(6).enumerate() {
+            for i in chunk {
+                assert!(*i >= qi as u16 * 4 && *i < qi as u16 * 4 + 4);
+            }
+        }
     }
 
     #[test]
