@@ -71,8 +71,8 @@ pub fn drag_offset(press: Vec2, current: Vec2) -> Option<Vec2> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SuperState {
     Idle,
-    /// Canvas mode: no zoom change, apps frozen. Drag on empty space pans
-    /// the canvas; a 1s dwell inside a window arms it for moving.
+    /// Canvas mode: no zoom change, apps frozen. Left drag pans anywhere
+    /// with no wait.
     Canvas,
 }
 
@@ -99,47 +99,15 @@ pub struct CanvasOrigin {
     pub offset: Vec2,
 }
 
-/// Dwell-to-arm: staying inside one window for DWELL_ARM_MS (small moves
-/// inside allowed, leaving resets) arms it for moving, Hyprland-style but
-/// without holding a key.
-pub const DWELL_ARM_MS: u64 = 1000;
-
-#[derive(Debug, Default)]
-pub struct DwellTracker {
-    pub inside: Option<u64>,
-    pub since_ms: u64,
-    pub armed: Option<u64>,
-}
-
-impl DwellTracker {
-    pub fn update(&mut self, inside: Option<u64>, now_ms: u64) -> Option<u64> {
-        if inside != self.inside {
-            self.inside = inside;
-            self.since_ms = now_ms;
-            self.armed = None;
-        }
-        if let Some(id) = self.inside {
-            if self.armed.is_none() && now_ms.saturating_sub(self.since_ms) >= DWELL_ARM_MS {
-                self.armed = Some(id);
-            }
-        } else {
-            self.armed = None;
-        }
-        self.armed
-    }
-
-    pub fn disarm(&mut self) {
-        self.armed = None;
-    }
-}
-
 /// Drives canvas mode enter/quit + multi-select, shared by all outputs.
+/// Left drag pans anywhere with no wait.
 pub struct Session {
     pub state: SuperState,
     pub overview: Overview,
+    /// Fixed viewpoint: pos stays zero, only zoom glides (Super dolly +
+    /// wheel zoom). Panning never retargets the camera.
     pub camera: Camera,
     pub canvas: CanvasOrigin,
-    pub dwell: DwellTracker,
     pub prev_offset: Option<Vec2>,
     /// Zoom before Super mode, for the dolly-back-and-return. Enter
     /// glides to 90%, every quit path glides back here — the view
@@ -166,7 +134,6 @@ impl Session {
             overview: Overview::default(),
             camera: Camera::new(),
             canvas: CanvasOrigin::default(),
-            dwell: DwellTracker::default(),
             prev_offset: None,
             prev_zoom: None,
             super_dolly: 0.90,
@@ -205,6 +172,9 @@ impl Session {
     }
 
     /// Pan the canvas by a screen-space drag delta (content follows cursor).
+    /// Left drag pans anywhere with no wait: the offset moves immediately,
+    /// no spring, no camera retarget. Camera stays fixed for pan — pos
+    /// stays zero, only zoom glides.
     /// The offset velocity is left for the backend to measure per-frame
     /// (offset delta / dt): it drives the toy-cube grip, so a left-drag
     /// fling shoves the cubes like a yanked tablecloth.
@@ -328,7 +298,6 @@ impl Session {
                 self.camera.zoom_to(self.camera.zoom_target * self.super_dolly);
                 self.overview.enter();
                 self.state = SuperState::Canvas;
-                self.dwell = DwellTracker::default();
                 self.zoom_anchor = None;
                 SuperAction::EnterCanvas
             }
@@ -348,14 +317,12 @@ impl Session {
                 if let Some(z) = self.prev_zoom.take() {
                     self.camera.zoom_to(z);
                 }
-                self.dwell.disarm();
                 SuperAction::QuitCanvas { centred: false }
             }
             // Esc: quit, drop the selection, undo canvas panning, zoom back.
             (SuperState::Canvas, SuperEvent::Esc) => {
                 self.overview.quit();
                 self.state = SuperState::Idle;
-                self.dwell.disarm();
                 self.zoom_anchor = None;
                 if let Some(prev) = self.prev_offset.take() {
                     self.canvas.offset = prev;
@@ -370,7 +337,6 @@ impl Session {
             (SuperState::Canvas, SuperEvent::CanvasClick) => {
                 self.overview.quit();
                 self.state = SuperState::Idle;
-                self.dwell.disarm();
                 self.prev_offset = None;
                 self.zoom_anchor = None;
                 if let Some(z) = self.prev_zoom.take() {
@@ -621,22 +587,6 @@ mod tests {
         ));
         assert_eq!(s.canvas.offset, Vec2::new(0.0, 0.0));
         assert_eq!(s.state, SuperState::Idle);
-    }
-
-    #[test]
-    fn dwell_arms_after_one_second_inside() {
-        let mut d = DwellTracker::default();
-        assert_eq!(d.update(None, 0), None);
-        assert_eq!(d.update(Some(1), 0), None);
-        // Small moves inside the same window do not reset the timer.
-        assert_eq!(d.update(Some(1), 500), None);
-        assert_eq!(d.update(Some(1), 999), None);
-        assert_eq!(d.update(Some(1), 1000), Some(1));
-        assert_eq!(d.update(Some(1), 5000), Some(1));
-        // Switching window resets; leaving disarms.
-        assert_eq!(d.update(Some(2), 5001), None);
-        assert_eq!(d.update(Some(2), 6001), Some(2));
-        assert_eq!(d.update(None, 6002), None);
     }
 
     #[test]
