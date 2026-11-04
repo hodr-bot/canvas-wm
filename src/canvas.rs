@@ -456,6 +456,41 @@ pub fn offset_to_centre(cam_pos: Vec2, target: Vec2) -> Vec2 {
     cam_pos - target
 }
 
+/// Gentle half-zoom half-fisheye radial gain.
+///
+/// `dist_px` is the distance from the view centre, `half_diag_px` the
+/// half-diagonal of the view (i.e. the centre-to-corner distance).
+/// Returns a multiplicative gain: 1 at the centre, rising smoothly to
+/// ~1.08 at the corners, capped beyond. The smoothstep profile has
+/// zero slope at the centre (no kink, no nausea) and zero slope at
+/// the cap (no hard clamp edge). Pure function.
+pub fn fisheye_factor(dist_px: f64, half_diag_px: f64) -> f64 {
+    if !(dist_px > 0.0) || !(half_diag_px > 0.0) {
+        return 1.0;
+    }
+    let t = (dist_px / half_diag_px).clamp(0.0, 1.0);
+    // Smoothstep: t*t*(3-2t), monotonic on [0,1], 0 at 0, 1 at 1.
+    let s = t * t * (3.0 - 2.0 * t);
+    1.0 + 0.08 * s
+}
+
+/// Apply the gentle fisheye to a screen point: radial expansion about
+/// `centre` by [`fisheye_factor`]. Identity at the centre, smooth and
+/// monotonic outward, capped near 8% at the corners. Pure function.
+pub fn apply_fisheye(screen: Vec2, centre: Vec2, half_diag: f64) -> Vec2 {
+    let ox = screen.x - centre.x;
+    let oy = screen.y - centre.y;
+    if ox == 0.0 && oy == 0.0 {
+        return centre;
+    }
+    if !(half_diag > 0.0) {
+        return screen;
+    }
+    let dist = (ox * ox + oy * oy).sqrt();
+    let f = fisheye_factor(dist, half_diag);
+    Vec2::new(centre.x + ox * f, centre.y + oy * f)
+}
+
 /// Void dust: faint motes pinned to the canvas plane so camera motion
 /// reads on screen even with no window in view (panning the void
 /// otherwise shows nothing moving). Deterministic hash grid over
@@ -830,5 +865,65 @@ mod tests {
             offset_to_centre(Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0)),
             Vec2::new(0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn fisheye_centre_is_identity() {
+        let centre = Vec2::new(960.0, 540.0);
+        let half_diag = (960.0f64 * 960.0 + 540.0 * 540.0).sqrt();
+        assert_eq!(fisheye_factor(0.0, half_diag), 1.0);
+        assert_eq!(apply_fisheye(centre, centre, half_diag), centre);
+        // Zero / degenerate inputs stay identity (no NaN, no shift).
+        assert_eq!(fisheye_factor(0.0, 0.0), 1.0);
+        assert_eq!(fisheye_factor(-5.0, half_diag), 1.0);
+        assert_eq!(apply_fisheye(centre, centre, 0.0), centre);
+    }
+
+    #[test]
+    fn fisheye_corner_capped_near_8_percent() {
+        let half_diag = 1100.0;
+        let corner = fisheye_factor(half_diag, half_diag);
+        assert!(
+            (corner - 1.08).abs() < 1e-9,
+            "corner gain should be ~1.08, got {}",
+            corner
+        );
+        // Beyond the corner: capped, never exceeds ~1.08.
+        assert_eq!(fisheye_factor(half_diag * 2.0, half_diag), corner);
+        assert!(fisheye_factor(half_diag * 5.0, half_diag) <= 1.08 + 1e-9);
+        // apply_fisheye at the corner matches the capped gain.
+        let centre = Vec2::new(0.0, 0.0);
+        let screen = Vec2::new(half_diag, 0.0);
+        let out = apply_fisheye(screen, centre, half_diag);
+        assert!((out.x - half_diag * 1.08).abs() < 1e-6);
+        assert!((out.y - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fisheye_monotonic_outward() {
+        let half_diag = 1100.0;
+        let mut prev = fisheye_factor(0.0, half_diag);
+        for i in 1..=20 {
+            let d = half_diag * i as f64 / 20.0;
+            let f = fisheye_factor(d, half_diag);
+            assert!(f >= prev, "gain must not decrease at d={}", d);
+            assert!(f >= 1.0 && f <= 1.08 + 1e-9);
+            prev = f;
+        }
+        // apply_fisheye pushes outward smoothly along a ray: mapped
+        // distance from centre grows monotonically with input distance.
+        let centre = Vec2::new(960.0, 540.0);
+        let mut prev_d = 0.0;
+        for i in 1..=20 {
+            let d = half_diag * i as f64 / 20.0;
+            let p = Vec2::new(centre.x + d, centre.y);
+            let q = apply_fisheye(p, centre, half_diag);
+            let mapped = q.x - centre.x;
+            assert!(mapped > prev_d, "mapped dist must grow at d={}", d);
+            prev_d = mapped;
+            // Same side, no flip: gentle, no nausea.
+            assert!(q.x > centre.x);
+            assert!((q.y - centre.y).abs() < 1e-9);
+        }
     }
 }
