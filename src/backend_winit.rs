@@ -1794,8 +1794,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         if let Some(g) = r_scale.as_mut() {
             if g.live {
                 let now = session.to_canvas(pointer, view);
-                g.target =
-                    crate::chrome::axial_target_size(g.center, g.size0, g.grab, now);
+                let fs = crate::chrome::fullscreen_rect_for(view, &|s| {
+                    session.to_canvas(s, view)
+                });
+                g.target = crate::chrome::axial_target_size_capped(
+                    g.center, g.size0, g.grab, now, fs.size.x, fs.size.y,
+                );
             }
             let tick = std::time::Instant::now();
             let dt = tick.duration_since(last_scale_step).as_secs_f64();
