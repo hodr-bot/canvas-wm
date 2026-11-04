@@ -427,6 +427,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // Frame counter: phases the far-marble LOD steps.
     let mut frame_no: u64 = 0;
     let mut prev_canvas_offset = session.canvas.offset;
+    let mut dust_motion = 0.0;
     let mut shake = crate::marbles::Shake::new();
     let mut e_grab: Option<(u64, crate::canvas::Vec2)> = None;
     // Centre-anchored scale (R held): the live gesture (id, pinned
@@ -898,13 +899,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         // gamer cluster, ZQSD-labelled on azerty): D pulls
                         // focus to the window on the right, A left, W up,
                         // S down — strictly in that half-plane, or nothing.
-                        // Anchored on the CAMERA (view centre), never on the
-                        // selection: after panning into the void the view
-                        // may be nowhere near the focused window, and
-                        // searching from the selection then finds nothing
-                        // (or the wrong window) and feels stuck. Once a
-                        // flight lands, view centre == window centre, so
-                        // window-to-window hopping is unchanged.
+                        // Camera FIXED: the search starts at the SETTLED
+                        // camera goal (view centre once any flight lands),
+                        // never the live spring pos, and the found window
+                        // is centred with an instant canvas offset snap —
+                        // the camera never moves for focus, so neighbours
+                        // stay valid with no wait.
                         // Canvas-modal and consumed, so apps never see it.
                         // Keyboard window move: Shift + WASD shoves the
                         // focused window (else the hovered one) by a fixed
@@ -978,9 +978,26 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     view.x / 2.0,
                                     view.y / 2.0,
                                 );
-                                // Camera-anchored: where you look is where
-                                // the search starts (see above).
-                                let from = session.to_canvas(centre, view);
+                                // Settled-goal origin: a Camera with pos =
+                                // camera.target and the same zoom and canvas
+                                // offset as the live view, so a mid-flight
+                                // spring never skews the half-plane search.
+                                // Camera fixed — no flight, no wait.
+                                let settled_cam = crate::canvas::Camera {
+                                    pos: session.camera.target,
+                                    zoom: session.camera.zoom,
+                                    ..crate::canvas::Camera::new()
+                                };
+                                let settled_view = crate::canvas::Camera {
+                                    pos: crate::canvas::Vec2::new(
+                                        settled_cam.pos.x - session.canvas.offset.x,
+                                        settled_cam.pos.y - session.canvas.offset.y,
+                                    ),
+                                    zoom: settled_cam.zoom,
+                                    ..crate::canvas::Camera::new()
+                                };
+                                let from =
+                                    settled_view.screen_to_world(centre, view);
                                 let wins: Vec<crate::canvas::CanvasWindow> =
                                     server_state
                                         .windows
@@ -994,10 +1011,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                 ) {
                                     Some(id) => {
                                         // Focus + raise, like click-focus:
-                                        // what you type stays visible. The
-                                        // camera flies to the window centre
-                                        // (view-centre world = pos - offset,
-                                        // so the goal is centre + offset).
+                                        // what you type stays visible. Camera
+                                        // fixed: centre the window with an
+                                        // instant canvas offset snap, never
+                                        // a camera flight.
                                         if let Some(c) =
                                             server_state.windows.get(&id)
                                         {
@@ -1011,12 +1028,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                                 server.focus_keyboard(None);
                                             }
                                             let ctr = c.canvas.center();
-                                            session.camera.retarget(
-                                                crate::canvas::Vec2::new(
-                                                    ctr.x + session.canvas.offset.x,
-                                                    ctr.y + session.canvas.offset.y,
-                                                ),
-                                            );
+                                            session.canvas.offset =
+                                                crate::canvas::offset_to_centre(
+                                                    session.camera.pos,
+                                                    ctr,
+                                                );
                                         }
                                         server_state.raise(id);
                                         focused_id = Some(id);
