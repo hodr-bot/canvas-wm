@@ -94,9 +94,71 @@ pub enum SuperAction {
 
 /// Canvas origin on the infinite plane, separate from the camera so future
 /// velocity/physics animate the content, never the viewpoint.
-#[derive(Debug, Clone, Copy, Default)]
+/// WASD focus glides the offset on the same critically-damped spring as
+/// the camera (no overshoot, exact settle); direct writes (pan, zoom
+/// anchor) snap and clear the goal so fingers never fight the spring.
+#[derive(Debug, Clone, Copy)]
 pub struct CanvasOrigin {
     pub offset: Vec2,
+    goal: Vec2,
+    vel: Vec2,
+}
+
+impl Default for CanvasOrigin {
+    fn default() -> Self {
+        Self {
+            offset: Vec2::new(0.0, 0.0),
+            goal: Vec2::new(0.0, 0.0),
+            vel: Vec2::new(0.0, 0.0),
+        }
+    }
+}
+
+impl CanvasOrigin {
+    /// Glide target (WASD focus). Momentum kept, never snaps.
+    pub fn set_goal(&mut self, goal: Vec2) {
+        self.goal = goal;
+    }
+
+    /// Direct write: offset, goal and velocity all land here.
+    pub fn snap_to(&mut self, offset: Vec2) {
+        self.offset = offset;
+        self.goal = offset;
+        self.vel = Vec2::new(0.0, 0.0);
+    }
+
+    /// True while gliding toward a goal set by [`set_goal`](Self::set_goal).
+    pub fn gliding(&self) -> bool {
+        self.offset != self.goal || self.vel != Vec2::new(0.0, 0.0)
+    }
+
+    /// Advance the glide spring by `dt` seconds. Same tuning as the
+    /// camera position spring (~95% in ~0.45s, critically damped).
+    /// Returns true while still gliding — the backend forces frames on
+    /// true. Pure physics, unit-tested below.
+    pub fn step(&mut self, dt: f64) -> bool {
+        if !self.gliding() {
+            return false;
+        }
+        const STIFFNESS: f64 = 90.0;
+        let damping = 2.0 * STIFFNESS.sqrt();
+        let dt = dt.clamp(0.0, 0.05);
+        let ax = STIFFNESS * (self.goal.x - self.offset.x) - damping * self.vel.x;
+        let ay = STIFFNESS * (self.goal.y - self.offset.y) - damping * self.vel.y;
+        self.vel.x += ax * dt;
+        self.vel.y += ay * dt;
+        self.offset.x += self.vel.x * dt;
+        self.offset.y += self.vel.y * dt;
+        let dx = self.goal.x - self.offset.x;
+        let dy = self.goal.y - self.offset.y;
+        if dx * dx + dy * dy < 0.25
+            && self.vel.x * self.vel.x + self.vel.y * self.vel.y < 25.0
+        {
+            self.snap_to(self.goal);
+            return false;
+        }
+        true
+    }
 }
 
 /// Drives canvas mode enter/quit + multi-select, shared by all outputs.
@@ -181,8 +243,10 @@ impl Session {
     pub fn pan_canvas(&mut self, delta_screen: Vec2) {
         self.canvas.offset.x += delta_screen.x / self.camera.zoom;
         self.canvas.offset.y += delta_screen.y / self.camera.zoom;
-        // Manual pan owns the offset now: drop any zoom tracking.
+        // Manual pan owns the offset now: drop any zoom tracking and
+        // any WASD glide — the finger leads, the spring follows.
         self.zoom_anchor = None;
+        self.canvas.snap_to(self.canvas.offset);
     }
 
     /// Zoom keeping the world point under `screen` fixed.
@@ -215,6 +279,7 @@ impl Session {
             - anchor.x;
         self.canvas.offset.y = (s.y - view.y * 0.5) / self.camera.zoom + self.camera.pos.y
             - anchor.y;
+        self.canvas.snap_to(self.canvas.offset);
         self.zoom_slip.x += self.canvas.offset.x - old.x;
         self.zoom_slip.y += self.canvas.offset.y - old.y;
     }
@@ -287,6 +352,7 @@ impl Session {
                 (s.x - view.x * 0.5) / z + self.camera.pos.x - world.x;
             self.canvas.offset.y =
                 (s.y - view.y * 0.5) / z + self.camera.pos.y - world.y;
+            self.canvas.snap_to(self.canvas.offset);
             // Anchor tracking rewrites the offset every frame of the
             // fade: bank it as zoom slip, never as canvas motion.
             self.zoom_slip.x += self.canvas.offset.x - old.x;
@@ -386,6 +452,47 @@ impl Default for Session {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn canvas_glide_settles_exactly_without_overshoot() {
+        let mut c = CanvasOrigin::default();
+        assert!(!c.gliding());
+        let goal = Vec2::new(400.0, -200.0);
+        c.set_goal(goal);
+        assert!(c.gliding());
+        // Monotonic approach on each axis (critically damped: no
+        // overshoot, no sign flip past the goal).
+        let (mut px, mut py) = (c.offset.x, c.offset.y);
+        let mut still = true;
+        for _ in 0..600 {
+            still = c.step(1.0 / 60.0);
+            assert!(
+                (c.offset.x - px) * (goal.x - px) >= -1e-9
+                    && (c.offset.y - py) * (goal.y - py) >= -1e-9,
+                "must approach, never retreat"
+            );
+            px = c.offset.x;
+            py = c.offset.y;
+            if !still {
+                break;
+            }
+        }
+        assert!(!still, "glide must settle");
+        assert!(!c.gliding());
+        assert_eq!(c.offset, goal);
+    }
+
+    #[test]
+    fn canvas_direct_writes_clear_the_glide() {
+        let mut c = CanvasOrigin::default();
+        c.set_goal(Vec2::new(500.0, 500.0));
+        c.step(1.0 / 60.0);
+        assert!(c.gliding());
+        c.snap_to(Vec2::new(10.0, 20.0));
+        assert_eq!(c.offset, Vec2::new(10.0, 20.0));
+        assert!(!c.gliding());
+        assert!(!c.step(1.0 / 60.0));
+    }
 
     fn two_windows() -> HashMap<u64, CanvasWindow> {
         let mut m = HashMap::new();

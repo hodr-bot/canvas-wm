@@ -128,6 +128,10 @@ pub struct ClientWindow {
     pub view_lock: Option<crate::layer::ViewLock>,
     /// Stacking order: higher is on top. Bumped on click-focus and grab.
     pub z: u64,
+    /// When the window mapped: headed diagnostics warn once if no
+    /// buffer arrives within seconds (client never committed).
+    pub created: std::time::Instant,
+    warned_nobuffer: bool,
 }
 
 impl ClientWindow {
@@ -142,7 +146,28 @@ impl ClientWindow {
             buf_size: None,
             view_lock: None,
             z: 0,
+            created: std::time::Instant::now(),
+            warned_nobuffer: false,
         }
+    }
+
+    /// Warn once (headed log) if a mapped window still shows nothing
+    /// after `grace` — the client connected but never committed a
+    /// buffer. Returns true when the warning fired (test hook).
+    pub fn warn_if_bufferless(&mut self, id: u64, grace_secs: u64) -> bool {
+        if self.texture.is_none()
+            && !self.warned_nobuffer
+            && self.created.elapsed().as_secs() >= grace_secs
+        {
+            self.warned_nobuffer = true;
+            log::warn!(
+                "window {} mapped {}s with no buffer — client never committed?",
+                id,
+                grace_secs
+            );
+            return true;
+        }
+        false
     }
 }
 
@@ -811,6 +836,19 @@ mod tests {
         let b = cascade_origin(1);
         assert!(b.x > a.x && b.y > a.y);
         assert_eq!(cascade_origin(8), cascade_origin(0));
+    }
+
+    #[test]
+    fn bufferless_warning_fires_once_after_grace() {
+        let mut s = ServerState::default();
+        let id = s.add_toplevel(None);
+        let w = s.windows.get_mut(&id).unwrap();
+        // Fresh: silent. Backdate past grace: fires once, then quiet.
+        assert!(!w.warn_if_bufferless(id, 5));
+        w.created = std::time::Instant::now()
+            - std::time::Duration::from_secs(30);
+        assert!(w.warn_if_bufferless(id, 5));
+        assert!(!w.warn_if_bufferless(id, 5));
     }
 
     #[test]

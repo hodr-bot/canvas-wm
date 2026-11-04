@@ -419,7 +419,7 @@ pub fn fit_view_for_selection(
     let zoom = ((view.x - padding * 2.0) / bbox_w)
         .min((view.y - padding * 2.0) / bbox_h)
         .clamp(0.05, 2.0);
-    // The gentle fisheye pushes off-centre content outward (up to ~8%
+    // The gentle fisheye pushes off-centre content outward (up to ~12%
     // at the corners when zoomed), so a flat fit can overflow the
     // padding. Shrink until the WARPED bbox corners honour it.
     let probe = |zx: f64, px: f64, py: f64| {
@@ -530,7 +530,7 @@ pub fn offset_to_centre(cam_pos: Vec2, target: Vec2) -> Vec2 {
 /// `dist_px` is the distance from the view centre, `half_diag_px` the
 /// half-diagonal of the view (i.e. the centre-to-corner distance).
 /// Returns a multiplicative gain: 1 at the centre, rising smoothly to
-/// ~1.08 at the corners, capped beyond. The smoothstep profile has
+/// ~1.12 at the corners, capped beyond. The smoothstep profile has
 /// zero slope at the centre (no kink, no nausea) and zero slope at
 /// the cap (no hard clamp edge). Pure function.
 pub fn fisheye_factor(dist_px: f64, half_diag_px: f64) -> f64 {
@@ -540,12 +540,12 @@ pub fn fisheye_factor(dist_px: f64, half_diag_px: f64) -> f64 {
     let t = (dist_px / half_diag_px).clamp(0.0, 1.0);
     // Smoothstep: t*t*(3-2t), monotonic on [0,1], 0 at 0, 1 at 1.
     let s = t * t * (3.0 - 2.0 * t);
-    1.0 + 0.08 * s
+    1.0 + 0.12 * s
 }
 
 /// Apply the gentle fisheye to a screen point: radial expansion about
 /// `centre` by [`fisheye_factor`]. Identity at the centre, smooth and
-/// monotonic outward, capped near 8% at the corners. Pure function.
+/// monotonic outward, capped near 12% at the corners. Pure function.
 pub fn apply_fisheye(screen: Vec2, centre: Vec2, half_diag: f64) -> Vec2 {
     apply_fisheye_gain(screen, centre, half_diag, 1.0)
 }
@@ -579,13 +579,13 @@ pub fn apply_fisheye_gain(
 }
 
 /// Fisheye gain from the camera zoom: 0 at zoom 1 (flat, back-compat),
-/// ramping with |zoom − 1|, capped at 1. Zoomed-in and zoomed-out both
-/// breathe; the centre never moves. Pure function.
+/// ramping fast with |zoom − 1| (full by ±0.5), capped at 1. Zoomed-in
+/// and zoomed-out both breathe; the centre never moves. Pure function.
 pub fn fisheye_gain(zoom: f64) -> f64 {
     if !zoom.is_finite() {
         return 0.0;
     }
-    ((zoom - 1.0).abs() * 0.75).clamp(0.0, 1.0)
+    ((zoom - 1.0).abs() * 2.0).clamp(0.0, 1.0)
 }
 
 /// View centre and half-diagonal (centre-to-corner) in screen px.
@@ -644,14 +644,16 @@ pub fn unapply_fisheye(
 /// canvas cells — infinite, stateless, zero per-frame cost beyond
 /// drawing. Two depths (rigid + half parallax) for a hint of depth.
 /// Fades out when zoomed far (overview), full at working zoom.
-/// `motion` is camera speed in canvas px/s; below 60 the void stays
-/// clean (no dust at rest). Sizes are constant screen px per layer
+/// `motion` is camera speed in canvas px/s; it only scales the alpha
+/// (full bright in motion, faint at rest) — the dust never blinks out,
+/// a visibility gate reads as flicker under a held button.
+/// Sizes are constant screen px per layer
 /// (3.2 / 2.4) with small per-dot hash variation, never zoom-scaled.
 /// Returns screen-space (x, y, size, alpha) in logical px.
 pub fn dust_dots(cam: &Camera, view: Vec2, motion: f64) -> Vec<(f64, f64, f64, f32)> {
-    if motion < 60.0 {
-        return Vec::new();
-    }
+    // No visibility gate: motion scales alpha (bright in motion, faint
+    // at rest) so dots never pop under a held finger.
+    let motion_k = (motion / 240.0).clamp(0.15, 1.0) as f32;
     const CELL: f64 = 320.0;
     /// Cap cells per axis so zoomed-out views stay cheap: stride the
     /// grid instead (dots shrink with zoom anyway, sparser is fine).
@@ -710,8 +712,18 @@ pub fn dust_dots(cam: &Camera, view: Vec2, motion: f64) -> Vec<(f64, f64, f64, f
                         (w.x, w.y)
                     };
                     let s = base_s * (0.8 + 0.4 * f64::from(fv));
-                    let a = base_a * fade * (0.6 + 0.4 * fv);
-                    out.push((sx, sy, s, a));
+                    let a = base_a * fade * motion_k * (0.6 + 0.4 * fv);
+                    // Cull past a dot-size margin outside the viewport:
+                    // far-offscreen quads are what clipped oddly at the
+                    // frame edges while panning.
+                    let m = s;
+                    if sx > -m
+                        && sy > -m
+                        && sx < view.x + m
+                        && sy < view.y + m
+                    {
+                        out.push((sx, sy, s, a));
+                    }
                 }
             }
         }
@@ -968,7 +980,14 @@ mod tests {
         let view = Vec2::new(1920.0, 1080.0);
         let a = dust_dots(&cam, view, 500.0);
         let b = dust_dots(&cam, view, 500.0);
-        assert!(dust_dots(&cam, view, 0.0).is_empty());
+        // Persistent at rest (faint, never blinking out): motion only
+        // scales the alpha, so rest dots are dimmer but present.
+        let rest = dust_dots(&cam, view, 0.0);
+        assert_eq!(a.len(), rest.len());
+        let max_a = a.iter().map(|d| d.3).fold(0.0f32, f32::max);
+        let max_rest = rest.iter().map(|d| d.3).fold(0.0f32, f32::max);
+        assert!(max_rest < max_a, "rest must be fainter than motion");
+        assert!(max_rest > 0.0, "rest must stay visible");
         assert_eq!(a.len(), b.len());
         assert!(a.len() > 50, "void should read: {}", a.len());
         assert!(a.len() < 800, "bounded draw cost: {}", a.len());
@@ -1041,22 +1060,22 @@ mod tests {
     }
 
     #[test]
-    fn fisheye_corner_capped_near_8_percent() {
+    fn fisheye_corner_capped_near_12_percent() {
         let half_diag = 1100.0;
         let corner = fisheye_factor(half_diag, half_diag);
         assert!(
-            (corner - 1.08).abs() < 1e-9,
-            "corner gain should be ~1.08, got {}",
+            (corner - 1.12).abs() < 1e-9,
+            "corner gain should be ~1.12, got {}",
             corner
         );
-        // Beyond the corner: capped, never exceeds ~1.08.
+        // Beyond the corner: capped, never exceeds ~1.12.
         assert_eq!(fisheye_factor(half_diag * 2.0, half_diag), corner);
-        assert!(fisheye_factor(half_diag * 5.0, half_diag) <= 1.08 + 1e-9);
+        assert!(fisheye_factor(half_diag * 5.0, half_diag) <= 1.12 + 1e-9);
         // apply_fisheye at the corner matches the capped gain.
         let centre = Vec2::new(0.0, 0.0);
         let screen = Vec2::new(half_diag, 0.0);
         let out = apply_fisheye(screen, centre, half_diag);
-        assert!((out.x - half_diag * 1.08).abs() < 1e-6);
+        assert!((out.x - half_diag * 1.12).abs() < 1e-6);
         assert!((out.y - 0.0).abs() < 1e-9);
     }
 
@@ -1068,7 +1087,7 @@ mod tests {
             let d = half_diag * i as f64 / 20.0;
             let f = fisheye_factor(d, half_diag);
             assert!(f >= prev, "gain must not decrease at d={}", d);
-            assert!(f >= 1.0 && f <= 1.08 + 1e-9);
+            assert!(f >= 1.0 && f <= 1.12 + 1e-9);
             prev = f;
         }
         // apply_fisheye pushes outward smoothly along a ray: mapped
@@ -1093,9 +1112,10 @@ mod tests {
         assert_eq!(fisheye_gain(1.0), 0.0);
         assert_eq!(fisheye_gain(f64::NAN), 0.0);
         assert_eq!(fisheye_gain(f64::INFINITY), 0.0);
-        // Ramps symmetrically, capped at 1.
-        assert!((fisheye_gain(2.0) - 0.75).abs() < 1e-9);
-        assert!((fisheye_gain(0.0) - 0.75).abs() < 1e-9);
+        // Ramps symmetrically, capped at 1 (full by ±0.5).
+        assert!((fisheye_gain(1.5) - 1.0).abs() < 1e-9);
+        assert!((fisheye_gain(0.5) - 1.0).abs() < 1e-9);
+        assert!((fisheye_gain(1.25) - 0.5).abs() < 1e-9);
         assert_eq!(fisheye_gain(4.0), 1.0);
         assert_eq!(fisheye_gain(-2.0), 1.0);
     }
@@ -1223,8 +1243,8 @@ mod tests {
             let ds = ((s.x - 960.0).powi(2) + (s.y - 540.0).powi(2)).sqrt();
             assert!(ds >= df - 1e-9, "warp must not pull inward");
             assert!(
-                ds <= df * 1.08 + 1e-6,
-                "warp exceeds the 8% corner cap"
+                ds <= df * 1.12 + 1e-6,
+                "warp exceeds the 12% corner cap"
             );
         }
     }

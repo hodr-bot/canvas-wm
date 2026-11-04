@@ -1016,9 +1016,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     Some(id) => {
                                         // Focus + raise, like click-focus:
                                         // what you type stays visible. Camera
-                                        // fixed: centre the window with an
-                                        // instant canvas offset snap, never
-                                        // a camera flight.
+                                        // fixed: glide the canvas offset to
+                                        // centre the window on the same
+                                        // spring as the camera (smooth,
+                                        // no overshoot) — never a snap,
+                                        // never a camera flight.
                                         if let Some(c) =
                                             server_state.windows.get(&id)
                                         {
@@ -1032,11 +1034,12 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                                 server.focus_keyboard(None);
                                             }
                                             let ctr = c.canvas.center();
-                                            session.canvas.offset =
+                                            session.canvas.set_goal(
                                                 crate::canvas::offset_to_centre(
                                                     session.camera.pos,
                                                     ctr,
-                                                );
+                                                ),
+                                            );
                                         }
                                         server_state.raise(id);
                                         focused_id = Some(id);
@@ -1956,6 +1959,9 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             if session.camera.step(dt) {
                 need_render = true;
             }
+            if session.canvas.step(dt) {
+                need_render = true;
+            }
             // Wheel-zoom tracking: keep the pinned world under its
             // screen point through the fade (drops itself on landing).
             session.track_zoom_anchor(view);
@@ -2492,12 +2498,24 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                         // rect (true fullscreen); the client
                                         // buffer follows via configure.
                                         let buf = (w as u32, h as u32);
+                                        // Client-driven sizes are capped at
+                                        // the fullscreen rect: a client must
+                                        // never grow its window past the
+                                        // screen (Super or not — this path
+                                        // is the "hors Super" one).
+                                        let fs =
+                                            crate::chrome::fullscreen_rect_for(
+                                                view,
+                                                &|s| session.to_canvas(s, view),
+                                            );
+                                        cw.canvas.size.x = (w as f64)
+                                            .clamp(80.0, fs.size.x);
+                                        cw.canvas.size.y = (h as f64)
+                                            .clamp(60.0, fs.size.y);
                                         if cw.fullscreen_prev.is_none()
                                             && cw.buf_size != Some(buf)
                                         {
                                             cw.buf_size = Some(buf);
-                                            cw.canvas.size.x = w as f64;
-                                            cw.canvas.size.y = h as f64;
                                             log::info!(
                                                 "window {} sized to {}x{}",
                                                 id,
@@ -2517,7 +2535,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                                     Some(Err(err)) => log::warn!("buffer import failed: {}", err),
                                     None => {}
                                 }
+                                // Headed diagnostic: mapped but silent.
                             }
+                        }
+                        if cw.texture.is_none() {
+                            cw.warn_if_bufferless(id, 5);
                         }
                     }
                     // Windows render as textured perspective planes (3D).
