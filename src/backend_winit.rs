@@ -1892,6 +1892,8 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     (session.canvas.offset.x - prev_canvas_offset.x - slip.x) / dt_c,
                     (session.canvas.offset.y - prev_canvas_offset.y - slip.y) / dt_c,
                 );
+                dust_motion =
+                    (canvas_vel.x * canvas_vel.x + canvas_vel.y * canvas_vel.y).sqrt();
                 prev_canvas_offset = session.canvas.offset;
                 // LOD prologue: the viewport in canvas coords. Marbles
                 // inside 2x the screen span step every frame; out to 10x
@@ -2189,7 +2191,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 let dust = if settings.eco {
                     Vec::new()
                 } else {
-                    crate::canvas::dust_dots(&session.view_camera(), view)
+                    crate::canvas::dust_dots(&session.view_camera(), view, dust_motion)
                 };
                 // Canvas props (decor layer, behind windows): parallax dust
                 // and laggy boxes through the solid program. Empty by
@@ -2232,28 +2234,67 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         // the pass, restored after so later draws keep
                         // their premultiplied expectation.
                         if !dust.is_empty() {
-                            let _ = renderer.with_context(|_, gl| unsafe {
-                                use smithay::backend::renderer::gles2::ffi;
-                                gl.BlendFunc(
-                                    ffi::SRC_ALPHA,
-                                    ffi::ONE_MINUS_SRC_ALPHA,
-                                );
-                                for (x, y, s, a) in &dust {
-                                    crate::render3d::draw_solid(
-                                        gl,
-                                        prog,
-                                        &mvp,
-                                        [0.72, 0.72, 0.78, *a],
-                                        (
-                                            *x as f32 * sc,
-                                            *y as f32 * sc,
-                                            *s as f32 * sc,
-                                            *s as f32 * sc,
-                                        ),
-                                    );
+                            if round_prog.is_none() {
+                                match renderer.with_context(|_, gl| {
+                                    crate::render3d::compile_rounded(gl)
+                                }) {
+                                    Ok(Ok(p)) => {
+                                        round_prog = Some(p);
+                                        log::info!("rounded GL program ready");
+                                    }
+                                    Ok(Err(e)) => log::warn!("rounded GL program: {}", e),
+                                    Err(e) => log::warn!("rounded GL context: {:?}", e),
                                 }
-                                gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
-                            });
+                            }
+                            if let Some(rprog) = round_prog {
+                                let _ = renderer.with_context(|_, gl| unsafe {
+                                    use smithay::backend::renderer::gles2::ffi;
+                                    gl.BlendFunc(
+                                        ffi::SRC_ALPHA,
+                                        ffi::ONE_MINUS_SRC_ALPHA,
+                                    );
+                                    for (x, y, s, a) in &dust {
+                                        let sd = *s as f32 * sc;
+                                        crate::render3d::draw_rounded(
+                                            gl,
+                                            rprog,
+                                            &mvp,
+                                            [1.0, 1.0, 1.0, *a],
+                                            (
+                                                *x as f32 * sc - sd * 0.5,
+                                                *y as f32 * sc - sd * 0.5,
+                                                sd,
+                                                sd,
+                                            ),
+                                            sd * 0.5,
+                                        );
+                                    }
+                                    gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+                                });
+                            } else {
+                                let _ = renderer.with_context(|_, gl| unsafe {
+                                    use smithay::backend::renderer::gles2::ffi;
+                                    gl.BlendFunc(
+                                        ffi::SRC_ALPHA,
+                                        ffi::ONE_MINUS_SRC_ALPHA,
+                                    );
+                                    for (x, y, s, a) in &dust {
+                                        crate::render3d::draw_solid(
+                                            gl,
+                                            prog,
+                                            &mvp,
+                                            [0.72, 0.72, 0.78, *a],
+                                            (
+                                                *x as f32 * sc,
+                                                *y as f32 * sc,
+                                                *s as f32 * sc,
+                                                *s as f32 * sc,
+                                            ),
+                                        );
+                                    }
+                                    gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+                                });
+                            }
                         }
                     }
                 }
