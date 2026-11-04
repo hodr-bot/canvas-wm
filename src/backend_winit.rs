@@ -112,6 +112,14 @@ struct ScaleGesture {
     live: bool,
 }
 
+// Minimal right-click action menu (Canvas mode): open flag plus target
+// window id plus anchor position (screen px at open time).
+struct ActionMenu {
+    open: bool,
+    target: Option<u64>,
+    anchor: crate::canvas::Vec2,
+}
+
 // While live, at most one client reconfigure per interval: the rect
 // glides every frame, the app reflows behind it. Settle/release
 // frames always push (exact landing).
@@ -386,11 +394,19 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
     // next click). The per-frame check below folds focus back to the parent
     // as soon as the popup is gone.
     let mut popup_focus: Option<(u64, u64)> = None;
-    // Live canvas gestures: left-drag on empty canvas space pans the canvas
-    // (Canvas mode only); a dwell-armed window drag moves that window.
-    // Press canvas coords + last canvas coords + whether past threshold.
-    let mut grab: Option<(u64, crate::canvas::Vec2, crate::canvas::Vec2, bool)> = None;
+    // Live canvas gestures: any left-drag in Canvas mode pans the canvas
+    // (even over a window); a clean press + release selects / quits.
     let mut panning: Option<crate::canvas::Vec2> = None;
+    // Press hit remembered for clean-release select: outer None = no active
+    // press, inner Some(id) = pressed over a window, inner None = empty.
+    let mut press_hit: Option<Option<u64>> = None;
+    // Minimal right-click action menu (Canvas mode): open flag + target
+    // window id + anchor position (screen px at open time).
+    let mut action_menu = ActionMenu {
+        open: false,
+        target: None,
+        anchor: crate::canvas::Vec2::new(0.0, 0.0),
+    };
     // Hover chrome: last frame's revealed buttons (window id + layout).
     let mut last_chrome: Option<(u64, crate::chrome::ChromeLayout)> = None;
     // Hover keyboard shortcuts (Canvas mode, or Super held in Idle):
@@ -502,7 +518,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         Vec::new()
     };
     // Headless proof hook (screenshots): enter Canvas without a keyboard.
-    // Same path as a real Super tap (overview, dolly, dwell all armed).
+    // Same path as a real Super tap (overview, dolly).
     if std::env::var("CANVAS_FORCE_CANVAS").is_ok() {
         let action = session.on_event(
             crate::session::SuperEvent::SuperTap,
@@ -794,6 +810,11 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     }
                 }
                 if sym == KEY_Escape && pressed {
+                    if action_menu.open {
+                        action_menu.open = false;
+                        action_menu.target = None;
+                        log::info!("action menu closed");
+                    }
                     let action = session.on_event(
                         SuperEvent::Esc,
                         &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
@@ -1274,6 +1295,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 pointer = logical;
                 // Live gestures before picking, in canvas-plane coordinates.
                 // Canvas pan: content follows the cursor, velocity-ready.
+                // Pan uses session pan_canvas only; the camera stays fixed.
                 if let Some(last) = panning {
                     let dx = pointer.x - last.x;
                     let dy = pointer.y - last.y;
@@ -1283,27 +1305,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                     session.pan_canvas(crate::canvas::Vec2::new(dx, dy));
                     panning = Some(pointer);
                     need_render = true;
-                }
-                if let Some((id, press_world, last_world, moved)) = grab {
-                    let world_now = session.to_canvas(pointer, view);
-                    // Past the threshold, every motion moves the window by its
-                    // delta — including the crossing event itself, so even a
-                    // single-jump drag (press, one motion, release) moves.
-                    if moved || drag_offset(press_world, world_now).is_some() {
-                        let dx = world_now.x - last_world.x;
-                        let dy = world_now.y - last_world.y;
-                        match server_state.windows.get_mut(&id) {
-                            Some(cw) => {
-                                cw.canvas.pos.x += dx;
-                                cw.canvas.pos.y += dy;
-                                need_render = true;
-                            }
-                            None => grab = None,
-                        }
-                        if grab.is_some() {
-                            grab = Some((id, press_world, world_now, true));
-                        }
-                    }
                 }
                 // E-grab: while E is held, the window follows the pointer —
                 // no button needed, release drops it.
@@ -1401,8 +1402,7 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 }
                 // Focus follows the pointer (keeps last focus over empty
                 // canvas; never steals mid-drag).
-                    if grab.is_none()
-                        && panning.is_none()
+                    if panning.is_none()
                         && e_grab.is_none()
                         && r_scale.is_none()
                 {
@@ -1469,66 +1469,92 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                 // Canvas-mode press starts here; Idle falls through to focus.
                 if session.state == crate::session::SuperState::Canvas {
                     // Canvas mode: apps are frozen, nothing reaches clients.
-                    // Armed window + press = move it (Hyprland-style, dwell
-                    // replaces the held key); empty press starts a canvas pan.
+                    // Any left press starts a canvas pan immediately, even
+                    // over a window (pan uses session pan_canvas only;
+                    // the camera stays fixed). A clean release without
+                    // motion selects (window hit) or quits (empty).
                     if pressed && left {
                         let cw = session.to_canvas(pointer, view);
                         let hit = server_state.topmost_at(cw);
+                        if hit.is_none() && action_menu.open {
+                            action_menu.open = false;
+                            action_menu.target = None;
+                            log::info!("action menu closed");
+                        }
+                        pan_start = Some(pointer);
+                        panning = Some(pointer);
+                        pan_moved = false;
+                        press_hit = Some(hit);
+                        log::info!(
+                            "canvas pan start at ({:.0}, {:.0}) hit={:?}",
+                            pointer.x,
+                            pointer.y,
+                            hit
+                        );
+                    } else if pressed && event.button() == MouseButton::Right {
+                        let cw = session.to_canvas(pointer, view);
+                        let hit = server_state.topmost_at(cw);
                         match hit {
-                            Some(id) if session.dwell.armed == Some(id) => {
-                                grab = Some((id, cw, cw, true));
-                                server_state.raise(id);
-                                session.overview.select(id);
-                                log::info!("canvas armed move window {}", id);
-                            }
                             Some(id) => {
-                                let action = session.on_event(
-                                    SuperEvent::WindowClick(id),
-                                    &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
-                                    view,
-                                );
+                                action_menu.open = true;
+                                action_menu.target = Some(id);
+                                action_menu.anchor = pointer;
                                 log::info!(
-                                    "super {:?} click window {} state={:?} zoom={:.2} selected={}",
-                                    action,
+                                    "action menu opened window {} at ({:.0}, {:.0})",
                                     id,
-                                    session.state,
-                                    session.camera.zoom,
-                                    session.overview.selected.len()
-                                );
-                            }
-                            None => {
-                                pan_start = Some(pointer);
-                                panning = Some(pointer);
-                                pan_moved = false;
-                                log::info!(
-                                    "canvas pan start at ({:.0}, {:.0})",
                                     pointer.x,
                                     pointer.y
                                 );
                             }
+                            None => {
+                                if action_menu.open {
+                                    action_menu.open = false;
+                                    action_menu.target = None;
+                                    log::info!("action menu closed");
+                                }
+                            }
                         }
                     } else if !pressed && left {
-                        grab = None;
                         panning = None;
-                        // Press + release without moving = plain canvas click.
+                        let hit = press_hit.take();
+                        // Press + release without moving = click select.
                         // (pan_moved, not the endpoints, decides: an
                         // out-and-back drag ends where it started.)
                         if let Some(start) = pan_start.take() {
                             let moved = pan_moved;
                             pan_moved = false;
                             if !moved && drag_offset(start, pointer).is_none() {
-                                let action = session.on_event(
-                                    SuperEvent::CanvasClick,
-                                    &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
-                                    view,
-                                );
-                                log::info!(
-                                    "super {:?} click canvas state={:?} zoom={:.2} selected={}",
-                                    action,
-                                    session.state,
-                                    session.camera.zoom,
-                                    session.overview.selected.len()
-                                );
+                                match hit.flatten() {
+                                    Some(id) => {
+                                        let action = session.on_event(
+                                            SuperEvent::WindowClick(id),
+                                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                                            view,
+                                        );
+                                        log::info!(
+                                            "super {:?} click window {} state={:?} zoom={:.2} selected={}",
+                                            action,
+                                            id,
+                                            session.state,
+                                            session.camera.zoom,
+                                            session.overview.selected.len()
+                                        );
+                                    }
+                                    None => {
+                                        let action = session.on_event(
+                                            SuperEvent::CanvasClick,
+                                            &|wid| server_state.windows.get(&wid).map(|c| c.canvas),
+                                            view,
+                                        );
+                                        log::info!(
+                                            "super {:?} click canvas state={:?} zoom={:.2} selected={}",
+                                            action,
+                                            session.state,
+                                            session.camera.zoom,
+                                            session.overview.selected.len()
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1699,10 +1725,10 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         // held state or it wedges (E-grab stuck, Super
                         // phantom-held, focus guard blind) until restart.
                         e_grab = None;
-                        grab = None;
                         panning = None;
                         pan_start = None;
                         pan_moved = false;
+                        press_hit = None;
                         r_scale = None;
                         held_mods.clear();
                         super_held = false;
@@ -1712,7 +1738,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
                         for h in wasd_held.iter_mut() {
                             *h = false;
                         }
-                        session.dwell.disarm();
                         need_render = true;
                     }
                 }
@@ -1726,8 +1751,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Dwell-to-arm runs every frame (a still pointer sends no motion
-        // events): 1s inside one window arms it for moving, leaving resets.
         // Popup focus fallback: the keyboard went to a popup surface on
         // press — if that popup has since died, fold focus back to the
         // parent window NOW (not at the next click), or the app reads as
@@ -1802,14 +1825,6 @@ pub fn run(max_frames: Option<u64>) -> Result<(), Box<dyn Error>> {
         }
         if drop_scale {
             r_scale = None;
-        }
-        if session.state == crate::session::SuperState::Canvas {
-            let now_ms = frame_clock.elapsed().as_millis() as u64;
-            let cw = session.to_canvas(pointer, view);
-            let inside = server_state.topmost_at(cw);
-            if session.dwell.update(inside, now_ms).is_some() {
-                log::debug!("dwell armed {:?}", session.dwell.armed);
-            }
         }
 
         // Camera flight: spring toward target every frame; while flying,
