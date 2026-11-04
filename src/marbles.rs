@@ -64,11 +64,15 @@ pub fn lod_for(dist: f64, span: f64) -> Lod {
 }
 /// Gravity, canvas px / s^2.
 const GRAV: f64 = 2600.0;
-/// Table restitution: the canvas returns a small glass tap.
-const E_FLOOR: f64 = 0.25;
+/// Table restitution: the canvas returns a small glass tap — softened
+/// a touch so sky-drops settle fast. Light drag (slide damping via
+/// BOUNCE_KEEP plus the rolling resistance below) eats the rest, so
+/// nothing rolls to infinity.
+const E_FLOOR: f64 = 0.22;
 /// |vz| below this on touchdown = rest instead of bounce.
 const REST_VZ: f64 = 90.0;
-/// Sideways kept through a bounce: the table eats some slide.
+/// Sideways kept through a bounce: the table eats some slide (light
+/// drag on every touch — kept, not removed, so landings calm down).
 const BOUNCE_KEEP: f64 = 0.82;
 /// Sideways kick on landing, fraction of impact speed: every bounce
 /// scatters a little, never straight up-down.
@@ -92,10 +96,15 @@ const SPIN_GAIN: f64 = 2.0;
 /// Slip below this reads as rolling (static cap), above as sliding
 /// (kinetic cap).
 const SLIP_STATIC: f64 = 20.0;
-/// Window-wall restitution: wooden-box bonk.
-const E_WALL: f64 = 0.45;
-/// Window-wall tangential kept through a bonk.
-const WALL_KEEP: f64 = 0.90;
+/// Window-wall restitution: softened to a kiss — a ball arriving
+/// square still bonks back, but a grazing ball just taps and rolls
+/// along instead of rattling. Boxes stay SOLID and deep (substepped,
+/// never tunnel); only the bounce is gentle.
+const E_WALL: f64 = 0.30;
+/// Window-wall tangential kept through a bonk: high on purpose so a
+/// glancing ball keeps its along-wall slide and rolls off instead of
+/// sticking.
+const WALL_KEEP: f64 = 0.95;
 /// Marble-marble restitution: glass clacks, it doesn't bounce far.
 const E_MARBLE: f64 = 0.50;
 /// Glass density: mass = RHO * r^3 — grams, not tonnes. Only ratios
@@ -264,10 +273,14 @@ fn wrap_flow(v: f64) -> f64 {
     u - FLOW_MAX
 }
 
-/// Input conditioner for the engine: turns the raw per-frame view
-/// velocity (finite difference over a jittery clock) into a clean
-/// shake acceleration. Feed it every frame, even at rest — the
-/// smoothers need the quiet to settle.
+/// Input conditioner for the engine: turns the per-frame CANVAS
+/// velocity (finite difference of the canvas offset over a jittery
+/// clock) into a clean shake acceleration. Canvas-only: never feed
+/// `camera.vel` here — the camera lags the canvas, so camera-derived
+/// velocity reads backwards during a yank and inverts the feel.
+/// Feed it every frame, even at rest — the smoothers need the quiet
+/// to settle. See [`shake_from_canvas_vel`] for the stateless,
+/// single-sample version of this filter.
 ///
 /// Pipeline: EMA the velocity (kills frame-time quanta), derive,
 /// EMA the acceleration (kills single-frame spikes), deadband the
@@ -289,18 +302,18 @@ impl Shake {
         }
     }
 
-    pub fn push(&mut self, dt: f64, raw_vel: Vec2) -> Vec2 {
+    pub fn push(&mut self, dt: f64, canvas_vel: Vec2) -> Vec2 {
         let dt = dt.clamp(1e-4, 0.1);
         if !self.live {
-            self.vel = raw_vel;
-            self.prev = raw_vel;
+            self.vel = canvas_vel;
+            self.prev = canvas_vel;
             self.live = true;
             return Vec2::new(0.0, 0.0);
         }
         let av = 1.0 - (-dt / SHAKE_VEL_TAU).exp();
         self.prev = self.vel;
-        self.vel.x += (raw_vel.x - self.vel.x) * av;
-        self.vel.y += (raw_vel.y - self.vel.y) * av;
+        self.vel.x += (canvas_vel.x - self.vel.x) * av;
+        self.vel.y += (canvas_vel.y - self.vel.y) * av;
         // Instantaneous accel from the smoother's own motion, then a
         // second EMA to kill single-frame spikes.
         let inst = Vec2::new(
@@ -321,6 +334,29 @@ fn deadband(a: Vec2) -> Vec2 {
     }
     let k = ((m - SHAKE_DEAD) / (SHAKE_FULL - SHAKE_DEAD)).min(1.0);
     Vec2::new(a.x * k, a.y * k)
+}
+
+/// Canvas-only shake input (pure, stateless): maps one sample of
+/// canvas velocity to a smoothed shake acceleration — NO camera term.
+///
+/// The engine is shaken by the box, not the view: callers must feed
+/// the canvas-box velocity (finite difference of the canvas offset),
+/// never `camera.vel` (the camera lags the canvas, so camera-minus-
+/// canvas reads backwards during a yank and inverts the feel).
+/// This helper is the single-sample (zero-state) response of the
+/// [`Shake`] filter: one velocity EMA stage, derived to acceleration,
+/// one acceleration EMA stage, then the tremor deadband. Pure means
+/// same inputs give same outputs — no hidden state, no camera.
+/// Feed [`Shake::push`] every frame for the full temporal smoothing;
+/// use this when a stateless canvas-only estimate is needed.
+pub fn shake_from_canvas_vel(canvas_vel: Vec2, dt: f64) -> Vec2 {
+    let dt = dt.clamp(1e-4, 0.1);
+    let av = 1.0 - (-dt / SHAKE_VEL_TAU).exp();
+    let aa = 1.0 - (-dt / SHAKE_ACC_TAU).exp();
+    // One EMA step from zero state, closed form: vel = cv * av,
+    // inst = vel / dt, acc = inst * aa.
+    let k = av * aa / dt;
+    deadband(Vec2::new(canvas_vel.x * k, canvas_vel.y * k))
 }
 
 impl Marble {
@@ -752,7 +788,7 @@ mod tests {
     #[test]
     fn shake_kills_idle_noise_but_passes_a_gentle_pan() {
         // Idle box read through a jittery clock: the input here is
-        // already-smooth simulated velocity (camera.vel), so idle is
+        // already-smooth simulated CANVAS velocity, so idle is
         // a ~px/s drift, not event quanta. The conditioner must
         // report exactly zero — drift never reaches the balls.
         let mut s = Shake::new();
@@ -1121,5 +1157,80 @@ mod tests {
             assert!(m.flow.x.abs() <= FLOW_MAX + 1e-9);
             assert!(m.flow.y.abs() <= FLOW_MAX + 1e-9);
         }
+    }
+
+    #[test]
+    fn shake_from_canvas_vel_is_pure_and_canvas_only() {
+        // Canvas-only by construction: the signature takes nothing
+        // but the canvas-box velocity and dt — there is no camera
+        // term to smuggle the lagging view in through.
+        let z = shake_from_canvas_vel(Vec2::new(0.0, 0.0), 0.016);
+        assert!(z.x == 0.0 && z.y == 0.0, "zero canvas vel reads zero");
+        // Pure: same inputs, same outputs, no hidden state.
+        let a = shake_from_canvas_vel(Vec2::new(600.0, -200.0), 0.016);
+        let b = shake_from_canvas_vel(Vec2::new(600.0, -200.0), 0.016);
+        assert!(a.x == b.x && a.y == b.y, "must be deterministic");
+        // Tremor-scale canvas drift reads zero (deadband).
+        let t = shake_from_canvas_vel(Vec2::new(3.0, -2.0), 0.016);
+        assert!(t.x == 0.0 && t.y == 0.0, "tremor must read zero");
+        // A real shove passes through with its direction intact.
+        assert!(a.x > 0.0 && a.y < 0.0, "direction survives");
+        // Scaling: doubling the canvas velocity doubles the answer
+        // (far past the deadband the ramp is 1, so the map is linear).
+        let big = shake_from_canvas_vel(Vec2::new(4000.0, 0.0), 0.016);
+        let small = shake_from_canvas_vel(Vec2::new(2000.0, 0.0), 0.016);
+        assert!(big.x > 0.0 && small.x > 0.0);
+        let ratio = big.x / small.x;
+        assert!((ratio - 2.0).abs() < 1e-9, "linear past deadband");
+        // dt clamping keeps hitches finite.
+        let h = shake_from_canvas_vel(Vec2::new(600.0, 0.0), 10.0);
+        assert!(h.x.is_finite() && h.y.is_finite());
+    }
+
+    #[test]
+    fn glance_kisses_and_rolls_along() {
+        // Grazing coincidence: a ball arriving almost tangentially
+        // must kiss the wall (small normal answer) and keep rolling
+        // along it — never catch, never tunnel, never stick. The box
+        // stays a solid deep box throughout.
+        let z = Vec2::new(0.0, 0.0);
+        let (wx, wy, ww, wh) = walls()[0];
+        let mut m = spawn(60.0, 160.0, 42);
+        m.z = 0.0;
+        m.vz = 0.0;
+        m.r = 15.0;
+        m.pos = Vec2::new(wx - m.r - 0.5, 160.0);
+        m.vel = Vec2::new(120.0, 500.0);
+        let mut kissed = false;
+        let mut min_gap = f64::INFINITY;
+        for _ in 0..60 {
+            m.step(0.016, z, &walls());
+            let inside = m.pos.x > wx
+                && m.pos.x < wx + ww
+                && m.pos.y > wy
+                && m.pos.y < wy + wh;
+            assert!(
+                !(inside && m.z < WIN_TOP - 1.0),
+                "glance must never tunnel, x={} z={}",
+                m.pos.x,
+                m.z
+            );
+            assert!(m.z >= 0.0, "never below the canvas");
+            if m.pos.y > wy && m.pos.y < wy + wh {
+                min_gap = min_gap.min((wx - (m.pos.x + m.r)).abs());
+                if m.vel.x <= 0.0 {
+                    kissed = true; // normal answered: the kiss
+                }
+            }
+        }
+        assert!(kissed, "wall must answer the normal");
+        assert!(min_gap < 3.0, "must kiss close, gap={min_gap}");
+        // Tangential kept: still rolling along the wall afterwards.
+        assert!(m.vel.y > 200.0, "must roll along, vy={}", m.vel.y);
+        // Normal answered softly: no hard rebound.
+        assert!(m.vel.x.abs() < 120.0, "kiss, not bonk, vx={}", m.vel.x);
+        // Travelled along the wall, outside it.
+        assert!(m.pos.y > 165.0, "rolls along, y={}", m.pos.y);
+        assert!(m.pos.x + m.r <= wx + 1.5, "stays outside, x={}", m.pos.x);
     }
 }
